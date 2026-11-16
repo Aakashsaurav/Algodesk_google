@@ -4,7 +4,7 @@ dist/
 coverage/
 .DS_Store
 *.log
-*.json
+token.json
 *.parquet
 .env*
 !.env.example
