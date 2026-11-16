@@ -159,11 +159,37 @@ class AppConfig:
     KEYRING_SERVICE: str = "algodesk"
 
     def __init__(self) -> None:
-        _load_env(self.BASE_DIR, override=False)
+        self._env_mtime: Optional[float] = None
+        self.reload_if_changed(force=True)
+
+    def _current_env_mtime(self) -> Optional[float]:
+        env_path = self.BASE_DIR / ".env"
+        try:
+            return env_path.stat().st_mtime if env_path.exists() else None
+        except OSError:
+            return None
+
+    def reload_if_changed(self, force: bool = False) -> bool:
+        """Auto-detect .env creation or edits without restarting the Python server."""
+        mtime = self._current_env_mtime()
+        if force or (mtime is not None and mtime != self._env_mtime):
+            _load_env(self.BASE_DIR, override=True)
+            self._env_mtime = mtime
+            return True
+        return False
 
     def reload(self) -> None:
         """Re-read .env variables cleanly without restarting the process."""
-        _load_env(self.BASE_DIR, override=True)
+        self.reload_if_changed(force=True)
+
+    def credential_source(self, env_key: str, keychain_account: str) -> str:
+        """Return where a setting was detected ('env', 'keychain', or 'none') without exposing it."""
+        self.reload_if_changed()
+        if os.getenv(env_key, "").strip():
+            return "env"
+        if keychain_get(self.KEYRING_SERVICE, keychain_account):
+            return "keychain"
+        return "none"
 
     # ── Paths (lazy, no import-time mkdir storm) ──────────────────────────
     @property
@@ -196,9 +222,10 @@ class AppConfig:
     def INSTRUMENT_KEY_PATH(self) -> Path:
         return self.BASE_DIR / "broker" / "upstox" / "complete_instru_list.json"
 
-    # ── Broker Credentials (env > macOS Keychain) ─────────────────────────
+    # ── Broker Credentials (.env / env > macOS Keychain) ──────────────────
     @property
     def UPSTOX_API_KEY(self) -> str:
+        self.reload_if_changed()
         val = os.getenv("UPSTOX_API_KEY", "").strip()
         if val:
             return val
@@ -206,6 +233,7 @@ class AppConfig:
 
     @property
     def UPSTOX_API_SECRET(self) -> str:
+        self.reload_if_changed()
         val = os.getenv("UPSTOX_API_SECRET", "").strip()
         if val:
             return val
@@ -213,10 +241,11 @@ class AppConfig:
 
     @property
     def UPSTOX_REDIRECT_URI(self) -> str:
-        return os.getenv(
-            "UPSTOX_REDIRECT_URI",
-            keychain_get(self.KEYRING_SERVICE, "upstox_redirect_uri")
-            or "http://127.0.0.1:8000/auth/upstox/callback",
+        self.reload_if_changed()
+        return (
+            os.getenv("UPSTOX_REDIRECT_URI", "").strip()
+            or keychain_get(self.KEYRING_SERVICE, "upstox_redirect_uri")
+            or "http://127.0.0.1:8000/auth/upstox/callback"
         ).strip()
 
     @property

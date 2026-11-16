@@ -49,6 +49,9 @@ interface OverviewPayload {
       has_api_secret: boolean;
       api_key_preview: string;
       redirect_uri: string;
+      key_source?: 'env' | 'keychain' | 'none';
+      secret_source?: 'env' | 'keychain' | 'none';
+      redirect_source?: 'env' | 'keychain' | 'none';
     };
   };
   runtime: {
@@ -58,6 +61,12 @@ interface OverviewPayload {
     ist_time: string;
     eager_instruments_loaded: boolean;
   };
+}
+
+function formatCredentialSource(src?: string): string {
+  if (src === 'env') return '.env';
+  if (src === 'keychain') return 'macOS Keychain';
+  return 'Default';
 }
 
 const ROADMAP_PHASES = [
@@ -145,12 +154,21 @@ export default function App() {
   const [apiKey, setApiKey] = useState('');
   const [apiSecret, setApiSecret] = useState('');
   const [redirectUri, setRedirectUri] = useState('');
+  const [credsExpanded, setCredsExpanded] = useState(false);
   const [oauthUrl, setOauthUrl] = useState('');
+  const [captureActive, setCaptureActive] = useState(false);
+  const [captureStatus, setCaptureStatus] = useState<{
+    status: string;
+    mode?: string;
+    redirectUri?: string;
+    message: string;
+  } | null>(null);
+  const [manualOpen, setManualOpen] = useState(false);
   const [callbackInput, setCallbackInput] = useState('');
   const [modalFeedback, setModalFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
   const [exchanging, setExchanging] = useState(false);
 
-  const fetchOverview = useCallback(async (refresh = true) => {
+  const fetchOverview = useCallback(async (refresh = true): Promise<OverviewPayload | null> => {
     setRefreshing(true);
     setLoadError(null);
     try {
@@ -163,8 +181,10 @@ export default function App() {
       setOverview(data);
       setTradingSelection(data.selections.trading_broker);
       setDataSelection(data.selections.data_connection);
+      return data;
     } catch (err) {
       setLoadError(err instanceof Error ? err.message : 'Unable to reach Python broker service.');
+      return null;
     } finally {
       setLoading(false);
       setRefreshing(false);
@@ -244,15 +264,89 @@ export default function App() {
     }
   };
 
-  const openReconnectModal = (brokerId: string) => {
-    const creds = overview?.credentials?.upstox;
+  const closeReconnectModal = useCallback(() => {
+    if (captureActive && modalBrokerId) {
+      void fetch(`/api/brokers/${modalBrokerId}/reconnect-cancel`, {
+        method: 'POST',
+        keepalive: true,
+      }).catch(() => {});
+    }
+    setCaptureActive(false);
+    setModalBrokerId(null);
+  }, [captureActive, modalBrokerId]);
+
+  const pollCaptureStatus = useCallback(async () => {
+    if (!modalBrokerId || !captureActive) return;
+    try {
+      const res = await fetch(`/api/brokers/${modalBrokerId}/reconnect-status`);
+      if (!res.ok) return;
+      const st = await res.json();
+      if (st.status === 'listening' || st.status === 'exchanging') {
+        setCaptureStatus({
+          status: st.status,
+          mode: st.capture_mode,
+          redirectUri: st.redirect_uri,
+          message: st.message || 'Waiting for Upstox redirect...',
+        });
+      } else if (st.status === 'connected') {
+        setCaptureActive(false);
+        setCaptureStatus({
+          status: 'connected',
+          mode: st.capture_mode,
+          redirectUri: st.redirect_uri,
+          message: st.message || 'Connected automatically and verified with Upstox.',
+        });
+        setModalFeedback({ type: 'ok', text: 'Connected and verified against Upstox profile API.' });
+        await fetchOverview(true);
+        setTimeout(() => setModalBrokerId(null), 800);
+      } else if (st.status === 'error' || st.status === 'timeout') {
+        setCaptureActive(false);
+        setCaptureStatus({
+          status: st.status,
+          mode: st.capture_mode,
+          redirectUri: st.redirect_uri,
+          message: st.message || 'Auto-capture did not complete.',
+        });
+        setManualOpen(true);
+      }
+    } catch {
+      // Transient poll failure; ignore and retry on next interval
+    }
+  }, [captureActive, fetchOverview, modalBrokerId]);
+
+  useEffect(() => {
+    if (!captureActive || !modalBrokerId) return;
+    const timer = window.setInterval(() => {
+      void pollCaptureStatus();
+    }, 900);
+    const onMessage = (event: MessageEvent) => {
+      if (event?.data?.type === 'algodesk-oauth-captured') {
+        void pollCaptureStatus();
+      }
+    };
+    window.addEventListener('message', onMessage);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener('message', onMessage);
+    };
+  }, [captureActive, modalBrokerId, pollCaptureStatus]);
+
+  const openReconnectModal = async (brokerId: string) => {
+    setCaptureActive(false);
+    setCaptureStatus(null);
     setModalBrokerId(brokerId);
     setApiKey('');
     setApiSecret('');
-    setRedirectUri(creds?.redirect_uri || `${window.location.origin}/auth/${brokerId}/callback`);
     setOauthUrl('');
     setCallbackInput('');
     setModalFeedback(null);
+
+    const fresh = await fetchOverview(false);
+    const creds = fresh?.credentials?.upstox ?? overview?.credentials?.upstox;
+    const hasAll = Boolean(creds?.has_api_key && creds?.has_api_secret);
+    setCredsExpanded(!hasAll);
+    setManualOpen(false);
+    setRedirectUri(creds?.redirect_uri || `${window.location.origin}/auth/${brokerId}/callback`);
   };
 
   const handleSaveCredentials = async () => {
@@ -270,11 +364,12 @@ export default function App() {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || 'Credential save failed.');
+      await fetchOverview(false);
+      setCredsExpanded(false);
       setModalFeedback({
         type: 'ok',
-        text: 'Credentials saved securely in Keychain/env. Click Open Upstox Login to authenticate.',
+        text: 'Credentials saved securely. Click Login with Upstox (Auto-Capture).',
       });
-      await fetchOverview(false);
     } catch (err) {
       setModalFeedback({
         type: 'err',
@@ -286,6 +381,25 @@ export default function App() {
   const handleStartOAuth = async () => {
     if (!modalBrokerId) return;
     setModalFeedback(null);
+
+    if (apiKey.trim() && apiSecret.trim()) {
+      const saveRes = await fetch(`/api/brokers/${modalBrokerId}/credentials`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          api_key: apiKey.trim(),
+          api_secret: apiSecret.trim(),
+          redirect_uri: redirectUri.trim() || null,
+        }),
+      });
+      if (!saveRes.ok) {
+        const errBody = await saveRes.json().catch(() => ({}));
+        setModalFeedback({ type: 'err', text: errBody.detail || 'Could not save credentials.' });
+        return;
+      }
+      await fetchOverview(false);
+    }
+
     try {
       const res = await fetch(`/api/brokers/${modalBrokerId}/reconnect`, {
         method: 'POST',
@@ -295,16 +409,27 @@ export default function App() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || 'Could not start OAuth login.');
       if (data.mode === 'needs_credentials') {
+        setCredsExpanded(true);
         setModalFeedback({ type: 'err', text: data.message });
         return;
       }
       if (data.login_url) {
         setOauthUrl(data.login_url);
-        window.open(data.login_url, '_blank', 'noopener,noreferrer');
-        setModalFeedback({
-          type: 'ok',
-          text: 'Upstox login opened in a new tab. Complete login or paste the redirected URL below.',
+        const httpsHint = String(data.redirect_uri || '').startsWith('https://127.0.0.1')
+          ? ' If your browser warns about the self-signed localhost certificate on 127.0.0.1, click Advanced -> Proceed so capture completes automatically.'
+          : '';
+        setCaptureStatus({
+          status: data.capture_mode === 'manual_only' ? 'manual_only' : 'listening',
+          mode: data.capture_mode,
+          redirectUri: data.redirect_uri,
+          message: (data.message || 'Listening for browser callback...') + httpsHint,
         });
+        window.open(data.login_url, 'algodesk_oauth_login', 'width=640,height=760');
+        if (data.capture_mode === 'manual_only') {
+          setManualOpen(true);
+        } else {
+          setCaptureActive(true);
+        }
       }
     } catch (err) {
       setModalFeedback({
@@ -333,6 +458,8 @@ export default function App() {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || 'Authorization code exchange failed.');
+      setCaptureActive(false);
+      setCaptureStatus({ status: 'connected', message: 'Connected and verified with Upstox.' });
       setModalFeedback({ type: 'ok', text: 'Connected and verified against Upstox profile API.' });
       await fetchOverview(true);
       setTimeout(() => setModalBrokerId(null), 650);
@@ -664,17 +791,17 @@ export default function App() {
           aria-modal="true"
           aria-labelledby="reconnect-modal-title"
           onClick={(e) => {
-            if (e.target === e.currentTarget) setModalBrokerId(null);
+            if (e.target === e.currentTarget) closeReconnectModal();
           }}
         >
-          <div className="w-full max-w-[540px] rounded-xl border border-slate-700 bg-[#111827] p-6">
+          <div className="max-h-[92vh] w-full max-w-[560px] overflow-y-auto rounded-xl border border-slate-700 bg-[#111827] p-6">
             <div className="mb-5 flex items-center justify-between gap-4">
               <h3 id="reconnect-modal-title" className="text-lg font-semibold text-slate-100">
                 Reconnect {modalBrokerId.charAt(0).toUpperCase() + modalBrokerId.slice(1)} Session
               </h3>
               <button
                 type="button"
-                onClick={() => setModalBrokerId(null)}
+                onClick={closeReconnectModal}
                 className="inline-flex min-h-[36px] items-center gap-1.5 rounded-lg border border-slate-700 px-3 py-1.5 text-xs font-semibold text-slate-300 hover:bg-slate-800"
               >
                 <X className="h-3.5 w-3.5" />
@@ -683,109 +810,193 @@ export default function App() {
             </div>
 
             <div className="space-y-4">
-              <div>
-                <label htmlFor="modal-api-key" className="mb-1.5 block text-[13px] font-semibold text-slate-200">
-                  Upstox API Key
-                </label>
-                <input
-                  id="modal-api-key"
-                  type="text"
-                  value={apiKey}
-                  onChange={(e) => setApiKey(e.target.value)}
-                  placeholder={
-                    upstoxCreds?.has_api_key
-                      ? `Configured (${upstoxCreds.api_key_preview})`
-                      : 'Enter your Upstox API Key'
-                  }
-                  autoComplete="off"
-                  className="min-h-[42px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 text-sm text-slate-100 focus:border-sky-400 focus:outline-none"
-                />
+              {/* Auto-detected .env / Keychain Configuration */}
+              <div className="space-y-2 rounded-lg border border-slate-800 bg-[#0b1120] p-3.5">
+                <div className="flex items-center justify-between gap-3">
+                  <span className="text-[13px] font-semibold text-slate-200">Detected Local Configuration</span>
+                  <button
+                    type="button"
+                    onClick={() => setCredsExpanded((prev) => !prev)}
+                    className="rounded-md border border-slate-700 px-2.5 py-1 text-xs font-semibold text-slate-300 hover:bg-slate-800"
+                  >
+                    {credsExpanded ? 'Hide Inputs' : 'Edit Credentials'}
+                  </button>
+                </div>
+                <div className="flex items-baseline justify-between gap-3 text-xs">
+                  <span className="font-semibold text-slate-400">API Key</span>
+                  <span className="font-mono text-slate-200">
+                    {upstoxCreds?.has_api_key
+                      ? `${upstoxCreds.api_key_preview} (${formatCredentialSource(upstoxCreds.key_source)})`
+                      : 'Missing'}
+                  </span>
+                </div>
+                <div className="flex items-baseline justify-between gap-3 text-xs">
+                  <span className="font-semibold text-slate-400">API Secret</span>
+                  <span className="font-mono text-slate-200">
+                    {upstoxCreds?.has_api_secret
+                      ? `Configured (${formatCredentialSource(upstoxCreds.secret_source)})`
+                      : 'Missing'}
+                  </span>
+                </div>
+                <div className="flex items-baseline justify-between gap-3 text-xs">
+                  <span className="font-semibold text-slate-400">Redirect URI</span>
+                  <span className="font-mono break-all text-right text-slate-200">
+                    {upstoxCreds?.redirect_uri
+                      ? `${upstoxCreds.redirect_uri} (${formatCredentialSource(upstoxCreds.redirect_source)})`
+                      : `${redirectUri} (Default)`}
+                  </span>
+                </div>
               </div>
 
-              <div>
-                <label htmlFor="modal-api-secret" className="mb-1.5 block text-[13px] font-semibold text-slate-200">
-                  Upstox API Secret
-                </label>
-                <input
-                  id="modal-api-secret"
-                  type="password"
-                  value={apiSecret}
-                  onChange={(e) => setApiSecret(e.target.value)}
-                  placeholder={
-                    upstoxCreds?.has_api_secret
-                      ? 'Configured in Keychain/env (enter only to replace)'
-                      : 'Enter your Upstox API Secret'
-                  }
-                  autoComplete="off"
-                  className="min-h-[42px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 text-sm text-slate-100 focus:border-sky-400 focus:outline-none"
-                />
-              </div>
+              {credsExpanded && (
+                <div className="space-y-3.5 rounded-lg border border-slate-800 bg-[#0b1120]/60 p-4">
+                  <div>
+                    <label htmlFor="modal-api-key" className="mb-1.5 block text-[13px] font-semibold text-slate-200">
+                      Upstox API Key
+                    </label>
+                    <input
+                      id="modal-api-key"
+                      type="text"
+                      value={apiKey}
+                      onChange={(e) => setApiKey(e.target.value)}
+                      placeholder={
+                        upstoxCreds?.has_api_key
+                          ? `Detected (${upstoxCreds.api_key_preview}) — enter only to override`
+                          : 'Enter your Upstox API Key'
+                      }
+                      autoComplete="off"
+                      className="min-h-[42px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 text-sm text-slate-100 focus:border-sky-400 focus:outline-none"
+                    />
+                  </div>
 
-              <div>
-                <label htmlFor="modal-redirect-uri" className="mb-1.5 block text-[13px] font-semibold text-slate-200">
-                  OAuth Redirect URI
-                </label>
-                <input
-                  id="modal-redirect-uri"
-                  type="text"
-                  value={redirectUri}
-                  onChange={(e) => setRedirectUri(e.target.value)}
-                  className="min-h-[42px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 font-mono text-xs text-slate-100 focus:border-sky-400 focus:outline-none"
-                />
-              </div>
+                  <div>
+                    <label htmlFor="modal-api-secret" className="mb-1.5 block text-[13px] font-semibold text-slate-200">
+                      Upstox API Secret
+                    </label>
+                    <input
+                      id="modal-api-secret"
+                      type="password"
+                      value={apiSecret}
+                      onChange={(e) => setApiSecret(e.target.value)}
+                      placeholder={
+                        upstoxCreds?.has_api_secret
+                          ? `Detected in ${formatCredentialSource(upstoxCreds.secret_source)} — enter only to override`
+                          : 'Enter your Upstox API Secret'
+                      }
+                      autoComplete="off"
+                      className="min-h-[42px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 text-sm text-slate-100 focus:border-sky-400 focus:outline-none"
+                    />
+                  </div>
 
-              <div className="flex flex-wrap gap-2.5 pt-1">
-                <button
-                  type="button"
-                  onClick={() => void handleSaveCredentials()}
-                  className="min-h-[40px] shrink-0 whitespace-nowrap rounded-lg border border-slate-700 bg-[#0b1120] px-4 py-2 text-[13px] font-semibold text-slate-200 hover:bg-slate-800"
-                >
-                  Save Credentials
-                </button>
-                <button
-                  type="button"
-                  onClick={() => void handleStartOAuth()}
-                  className="inline-flex min-h-[40px] shrink-0 items-center gap-2 whitespace-nowrap rounded-lg bg-sky-400 px-4 py-2 text-[13px] font-semibold text-sky-950 hover:bg-sky-300"
-                >
-                  <ExternalLink className="h-3.5 w-3.5" />
-                  <span>Open Upstox OAuth Login</span>
-                </button>
-              </div>
+                  <div>
+                    <label htmlFor="modal-redirect-uri" className="mb-1.5 block text-[13px] font-semibold text-slate-200">
+                      OAuth Redirect URI
+                    </label>
+                    <input
+                      id="modal-redirect-uri"
+                      type="text"
+                      value={redirectUri}
+                      onChange={(e) => setRedirectUri(e.target.value)}
+                      className="min-h-[42px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 font-mono text-xs text-slate-100 focus:border-sky-400 focus:outline-none"
+                    />
+                  </div>
 
-              {oauthUrl && (
-                <div className="rounded-lg border border-slate-800 bg-[#0b1120] p-3 font-mono text-xs break-all text-slate-400">
-                  {oauthUrl}
+                  <button
+                    type="button"
+                    onClick={() => void handleSaveCredentials()}
+                    className="min-h-[38px] shrink-0 whitespace-nowrap rounded-lg border border-slate-700 bg-[#0b1120] px-4 py-2 text-[13px] font-semibold text-slate-200 hover:bg-slate-800"
+                  >
+                    Save Credentials
+                  </button>
+                </div>
+              )}
+
+              <button
+                type="button"
+                onClick={() => void handleStartOAuth()}
+                className="inline-flex min-h-[42px] w-full items-center justify-center gap-2 whitespace-nowrap rounded-lg bg-sky-400 px-4 py-2 text-sm font-semibold text-sky-950 hover:bg-sky-300"
+              >
+                <ExternalLink className="h-4 w-4" />
+                <span>Login with Upstox (Auto-Capture)</span>
+              </button>
+
+              {captureStatus && (
+                <div className="space-y-1.5 rounded-lg border border-slate-700 bg-[#0b1120] p-3.5">
+                  <div className="flex items-center gap-2.5 text-[13px] font-semibold text-slate-100">
+                    <span
+                      className={`h-2.5 w-2.5 shrink-0 rounded-full ${
+                        captureStatus.status === 'connected'
+                          ? 'bg-emerald-600 shadow-[0_0_10px_rgba(22,163,74,0.7)]'
+                          : captureStatus.status === 'error' || captureStatus.status === 'timeout'
+                            ? 'bg-red-600 shadow-[0_0_10px_rgba(220,38,38,0.65)]'
+                            : 'bg-amber-600 shadow-[0_0_10px_rgba(217,119,6,0.7)]'
+                      }`}
+                      aria-hidden="true"
+                    />
+                    <span>
+                      {captureStatus.status === 'connected'
+                        ? 'Connected automatically'
+                        : captureStatus.status === 'exchanging'
+                          ? 'Code captured — verifying session...'
+                          : captureStatus.status === 'timeout'
+                            ? 'Auto-capture timed out'
+                            : captureStatus.status === 'error'
+                              ? 'Auto-capture failed'
+                              : 'Listening for Upstox browser redirect...'}
+                    </span>
+                  </div>
+                  <p className="text-xs text-slate-400">{captureStatus.message}</p>
+                  {oauthUrl && (
+                    <a
+                      href={oauthUrl}
+                      target="algodesk_oauth_login"
+                      rel="noreferrer"
+                      className="inline-block font-mono text-[11px] text-sky-400 underline underline-offset-4"
+                    >
+                      Open Upstox login link (if popup was blocked)
+                    </a>
+                  )}
                 </div>
               )}
 
               <hr className="border-slate-800" />
 
-              <div>
-                <label htmlFor="modal-callback-input" className="mb-1.5 block text-[13px] font-semibold text-slate-200">
-                  Paste Redirect URL or Authorization Code
-                </label>
-                <input
-                  id="modal-callback-input"
-                  type="text"
-                  value={callbackInput}
-                  onChange={(e) => setCallbackInput(e.target.value)}
-                  placeholder="https://127.0.0.1:5000/?code=... or bare code"
-                  autoComplete="off"
-                  className="min-h-[42px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 font-mono text-xs text-slate-100 focus:border-sky-400 focus:outline-none"
-                />
-                <span className="mt-1.5 block text-xs text-slate-500">
-                  If your Upstox developer app redirects to port 5000 instead of /auth/upstox/callback, paste the redirected URL here.
-                </span>
-              </div>
-
-              <button
-                type="button"
-                onClick={() => void handleExchangeCode()}
-                disabled={exchanging}
-                className="min-h-[42px] w-full rounded-lg bg-sky-400 px-4 py-2 text-sm font-semibold text-sky-950 hover:bg-sky-300 disabled:opacity-50"
+              <details
+                open={manualOpen}
+                onToggle={(e) => setManualOpen((e.currentTarget as HTMLDetailsElement).open)}
               >
-                {exchanging ? 'Exchanging Code...' : 'Exchange Code & Connect'}
-              </button>
+                <summary className="cursor-pointer select-none text-[13px] font-semibold text-slate-400 hover:text-slate-200">
+                  Manual Fallback: Paste Redirect URL or Authorization Code
+                </summary>
+                <div className="mt-3 space-y-3">
+                  <div>
+                    <label htmlFor="modal-callback-input" className="mb-1.5 block text-[13px] font-semibold text-slate-200">
+                      Redirected Callback URL or Code
+                    </label>
+                    <input
+                      id="modal-callback-input"
+                      type="text"
+                      value={callbackInput}
+                      onChange={(e) => setCallbackInput(e.target.value)}
+                      placeholder="https://127.0.0.1:5000/?code=... or bare code"
+                      autoComplete="off"
+                      className="min-h-[42px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 font-mono text-xs text-slate-100 focus:border-sky-400 focus:outline-none"
+                    />
+                    <span className="mt-1.5 block text-xs text-slate-500">
+                      Use this only if browser auto-capture is blocked by a browser warning or proxy.
+                    </span>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => void handleExchangeCode()}
+                    disabled={exchanging}
+                    className="min-h-[40px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-4 py-2 text-[13px] font-semibold text-slate-200 hover:bg-slate-800 disabled:opacity-50"
+                  >
+                    {exchanging ? 'Exchanging Code...' : 'Exchange Code & Connect'}
+                  </button>
+                </div>
+              </details>
 
               {modalFeedback && (
                 <div

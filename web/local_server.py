@@ -77,43 +77,52 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
             self._send_json(200, hub_service.get_overview(refresh=refresh))
             return
 
+        parts = path.strip("/").split("/")
+        if len(parts) == 4 and parts[0] == "api" and parts[1] == "brokers" and parts[3] == "reconnect-status":
+            self._send_json(200, hub_service.get_reconnect_status(parts[2]))
+            return
+
         if path.startswith("/auth/") and path.endswith("/callback"):
-            parts = path.strip("/").split("/")
             broker_id = parts[1] if len(parts) >= 3 else "upstox"
             error = query.get("error", [None])[0]
             code = query.get("code", [None])[0]
             if error:
                 self._send_html(
                     400,
-                    f"<html><body style='font-family:sans-serif;background:#0F172A;color:#F8FAFC;padding:2rem'>"
-                    f"<h2>Authorization declined</h2><p>{html.escape(error)}</p>"
-                    f"<a href='/' style='color:#38BDF8'>Return to AlgoDesk</a></body></html>",
+                    f"<!doctype html><html><body style='font-family:sans-serif;background:#0b1120;color:#f1f5f9;padding:2rem'>"
+                    f"<h2>Authorization declined</h2><p style='color:#94a3b8'>{html.escape(error)}</p>"
+                    f"<a href='/' style='color:#38bdf8'>Return to AlgoDesk</a></body></html>",
                 )
                 return
             if not code:
                 self._send_html(
                     400,
-                    "<html><body style='font-family:sans-serif;background:#0F172A;color:#F8FAFC;padding:2rem'>"
+                    "<!doctype html><html><body style='font-family:sans-serif;background:#0b1120;color:#f1f5f9;padding:2rem'>"
                     "<h2>Missing authorization code</h2>"
-                    "<a href='/' style='color:#38BDF8'>Return to AlgoDesk</a></body></html>",
+                    "<a href='/' style='color:#38bdf8'>Return to AlgoDesk</a></body></html>",
                 )
                 return
             try:
                 result = hub_service.complete_reconnect(broker_id=broker_id, code_or_url=code)
                 state = result.get("broker", {}).get("state", "UNKNOWN")
+                js_broker = json.dumps(broker_id)
                 self._send_html(
                     200,
-                    f"<html><body style='font-family:sans-serif;background:#0F172A;color:#F8FAFC;padding:2rem'>"
+                    f"<!doctype html><html><body style='font-family:sans-serif;background:#0b1120;color:#f1f5f9;padding:2rem'>"
                     f"<h2>{html.escape(broker_id.title())} connection updated: {html.escape(state)}</h2>"
-                    f"<p>Token saved securely. Returning to AlgoDesk...</p>"
-                    f"<script>setTimeout(()=>window.location.href='/', 900);</script></body></html>",
+                    f"<p style='color:#94a3b8'>Session token captured automatically and saved securely. Returning to AlgoDesk...</p>"
+                    f"<a href='/' style='color:#38bdf8'>Return to AlgoDesk</a>"
+                    f"<script>"
+                    f"try {{ if (window.opener) {{ window.opener.postMessage({{type: 'algodesk-oauth-captured', brokerId: {js_broker}}}, '*'); }} }} catch (e) {{}}"
+                    f"setTimeout(() => {{ if (window.opener) {{ window.close(); }} else {{ window.location.href = '/'; }} }}, 900);"
+                    f"</script></body></html>",
                 )
             except Exception as exc:
                 self._send_html(
                     400,
-                    f"<html><body style='font-family:sans-serif;background:#0F172A;color:#F8FAFC;padding:2rem'>"
-                    f"<h2>Token exchange failed</h2><p>{html.escape(str(exc))}</p>"
-                    f"<a href='/' style='color:#38BDF8'>Return to AlgoDesk</a></body></html>",
+                    f"<!doctype html><html><body style='font-family:sans-serif;background:#0b1120;color:#f1f5f9;padding:2rem'>"
+                    f"<h2>Token exchange failed</h2><p style='color:#94a3b8'>{html.escape(str(exc))}</p>"
+                    f"<a href='/' style='color:#38bdf8'>Return to AlgoDesk</a></body></html>",
                 )
             return
 
@@ -158,13 +167,18 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
                     )
                     return
                 if action == "reconnect":
+                    server_port = self.server.server_address[1] if getattr(self, "server", None) else None
                     self._send_json(
                         200,
                         hub_service.start_reconnect(
                             broker_id=broker_id,
                             redirect_uri=body.get("redirect_uri"),
+                            server_port=server_port,
                         ),
                     )
+                    return
+                if action == "reconnect-cancel":
+                    self._send_json(200, hub_service.cancel_reconnect(broker_id))
                     return
                 if action == "callback-exchange":
                     self._send_json(

@@ -316,6 +316,8 @@
     .modal {
       width: 100%;
       max-width: 560px;
+      max-height: 92vh;
+      overflow-y: auto;
       background: var(--surface);
       border: 1px solid var(--border-strong);
       border-radius: 12px;
@@ -329,7 +331,45 @@
     }
     .modal-head h3 { margin: 0; font-size: 18px; }
     .stack { display: flex; flex-direction: column; gap: 14px; }
-    .divider { border: 0; border-top: 1px solid var(--border); margin: 18px 0; }
+    .divider { border: 0; border-top: 1px solid var(--border); margin: 14px 0; }
+    .kv-box {
+      border: 1px solid var(--border);
+      background: var(--bg);
+      border-radius: 8px;
+      padding: 12px 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .kv-row {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      font-size: 12px;
+    }
+    .kv-label { color: var(--text-muted); font-weight: 600; flex-shrink: 0; }
+    .kv-val { color: var(--text); text-align: right; word-break: break-all; }
+    .capture-box {
+      border: 1px solid var(--border-strong);
+      background: var(--bg);
+      border-radius: 8px;
+      padding: 12px 14px;
+      display: none;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .capture-box.visible { display: flex; }
+    .disclosure summary {
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text-muted);
+      list-style: none;
+      user-select: none;
+    }
+    .disclosure summary:hover { color: var(--text); }
+    .disclosure[open] summary { margin-bottom: 12px; color: var(--text); }
 
     @media (max-width: 900px) {
       .routing-grid { grid-template-columns: 1fr; }
@@ -436,30 +476,68 @@
         <button id="closeModalBtn" class="btn" type="button">Close</button>
       </div>
       <div class="stack">
-        <div class="field">
-          <label for="credApiKey">Upstox API Key</label>
-          <input id="credApiKey" type="text" placeholder="Enter your Upstox API Key" autocomplete="off" />
+        <div id="detectedCredsBox" class="kv-box">
+          <div style="display:flex; align-items:center; justify-content:space-between; gap:12px;">
+            <span style="font-size:13px; font-weight:600;">Detected Local Configuration</span>
+            <button id="toggleCredsBtn" class="btn" type="button" style="min-height:30px; padding:4px 10px; font-size:12px;">Edit Credentials</button>
+          </div>
+          <div class="kv-row">
+            <span class="kv-label">API Key</span>
+            <span id="detApiKey" class="kv-val mono">—</span>
+          </div>
+          <div class="kv-row">
+            <span class="kv-label">API Secret</span>
+            <span id="detApiSecret" class="kv-val mono">—</span>
+          </div>
+          <div class="kv-row">
+            <span class="kv-label">Redirect URI</span>
+            <span id="detRedirectUri" class="kv-val mono">—</span>
+          </div>
         </div>
-        <div class="field">
-          <label for="credApiSecret">Upstox API Secret</label>
-          <input id="credApiSecret" type="password" placeholder="Stored in macOS Keychain / env (never returned)" autocomplete="off" />
+
+        <div id="credsFormFields" class="stack" style="display:none;">
+          <div class="field">
+            <label for="credApiKey">Upstox API Key</label>
+            <input id="credApiKey" type="text" placeholder="Enter your Upstox API Key" autocomplete="off" />
+          </div>
+          <div class="field">
+            <label for="credApiSecret">Upstox API Secret</label>
+            <input id="credApiSecret" type="password" placeholder="Stored in macOS Keychain / .env (never returned)" autocomplete="off" />
+          </div>
+          <div class="field">
+            <label for="credRedirectUri">OAuth Redirect URI</label>
+            <input id="credRedirectUri" type="text" placeholder="https://127.0.0.1:5000/" />
+          </div>
+          <div>
+            <button id="saveCredsBtn" class="btn" type="button">Save Credentials</button>
+          </div>
         </div>
-        <div class="field">
-          <label for="credRedirectUri">OAuth Redirect URI</label>
-          <input id="credRedirectUri" type="text" placeholder="http://127.0.0.1:8000/auth/upstox/callback" />
+
+        <button id="openLoginBtn" class="btn btn-primary" type="button" style="width:100%;">Login with Upstox (Auto-Capture)</button>
+
+        <div id="captureStatusBox" class="capture-box">
+          <div class="led-row" style="font-size:13px;">
+            <span id="captureLed" class="led connecting" aria-hidden="true"></span>
+            <span id="captureTitle">Waiting for Upstox authorization...</span>
+          </div>
+          <div id="captureDetail" class="broker-sub"></div>
+          <div id="oauthUrlBox" class="mono" style="font-size:11px; color:#94a3b8; word-break:break-all;"></div>
         </div>
-        <div style="display:flex; gap:10px; flex-wrap:wrap;">
-          <button id="saveCredsBtn" class="btn" type="button">Save Credentials</button>
-          <button id="openLoginBtn" class="btn btn-primary" type="button">Open Upstox OAuth Login</button>
-        </div>
-        <div id="oauthUrlBox" class="mono" style="font-size:12px; color:#94a3b8; word-break:break-all;"></div>
+
         <hr class="divider" />
-        <div class="field">
-          <label for="callbackCodeInput">Paste Redirect URL or Authorization Code</label>
-          <input id="callbackCodeInput" type="text" placeholder="https://127.0.0.1:5000/?code=... or bare code" autocomplete="off" />
-          <span class="hint">If your Upstox app redirects to port 5000 instead of /auth/upstox/callback, paste the redirected URL here.</span>
-        </div>
-        <button id="exchangeCodeBtn" class="btn btn-primary" type="button">Exchange Code &amp; Connect</button>
+
+        <details id="manualFallbackDetails" class="disclosure">
+          <summary>Manual Fallback: Paste Redirect URL or Authorization Code</summary>
+          <div class="stack">
+            <div class="field">
+              <label for="callbackCodeInput">Redirected Callback URL or Code</label>
+              <input id="callbackCodeInput" type="text" placeholder="https://127.0.0.1:5000/?code=... or bare code" autocomplete="off" />
+              <span class="hint">Use this only if browser auto-capture is blocked by a browser warning or proxy.</span>
+            </div>
+            <button id="exchangeCodeBtn" class="btn" type="button">Exchange Code &amp; Connect</button>
+          </div>
+        </details>
+
         <div id="modalFeedback" class="feedback" role="status" aria-live="polite"></div>
       </div>
     </div>
@@ -470,6 +548,9 @@
       overview: null,
       activeBrokerModal: 'upstox',
       probingIds: new Set(),
+      captureTimer: null,
+      captureActive: false,
+      credsExpanded: false,
     };
 
     const els = {
@@ -482,12 +563,22 @@
       directory: document.getElementById('brokerDirectory'),
       modal: document.getElementById('reconnectModal'),
       closeModalBtn: document.getElementById('closeModalBtn'),
+      toggleCredsBtn: document.getElementById('toggleCredsBtn'),
+      credsFormFields: document.getElementById('credsFormFields'),
+      detApiKey: document.getElementById('detApiKey'),
+      detApiSecret: document.getElementById('detApiSecret'),
+      detRedirectUri: document.getElementById('detRedirectUri'),
       credApiKey: document.getElementById('credApiKey'),
       credApiSecret: document.getElementById('credApiSecret'),
       credRedirectUri: document.getElementById('credRedirectUri'),
       saveCredsBtn: document.getElementById('saveCredsBtn'),
       openLoginBtn: document.getElementById('openLoginBtn'),
+      captureStatusBox: document.getElementById('captureStatusBox'),
+      captureLed: document.getElementById('captureLed'),
+      captureTitle: document.getElementById('captureTitle'),
+      captureDetail: document.getElementById('captureDetail'),
       oauthUrlBox: document.getElementById('oauthUrlBox'),
+      manualFallbackDetails: document.getElementById('manualFallbackDetails'),
       callbackCodeInput: document.getElementById('callbackCodeInput'),
       exchangeCodeBtn: document.getElementById('exchangeCodeBtn'),
       modalFeedback: document.getElementById('modalFeedback'),
@@ -702,21 +793,73 @@
       }
     }
 
-    function openReconnectModal(brokerId) {
-      state.activeBrokerModal = brokerId;
+    function sourceLabel(src) {
+      if (src === 'env') return '.env';
+      if (src === 'keychain') return 'macOS Keychain';
+      return 'Default';
+    }
+
+    function stopCapturePolling(cancelOnServer = false) {
+      if (state.captureTimer) {
+        clearInterval(state.captureTimer);
+        state.captureTimer = null;
+      }
+      if (cancelOnServer && state.captureActive) {
+        state.captureActive = false;
+        fetch(`/api/brokers/${state.activeBrokerModal}/reconnect-cancel`, {
+          method: 'POST',
+          keepalive: true,
+        }).catch(() => {});
+      }
+      state.captureActive = false;
+    }
+
+    function setCredsExpanded(expanded) {
+      state.credsExpanded = expanded;
+      els.credsFormFields.style.display = expanded ? 'flex' : 'none';
+      els.toggleCredsBtn.textContent = expanded ? 'Hide Inputs' : 'Edit Credentials';
+    }
+
+    function syncDetectedCredsUI(brokerId) {
       const creds = (state.overview && state.overview.credentials && state.overview.credentials[brokerId]) || {};
+      els.detApiKey.textContent = creds.has_api_key
+        ? `${creds.api_key_preview} (${sourceLabel(creds.key_source)})`
+        : 'Missing';
+      els.detApiSecret.textContent = creds.has_api_secret
+        ? `Configured (${sourceLabel(creds.secret_source)})`
+        : 'Missing';
+      els.detRedirectUri.textContent = creds.redirect_uri
+        ? `${creds.redirect_uri} (${sourceLabel(creds.redirect_source)})`
+        : `${window.location.origin}/auth/${brokerId}/callback (Default)`;
+      els.credApiKey.placeholder = creds.has_api_key
+        ? `Detected (${creds.api_key_preview}) — enter only to override`
+        : 'Enter your Upstox API Key';
+      els.credApiSecret.placeholder = creds.has_api_secret
+        ? `Detected in ${sourceLabel(creds.secret_source)} — enter only to override`
+        : 'Enter your Upstox API Secret';
+      els.credRedirectUri.value = creds.redirect_uri || `${window.location.origin}/auth/${brokerId}/callback`;
+      return Boolean(creds.has_api_key && creds.has_api_secret);
+    }
+
+    async function openReconnectModal(brokerId) {
+      stopCapturePolling(false);
+      state.activeBrokerModal = brokerId;
+      await loadOverview(false);
+      const hasAll = syncDetectedCredsUI(brokerId);
       els.credApiKey.value = '';
       els.credApiSecret.value = '';
-      els.credApiKey.placeholder = creds.has_api_key ? `Configured (${creds.api_key_preview})` : 'Enter your Upstox API Key';
-      els.credApiSecret.placeholder = creds.has_api_secret ? 'Configured in Keychain/env (leave blank to keep)' : 'Enter your Upstox API Secret';
-      els.credRedirectUri.value = creds.redirect_uri || `${window.location.origin}/auth/${brokerId}/callback`;
+      setCredsExpanded(!hasAll);
+      els.captureStatusBox.classList.remove('visible');
       els.oauthUrlBox.textContent = '';
       els.callbackCodeInput.value = '';
+      els.manualFallbackDetails.open = false;
       els.modalFeedback.textContent = '';
+      els.modalFeedback.className = 'feedback';
       els.modal.classList.add('open');
     }
 
     function closeModal() {
+      stopCapturePolling(true);
       els.modal.classList.remove('open');
     }
 
@@ -733,17 +876,83 @@
         });
         const payload = await res.json();
         if (!res.ok) throw new Error(payload.detail || 'Credential save failed');
-        els.modalFeedback.className = 'feedback ok';
-        els.modalFeedback.textContent = 'Credentials saved securely. You can now open Upstox OAuth login.';
         await loadOverview(false);
+        syncDetectedCredsUI(state.activeBrokerModal);
+        setCredsExpanded(false);
+        els.modalFeedback.className = 'feedback ok';
+        els.modalFeedback.textContent = 'Credentials saved securely. Click Login with Upstox (Auto-Capture).';
       } catch (err) {
         els.modalFeedback.className = 'feedback err';
         els.modalFeedback.textContent = err.message;
       }
     }
 
+    async function pollCaptureStatus() {
+      if (!state.captureActive) return;
+      try {
+        const res = await fetch(`/api/brokers/${state.activeBrokerModal}/reconnect-status`);
+        if (!res.ok) return;
+        const st = await res.json();
+        if (st.status === 'listening') {
+          els.captureLed.className = 'led connecting';
+          els.captureTitle.textContent = 'Waiting for Upstox browser redirect...';
+          els.captureDetail.textContent = st.message || '';
+        } else if (st.status === 'exchanging') {
+          els.captureLed.className = 'led connecting';
+          els.captureTitle.textContent = 'Code captured — verifying session...';
+          els.captureDetail.textContent = st.message || '';
+        } else if (st.status === 'connected') {
+          stopCapturePolling(false);
+          els.captureLed.className = 'led connected';
+          els.captureTitle.textContent = 'Connected automatically';
+          els.captureDetail.textContent = st.message || 'Upstox token exchanged and verified.';
+          els.modalFeedback.className = 'feedback ok';
+          els.modalFeedback.textContent = 'Connected and verified against Upstox profile API.';
+          await loadOverview(true);
+          setTimeout(() => {
+            if (els.modal.classList.contains('open')) {
+              els.modal.classList.remove('open');
+            }
+          }, 800);
+        } else if (st.status === 'error' || st.status === 'timeout') {
+          stopCapturePolling(false);
+          els.captureLed.className = 'led error';
+          els.captureTitle.textContent = st.status === 'timeout' ? 'Auto-capture timed out' : 'Auto-capture failed';
+          els.captureDetail.textContent = st.message || '';
+          els.manualFallbackDetails.open = true;
+        }
+      } catch {
+        // Transient network hiccup during local polling; keep polling
+      }
+    }
+
     async function startOAuth() {
       els.modalFeedback.className = 'feedback';
+      els.modalFeedback.textContent = '';
+
+      // If user typed fresh credentials in expanded fields, persist them automatically first
+      const typedKey = els.credApiKey.value.trim();
+      const typedSecret = els.credApiSecret.value.trim();
+      if (typedKey && typedSecret) {
+        const saveRes = await fetch(`/api/brokers/${state.activeBrokerModal}/credentials`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            api_key: typedKey,
+            api_secret: typedSecret,
+            redirect_uri: els.credRedirectUri.value.trim() || null,
+          }),
+        });
+        if (!saveRes.ok) {
+          const errPayload = await saveRes.json().catch(() => ({}));
+          els.modalFeedback.className = 'feedback err';
+          els.modalFeedback.textContent = errPayload.detail || 'Could not save entered credentials.';
+          return;
+        }
+        await loadOverview(false);
+        syncDetectedCredsUI(state.activeBrokerModal);
+      }
+
       try {
         const res = await fetch(`/api/brokers/${state.activeBrokerModal}/reconnect`, {
           method: 'POST',
@@ -753,15 +962,38 @@
         const payload = await res.json();
         if (!res.ok) throw new Error(payload.detail || 'Could not generate OAuth link');
         if (payload.mode === 'needs_credentials') {
+          setCredsExpanded(true);
           els.modalFeedback.className = 'feedback err';
           els.modalFeedback.textContent = payload.message;
           return;
         }
         if (payload.login_url) {
-          els.oauthUrlBox.textContent = `OAuth URL: ${payload.login_url}`;
-          window.open(payload.login_url, '_blank', 'noopener');
-          els.modalFeedback.className = 'feedback ok';
-          els.modalFeedback.textContent = 'OAuth login opened in a new tab. Complete login or paste the redirected URL below.';
+          els.captureStatusBox.classList.add('visible');
+          els.captureLed.className = 'led connecting';
+          els.captureTitle.textContent = payload.capture_mode === 'manual_only'
+            ? 'Manual code paste needed for this port'
+            : 'Listening for automatic OAuth callback...';
+          const httpsHint = (payload.redirect_uri || '').startsWith('https://127.0.0.1')
+            ? ' Note: if the browser warns about the local self-signed cert on 127.0.0.1, click Advanced -> Proceed so capture completes automatically.'
+            : '';
+          els.captureDetail.textContent = (payload.message || '') + httpsHint;
+          els.oauthUrlBox.innerHTML = '';
+          const link = document.createElement('a');
+          link.href = payload.login_url;
+          link.target = 'algodesk_oauth_login';
+          link.style.color = '#38bdf8';
+          link.textContent = 'Open Upstox login link (click if popup was blocked)';
+          els.oauthUrlBox.appendChild(link);
+
+          window.open(payload.login_url, 'algodesk_oauth_login', 'width=640,height=760');
+
+          if (payload.capture_mode === 'manual_only') {
+            els.manualFallbackDetails.open = true;
+          } else {
+            stopCapturePolling(false);
+            state.captureActive = true;
+            state.captureTimer = setInterval(pollCaptureStatus, 900);
+          }
         }
       } catch (err) {
         els.modalFeedback.className = 'feedback err';
@@ -790,10 +1022,13 @@
         });
         const payload = await res.json();
         if (!res.ok) throw new Error(payload.detail || 'Token exchange failed');
+        stopCapturePolling(false);
+        els.captureLed.className = 'led connected';
+        els.captureTitle.textContent = 'Connected';
         els.modalFeedback.className = 'feedback ok';
         els.modalFeedback.textContent = 'Connected and verified against Upstox profile API.';
         await loadOverview(true);
-        setTimeout(closeModal, 600);
+        setTimeout(() => els.modal.classList.remove('open'), 600);
       } catch (err) {
         els.modalFeedback.className = 'feedback err';
         els.modalFeedback.textContent = err.message;
@@ -802,9 +1037,16 @@
       }
     }
 
+    window.addEventListener('message', (event) => {
+      if (event && event.data && event.data.type === 'algodesk-oauth-captured') {
+        void pollCaptureStatus();
+      }
+    });
+
     els.refreshBtn.addEventListener('click', () => loadOverview(true));
     els.saveRoutingBtn.addEventListener('click', saveRouting);
     els.closeModalBtn.addEventListener('click', closeModal);
+    els.toggleCredsBtn.addEventListener('click', () => setCredsExpanded(!state.credsExpanded));
     els.saveCredsBtn.addEventListener('click', saveCredentials);
     els.openLoginBtn.addEventListener('click', startOAuth);
     els.exchangeCodeBtn.addEventListener('click', exchangeCode);

@@ -64,6 +64,47 @@ def current_upstox_session_bounds(now: Optional[datetime] = None) -> tuple[datet
     return start, expiry
 
 
+def _ensure_loopback_ssl_certs(cert_file: str, key_file: str) -> tuple[str, str]:
+    """Ensure self-signed localhost TLS cert/key exist for HTTPS loopback capture."""
+    cert_path = Path(cert_file)
+    key_path = Path(key_file)
+    if cert_path.exists() and key_path.exists():
+        return str(cert_path), str(key_path)
+
+    cert_path.parent.mkdir(parents=True, exist_ok=True)
+    key_path.parent.mkdir(parents=True, exist_ok=True)
+    import subprocess
+
+    try:
+        subprocess.run(
+            [
+                "openssl",
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-nodes",
+                "-keyout",
+                str(key_path),
+                "-out",
+                str(cert_path),
+                "-days",
+                "365",
+                "-subj",
+                "/CN=127.0.0.1",
+            ],
+            check=True,
+            capture_output=True,
+            timeout=10,
+        )
+        os.chmod(key_path, stat.S_IRUSR | stat.S_IWUSR)
+        return str(cert_path), str(key_path)
+    except Exception as exc:
+        raise RuntimeError(
+            "HTTPS redirect capture requires cert.pem and key.pem, and automatic generation via openssl failed."
+        ) from exc
+
+
 class _DualProtocolLoopbackListener:
     """Accept HTTPS or plain HTTP on the same loopback port for OAuth redirect capture."""
 
@@ -80,6 +121,7 @@ class _DualProtocolLoopbackListener:
                 "HTTPS redirect capture requires UPSTOX_REDIRECT_SSL_CERT_FILE "
                 "and UPSTOX_REDIRECT_SSL_KEY_FILE."
             )
+        cert_file, key_file = _ensure_loopback_ssl_certs(cert_file, key_file)
 
         self.host = host
         self.port = port
@@ -156,9 +198,10 @@ class _DualProtocolLoopbackListener:
                 self.captured["url"] = f"{scheme}://{host_header}{path}"
                 self.event.set()
                 body = (
-                    "<html><body style='font-family:sans-serif;background:#0F172A;color:#F8FAFC;padding:2rem'>"
-                    "<h3>Upstox login captured.</h3>"
-                    "<p>You can close this window and return to AlgoDesk.</p>"
+                    "<html><body style='font-family:sans-serif;background:#0b1120;color:#f1f5f9;padding:2rem'>"
+                    "<h3>Upstox login captured automatically.</h3>"
+                    "<p>AlgoDesk is exchanging your code and verifying your session. You can close this tab.</p>"
+                    "<script>try{if(window.opener){window.opener.postMessage({type:'algodesk-oauth-captured',brokerId:'upstox'},'*');}setTimeout(()=>window.close(),1200);}catch(e){}</script>"
                     "</body></html>"
                 ).encode("utf-8")
                 self._send_response(conn, 200, body)
@@ -258,8 +301,9 @@ class AuthManager:
         webbrowser.open(url)
         return url
 
-    def _build_redirect_listener(self):
-        parsed = urlparse(self.redirect_uri)
+    def build_redirect_listener(self, redirect_uri: Optional[str] = None):
+        target_uri = redirect_uri or self.redirect_uri
+        parsed = urlparse(target_uri)
         host = parsed.hostname or "127.0.0.1"
         port = parsed.port or (443 if parsed.scheme == "https" else 80)
         expected_path = parsed.path or "/"
@@ -286,7 +330,13 @@ class AuthManager:
                     host_header = self.headers.get("Host", f"{host}:{port}")
                     captured["url"] = f"{scheme}://{host_header}{self.path}"
                     event.set()
-                    body = b"<html><body><h3>Upstox login captured.</h3></body></html>"
+                    body = (
+                        b"<html><body style='font-family:sans-serif;background:#0b1120;color:#f1f5f9;padding:2rem'>"
+                        b"<h3>Upstox login captured automatically.</h3>"
+                        b"<p>AlgoDesk is verifying your session. You can close this tab.</p>"
+                        b"<script>try{if(window.opener){window.opener.postMessage({type:'algodesk-oauth-captured',brokerId:'upstox'},'*');}setTimeout(()=>window.close(),1200);}catch(e){}</script>"
+                        b"</body></html>"
+                    )
                     self.send_response(200)
                     self.send_header("Content-Type", "text/html; charset=utf-8")
                     self.send_header("Content-Length", str(len(body)))
@@ -303,9 +353,12 @@ class AuthManager:
         server.timeout = 0.5
         return server, event, captured
 
+    def _build_redirect_listener(self, redirect_uri: Optional[str] = None):
+        return self.build_redirect_listener(redirect_uri=redirect_uri)
+
     def login_and_capture_token(self, timeout: int = 180, open_browser: bool = True) -> dict:
         login_url = self.get_login_url()
-        server, event, captured = self._build_redirect_listener()
+        server, event, captured = self.build_redirect_listener()
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
