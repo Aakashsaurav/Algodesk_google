@@ -155,29 +155,36 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.get("/auth/{broker_id}/callback", response_class=HTMLResponse)
-    def auth_callback(broker_id: str, code: Optional[str] = None, error: Optional[str] = None) -> HTMLResponse:
-        if error:
+    def auth_callback(
+        broker_id: str,
+        code: Optional[str] = None,
+        request_token: Optional[str] = None,
+        status: Optional[str] = None,
+        error: Optional[str] = None,
+    ) -> HTMLResponse:
+        if error or (status and status.lower() not in {"success", "ok"}):
             return HTMLResponse(
                 _render_callback_page(
                     title="Authorization declined",
-                    detail=error,
+                    detail=error or f"Broker returned status={status}",
                     broker_id=broker_id,
                     success=False,
                 ),
                 status_code=400,
             )
-        if not code:
+        auth_token = request_token or code
+        if not auth_token:
             return HTMLResponse(
                 _render_callback_page(
-                    title="Missing authorization code",
-                    detail="No authorization code query parameter was returned by the broker.",
+                    title="Missing authorization token",
+                    detail="No code or request_token query parameter was returned by the broker.",
                     broker_id=broker_id,
                     success=False,
                 ),
                 status_code=400,
             )
         try:
-            result = hub_service.complete_reconnect(broker_id=broker_id, code_or_url=code)
+            result = hub_service.complete_reconnect(broker_id=broker_id, code_or_url=auth_token)
             state = result.get("broker", {}).get("state", "UNKNOWN")
             return HTMLResponse(
                 _render_callback_page(

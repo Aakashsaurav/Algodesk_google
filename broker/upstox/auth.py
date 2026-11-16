@@ -21,8 +21,6 @@ from __future__ import annotations
 import json
 import logging
 import os
-import socket
-import ssl
 import stat
 import threading
 import urllib.error
@@ -30,7 +28,6 @@ import urllib.parse
 import urllib.request
 import webbrowser
 from datetime import datetime, time, timedelta
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.parse import parse_qs, urlencode, urlparse
@@ -40,6 +37,7 @@ try:
 except ImportError:  # pragma: no cover - optional; stdlib urllib fallback supported
     requests = None  # type: ignore[assignment]
 
+from broker.loopback import build_loopback_listener
 from config import IST_TZ, config, keychain_delete, keychain_get, keychain_set
 
 logger = logging.getLogger(__name__)
@@ -62,170 +60,6 @@ def current_upstox_session_bounds(now: Optional[datetime] = None) -> tuple[datet
         start = today_reset - timedelta(days=1)
         expiry = today_reset
     return start, expiry
-
-
-def _ensure_loopback_ssl_certs(cert_file: str, key_file: str) -> tuple[str, str]:
-    """Ensure self-signed localhost TLS cert/key exist for HTTPS loopback capture."""
-    cert_path = Path(cert_file)
-    key_path = Path(key_file)
-    if cert_path.exists() and key_path.exists():
-        return str(cert_path), str(key_path)
-
-    cert_path.parent.mkdir(parents=True, exist_ok=True)
-    key_path.parent.mkdir(parents=True, exist_ok=True)
-    import subprocess
-
-    try:
-        subprocess.run(
-            [
-                "openssl",
-                "req",
-                "-x509",
-                "-newkey",
-                "rsa:2048",
-                "-nodes",
-                "-keyout",
-                str(key_path),
-                "-out",
-                str(cert_path),
-                "-days",
-                "365",
-                "-subj",
-                "/CN=127.0.0.1",
-            ],
-            check=True,
-            capture_output=True,
-            timeout=10,
-        )
-        os.chmod(key_path, stat.S_IRUSR | stat.S_IWUSR)
-        return str(cert_path), str(key_path)
-    except Exception as exc:
-        raise RuntimeError(
-            "HTTPS redirect capture requires cert.pem and key.pem, and automatic generation via openssl failed."
-        ) from exc
-
-
-class _DualProtocolLoopbackListener:
-    """Accept HTTPS or plain HTTP on the same loopback port for OAuth redirect capture."""
-
-    def __init__(
-        self,
-        host: str,
-        port: int,
-        expected_path: str,
-        cert_file: str,
-        key_file: str,
-    ) -> None:
-        if not cert_file or not key_file:
-            raise RuntimeError(
-                "HTTPS redirect capture requires UPSTOX_REDIRECT_SSL_CERT_FILE "
-                "and UPSTOX_REDIRECT_SSL_KEY_FILE."
-            )
-        cert_file, key_file = _ensure_loopback_ssl_certs(cert_file, key_file)
-
-        self.host = host
-        self.port = port
-        self.expected_path = expected_path or "/"
-        self.timeout = 0.5
-        self.captured: dict[str, Optional[str]] = {"url": None}
-        self.event = threading.Event()
-        self._stop_event = threading.Event()
-
-        self._ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-        self._ssl_context.load_cert_chain(certfile=cert_file, keyfile=key_file)
-
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._sock.bind((host, port))
-        self._sock.listen(5)
-        self._sock.settimeout(self.timeout)
-
-    def serve_forever(self) -> None:
-        while not self._stop_event.is_set():
-            try:
-                conn, _ = self._sock.accept()
-            except socket.timeout:
-                continue
-            except OSError:
-                break
-            self._handle_connection(conn)
-
-    def shutdown(self) -> None:
-        self._stop_event.set()
-
-    def server_close(self) -> None:
-        try:
-            self._sock.close()
-        except OSError:
-            pass
-
-    def _handle_connection(self, raw_conn: socket.socket) -> None:
-        conn = raw_conn
-        scheme = "http"
-        try:
-            try:
-                first_byte = raw_conn.recv(1, socket.MSG_PEEK)
-            except (OSError, ValueError):
-                first_byte = b""
-
-            if first_byte[:1] == b"\x16":
-                conn = self._ssl_context.wrap_socket(raw_conn, server_side=True)
-                scheme = "https"
-
-            conn.settimeout(2.0)
-            request_bytes = b""
-            while b"\r\n\r\n" not in request_bytes and len(request_bytes) < 8192:
-                chunk = conn.recv(4096)
-                if not chunk:
-                    break
-                request_bytes += chunk
-
-            if not request_bytes:
-                return
-
-            lines = request_bytes.decode("latin1", errors="ignore").split("\r\n")
-            parts = (lines[0] if lines else "").split()
-            path = parts[1] if len(parts) >= 2 else "/"
-            host_header = f"{self.host}:{self.port}"
-            for line in lines[1:]:
-                if line.lower().startswith("host:"):
-                    host_header = line.split(":", 1)[1].strip()
-                    break
-
-            query = parse_qs(urlparse(path).query)
-            request_path = urlparse(path).path
-            if request_path.startswith(self.expected_path) or "code" in query:
-                self.captured["url"] = f"{scheme}://{host_header}{path}"
-                self.event.set()
-                body = (
-                    "<html><body style='font-family:sans-serif;background:#0b1120;color:#f1f5f9;padding:2rem'>"
-                    "<h3>Upstox login captured automatically.</h3>"
-                    "<p>AlgoDesk is exchanging your code and verifying your session. You can close this tab.</p>"
-                    "<script>try{if(window.opener){window.opener.postMessage({type:'algodesk-oauth-captured',brokerId:'upstox'},'*');}setTimeout(()=>window.close(),1200);}catch(e){}</script>"
-                    "</body></html>"
-                ).encode("utf-8")
-                self._send_response(conn, 200, body)
-                return
-
-            self._send_response(conn, 404, b"Not Found")
-        except (ssl.SSLError, OSError) as exc:
-            logger.debug("Local redirect socket error: %s", exc)
-        finally:
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-    @staticmethod
-    def _send_response(conn: socket.socket, status_code: int, body: bytes) -> None:
-        status_text = "OK" if status_code == 200 else "Not Found"
-        response = (
-            f"HTTP/1.1 {status_code} {status_text}\r\n"
-            "Content-Type: text/html; charset=utf-8\r\n"
-            f"Content-Length: {len(body)}\r\n"
-            "Connection: close\r\n\r\n"
-        ).encode("utf-8") + body
-        conn.sendall(response)
 
 
 class AuthManager:
@@ -265,24 +99,19 @@ class AuthManager:
         redirect_uri: Optional[str] = None,
     ) -> None:
         """
-        Persist credentials safely into macOS Keychain (when available) and
-        in-process environment variables. Never writes plaintext secrets into
-        algodesk.toml or exposes them back to the browser.
+        Persist credentials cleanly into process env and the local 0o600 vault
+        (and macOS Keychain only if ALGODESK_USE_KEYCHAIN=true).
         """
         clean_key = api_key.strip()
         clean_secret = api_secret.strip()
         if not clean_key or not clean_secret:
             raise ValueError("Both API Key and API Secret are required.")
 
-        os.environ["UPSTOX_API_KEY"] = clean_key
-        os.environ["UPSTOX_API_SECRET"] = clean_secret
-        keychain_set(KEYRING_SERVICE, "upstox_api_key", clean_key)
-        keychain_set(KEYRING_SERVICE, "upstox_api_secret", clean_secret)
+        config.save_local_credential("UPSTOX_API_KEY", "upstox_api_key", clean_key)
+        config.save_local_credential("UPSTOX_API_SECRET", "upstox_api_secret", clean_secret)
 
         if redirect_uri and redirect_uri.strip():
-            clean_uri = redirect_uri.strip()
-            os.environ["UPSTOX_REDIRECT_URI"] = clean_uri
-            keychain_set(KEYRING_SERVICE, "upstox_redirect_uri", clean_uri)
+            config.save_local_credential("UPSTOX_REDIRECT_URI", "upstox_redirect_uri", redirect_uri.strip())
 
     def get_login_url(self, redirect_uri: Optional[str] = None, state: Optional[str] = None) -> str:
         if not self.api_key:
@@ -303,55 +132,12 @@ class AuthManager:
 
     def build_redirect_listener(self, redirect_uri: Optional[str] = None):
         target_uri = redirect_uri or self.redirect_uri
-        parsed = urlparse(target_uri)
-        host = parsed.hostname or "127.0.0.1"
-        port = parsed.port or (443 if parsed.scheme == "https" else 80)
-        expected_path = parsed.path or "/"
-        is_loopback = host in {"127.0.0.1", "localhost"}
-
-        if parsed.scheme == "https" and is_loopback:
-            server = _DualProtocolLoopbackListener(
-                host=host,
-                port=port,
-                expected_path=expected_path,
-                cert_file=config.UPSTOX_REDIRECT_SSL_CERT_FILE,
-                key_file=config.UPSTOX_REDIRECT_SSL_KEY_FILE,
-            )
-            return server, server.event, server.captured
-
-        captured: dict[str, Optional[str]] = {"url": None}
-        event = threading.Event()
-
-        class _CallbackHandler(BaseHTTPRequestHandler):
-            def do_GET(self):  # type: ignore[override]
-                query = parse_qs(urlparse(self.path).query)
-                if self.path.startswith(expected_path) or "code" in query:
-                    scheme = parsed.scheme or "http"
-                    host_header = self.headers.get("Host", f"{host}:{port}")
-                    captured["url"] = f"{scheme}://{host_header}{self.path}"
-                    event.set()
-                    body = (
-                        b"<html><body style='font-family:sans-serif;background:#0b1120;color:#f1f5f9;padding:2rem'>"
-                        b"<h3>Upstox login captured automatically.</h3>"
-                        b"<p>AlgoDesk is verifying your session. You can close this tab.</p>"
-                        b"<script>try{if(window.opener){window.opener.postMessage({type:'algodesk-oauth-captured',brokerId:'upstox'},'*');}setTimeout(()=>window.close(),1200);}catch(e){}</script>"
-                        b"</body></html>"
-                    )
-                    self.send_response(200)
-                    self.send_header("Content-Type", "text/html; charset=utf-8")
-                    self.send_header("Content-Length", str(len(body)))
-                    self.end_headers()
-                    self.wfile.write(body)
-                    return
-                self.send_response(404)
-                self.end_headers()
-
-            def log_message(self, format, *args):
-                return
-
-        server = ThreadingHTTPServer((host, port), _CallbackHandler)
-        server.timeout = 0.5
-        return server, event, captured
+        return build_loopback_listener(
+            redirect_uri=target_uri,
+            broker_id="upstox",
+            ssl_cert_file=config.UPSTOX_REDIRECT_SSL_CERT_FILE,
+            ssl_key_file=config.UPSTOX_REDIRECT_SSL_KEY_FILE,
+        )
 
     def _build_redirect_listener(self, redirect_uri: Optional[str] = None):
         return self.build_redirect_listener(redirect_uri=redirect_uri)
@@ -485,20 +271,13 @@ class AuthManager:
             access_token = token_data.get("access_token", "")
             disk_token_data = dict(token_data)
 
-            stored_in_keychain = False
-            if access_token:
-                stored_in_keychain = keychain_set(KEYRING_SERVICE, KEYRING_USERNAME, access_token)
-                if stored_in_keychain:
+            if access_token and config.USE_KEYCHAIN:
+                if keychain_set(KEYRING_SERVICE, KEYRING_USERNAME, access_token):
                     disk_token_data.pop("access_token", None)
 
             with open(self.token_file, "w", encoding="utf-8") as fh:
                 json.dump(disk_token_data, fh, indent=2)
             os.chmod(self.token_file, stat.S_IRUSR | stat.S_IWUSR)
-
-            if access_token and not stored_in_keychain:
-                logger.warning(
-                    "OS Keychain/keyring unavailable; stored token in 0o600 file fallback."
-                )
         except Exception as exc:
             logger.warning("Could not persist token metadata: %s", exc)
 
@@ -514,7 +293,9 @@ class AuthManager:
         if not self._is_token_fresh(token_data):
             return None
 
-        access_token = keychain_get(KEYRING_SERVICE, KEYRING_USERNAME) or token_data.get("access_token")
+        access_token = token_data.get("access_token")
+        if not access_token and config.USE_KEYCHAIN:
+            access_token = keychain_get(KEYRING_SERVICE, KEYRING_USERNAME)
         if not access_token:
             return None
 
@@ -556,7 +337,7 @@ class AuthManager:
         return {"status": "not_authenticated"}
 
     def invalidate_local(self) -> None:
-        """Clear local in-memory, disk, and Keychain token state."""
+        """Clear local in-memory, disk, and optional Keychain token state."""
         with self._lock:
             self._token_data = None
             if self.token_file.exists():
@@ -564,7 +345,8 @@ class AuthManager:
                     self.token_file.unlink()
                 except OSError:
                     pass
-            keychain_delete(KEYRING_SERVICE, KEYRING_USERNAME)
+            if config.USE_KEYCHAIN:
+                keychain_delete(KEYRING_SERVICE, KEYRING_USERNAME)
 
     def logout(self) -> bool:
         """Invalidate token on Upstox server (using UPSTOX_BASE_URL) and purge local stores."""

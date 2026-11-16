@@ -36,6 +36,16 @@ interface BrokerSnapshot {
   roadmap_note: string;
 }
 
+interface BrokerCredSummary {
+  has_api_key: boolean;
+  has_api_secret: boolean;
+  api_key_preview: string;
+  redirect_uri: string;
+  key_source?: 'env' | 'local_vault' | 'keychain' | 'none';
+  secret_source?: 'env' | 'local_vault' | 'keychain' | 'none';
+  redirect_source?: 'env' | 'local_vault' | 'keychain' | 'none';
+}
+
 interface OverviewPayload {
   brokers: BrokerSnapshot[];
   selections: {
@@ -43,17 +53,7 @@ interface OverviewPayload {
     data_connection: string;
     updated_at: string;
   };
-  credentials: {
-    upstox?: {
-      has_api_key: boolean;
-      has_api_secret: boolean;
-      api_key_preview: string;
-      redirect_uri: string;
-      key_source?: 'env' | 'keychain' | 'none';
-      secret_source?: 'env' | 'keychain' | 'none';
-      redirect_source?: 'env' | 'keychain' | 'none';
-    };
-  };
+  credentials: Record<string, BrokerCredSummary | undefined>;
   runtime: {
     python_version: string;
     machine: string;
@@ -65,6 +65,7 @@ interface OverviewPayload {
 
 function formatCredentialSource(src?: string): string {
   if (src === 'env') return '.env';
+  if (src === 'local_vault') return 'Local 0o600 Vault';
   if (src === 'keychain') return 'macOS Keychain';
   return 'Default';
 }
@@ -74,13 +75,13 @@ const ROADMAP_PHASES = [
     phase: 'Phase 01',
     title: 'Hardened Upstox Hub & Security Fixes',
     detail:
-      'Fixed Upstox logout endpoint, IST 03:30 AM daily reset boundary validation, macOS Keychain secret storage, and decoupled M2-friendly broker health probing.',
+      'Fixed Upstox logout endpoint, IST 03:30 AM daily reset boundary validation, 0o600 local vault secret storage (opt-in Keychain), and decoupled M2-friendly broker health probing.',
   },
   {
     phase: 'Phase 02',
-    title: 'Zerodha Kite Connect Adapter',
+    title: 'Zerodha Kite Connect Adapter (Active)',
     detail:
-      'Implement Kite OAuth SHA-256 checksum login, KiteTicker WebSocket feed, and promote Zerodha from Planned to Active inside BrokerRegistry without UI rewrites.',
+      'Implemented Kite OAuth SHA-256 checksum login, 06:00 AM IST boundary validation, lazy KiteTicker WebSocket feed, and active BrokerRegistry routing.',
   },
   {
     phase: 'Phase 03',
@@ -281,12 +282,15 @@ export default function App() {
       const res = await fetch(`/api/brokers/${modalBrokerId}/reconnect-status`);
       if (!res.ok) return;
       const st = await res.json();
+      const label =
+        overview?.brokers.find((b) => b.broker_id === modalBrokerId)?.display_name ||
+        (modalBrokerId === 'zerodha' ? 'Zerodha Kite' : 'Upstox');
       if (st.status === 'listening' || st.status === 'exchanging') {
         setCaptureStatus({
           status: st.status,
           mode: st.capture_mode,
           redirectUri: st.redirect_uri,
-          message: st.message || 'Waiting for Upstox redirect...',
+          message: st.message || `Waiting for ${label} redirect...`,
         });
       } else if (st.status === 'connected') {
         setCaptureActive(false);
@@ -294,9 +298,9 @@ export default function App() {
           status: 'connected',
           mode: st.capture_mode,
           redirectUri: st.redirect_uri,
-          message: st.message || 'Connected automatically and verified with Upstox.',
+          message: st.message || `Connected automatically and verified with ${label}.`,
         });
-        setModalFeedback({ type: 'ok', text: 'Connected and verified against Upstox profile API.' });
+        setModalFeedback({ type: 'ok', text: `Connected and verified against ${label} profile API.` });
         await fetchOverview(true);
         setTimeout(() => setModalBrokerId(null), 800);
       } else if (st.status === 'error' || st.status === 'timeout') {
@@ -312,7 +316,7 @@ export default function App() {
     } catch {
       // Transient poll failure; ignore and retry on next interval
     }
-  }, [captureActive, fetchOverview, modalBrokerId]);
+  }, [captureActive, fetchOverview, modalBrokerId, overview]);
 
   useEffect(() => {
     if (!captureActive || !modalBrokerId) return;
@@ -342,7 +346,7 @@ export default function App() {
     setModalFeedback(null);
 
     const fresh = await fetchOverview(false);
-    const creds = fresh?.credentials?.upstox ?? overview?.credentials?.upstox;
+    const creds = fresh?.credentials?.[brokerId] ?? overview?.credentials?.[brokerId];
     const hasAll = Boolean(creds?.has_api_key && creds?.has_api_secret);
     setCredsExpanded(!hasAll);
     setManualOpen(false);
@@ -351,6 +355,9 @@ export default function App() {
 
   const handleSaveCredentials = async () => {
     if (!modalBrokerId) return;
+    const label =
+      overview?.brokers.find((b) => b.broker_id === modalBrokerId)?.display_name ||
+      (modalBrokerId === 'zerodha' ? 'Zerodha Kite' : 'Upstox');
     setModalFeedback(null);
     try {
       const res = await fetch(`/api/brokers/${modalBrokerId}/credentials`, {
@@ -368,7 +375,7 @@ export default function App() {
       setCredsExpanded(false);
       setModalFeedback({
         type: 'ok',
-        text: 'Credentials saved securely. Click Login with Upstox (Auto-Capture).',
+        text: `Credentials saved securely. Click Login with ${label} (Auto-Capture).`,
       });
     } catch (err) {
       setModalFeedback({
@@ -441,8 +448,11 @@ export default function App() {
 
   const handleExchangeCode = async () => {
     if (!modalBrokerId) return;
+    const label =
+      overview?.brokers.find((b) => b.broker_id === modalBrokerId)?.display_name ||
+      (modalBrokerId === 'zerodha' ? 'Zerodha Kite' : 'Upstox');
     if (!callbackInput.trim()) {
-      setModalFeedback({ type: 'err', text: 'Paste the redirected callback URL or authorization code first.' });
+      setModalFeedback({ type: 'err', text: 'Paste the redirected callback URL or authorization token first.' });
       return;
     }
     setExchanging(true);
@@ -457,10 +467,10 @@ export default function App() {
         }),
       });
       const data = await res.json();
-      if (!res.ok) throw new Error(data.detail || 'Authorization code exchange failed.');
+      if (!res.ok) throw new Error(data.detail || 'Authorization token exchange failed.');
       setCaptureActive(false);
-      setCaptureStatus({ status: 'connected', message: 'Connected and verified with Upstox.' });
-      setModalFeedback({ type: 'ok', text: 'Connected and verified against Upstox profile API.' });
+      setCaptureStatus({ status: 'connected', message: `Connected and verified with ${label}.` });
+      setModalFeedback({ type: 'ok', text: `Connected and verified against ${label} profile API.` });
       await fetchOverview(true);
       setTimeout(() => setModalBrokerId(null), 650);
     } catch (err) {
@@ -474,7 +484,10 @@ export default function App() {
   };
 
   const brokers = overview?.brokers ?? [];
-  const upstoxCreds = overview?.credentials?.upstox;
+  const activeCreds = modalBrokerId ? overview?.credentials?.[modalBrokerId] : undefined;
+  const modalBrokerLabel =
+    brokers.find((b) => b.broker_id === modalBrokerId)?.display_name ||
+    (modalBrokerId === 'zerodha' ? 'Zerodha Kite' : 'Upstox');
 
   return (
     <div className="min-h-screen bg-[#0b1120] text-slate-100">
@@ -797,7 +810,7 @@ export default function App() {
           <div className="max-h-[92vh] w-full max-w-[560px] overflow-y-auto rounded-xl border border-slate-700 bg-[#111827] p-6">
             <div className="mb-5 flex items-center justify-between gap-4">
               <h3 id="reconnect-modal-title" className="text-lg font-semibold text-slate-100">
-                Reconnect {modalBrokerId.charAt(0).toUpperCase() + modalBrokerId.slice(1)} Session
+                Reconnect {modalBrokerLabel} Session
               </h3>
               <button
                 type="button"
@@ -825,24 +838,24 @@ export default function App() {
                 <div className="flex items-baseline justify-between gap-3 text-xs">
                   <span className="font-semibold text-slate-400">API Key</span>
                   <span className="font-mono text-slate-200">
-                    {upstoxCreds?.has_api_key
-                      ? `${upstoxCreds.api_key_preview} (${formatCredentialSource(upstoxCreds.key_source)})`
+                    {activeCreds?.has_api_key
+                      ? `${activeCreds.api_key_preview} (${formatCredentialSource(activeCreds.key_source)})`
                       : 'Missing'}
                   </span>
                 </div>
                 <div className="flex items-baseline justify-between gap-3 text-xs">
                   <span className="font-semibold text-slate-400">API Secret</span>
                   <span className="font-mono text-slate-200">
-                    {upstoxCreds?.has_api_secret
-                      ? `Configured (${formatCredentialSource(upstoxCreds.secret_source)})`
+                    {activeCreds?.has_api_secret
+                      ? `Configured (${formatCredentialSource(activeCreds.secret_source)})`
                       : 'Missing'}
                   </span>
                 </div>
                 <div className="flex items-baseline justify-between gap-3 text-xs">
                   <span className="font-semibold text-slate-400">Redirect URI</span>
                   <span className="font-mono break-all text-right text-slate-200">
-                    {upstoxCreds?.redirect_uri
-                      ? `${upstoxCreds.redirect_uri} (${formatCredentialSource(upstoxCreds.redirect_source)})`
+                    {activeCreds?.redirect_uri
+                      ? `${activeCreds.redirect_uri} (${formatCredentialSource(activeCreds.redirect_source)})`
                       : `${redirectUri} (Default)`}
                   </span>
                 </div>
@@ -852,7 +865,7 @@ export default function App() {
                 <div className="space-y-3.5 rounded-lg border border-slate-800 bg-[#0b1120]/60 p-4">
                   <div>
                     <label htmlFor="modal-api-key" className="mb-1.5 block text-[13px] font-semibold text-slate-200">
-                      Upstox API Key
+                      {modalBrokerLabel} API Key
                     </label>
                     <input
                       id="modal-api-key"
@@ -860,9 +873,9 @@ export default function App() {
                       value={apiKey}
                       onChange={(e) => setApiKey(e.target.value)}
                       placeholder={
-                        upstoxCreds?.has_api_key
-                          ? `Detected (${upstoxCreds.api_key_preview}) — enter only to override`
-                          : 'Enter your Upstox API Key'
+                        activeCreds?.has_api_key
+                          ? `Detected (${activeCreds.api_key_preview}) — enter only to override`
+                          : `Enter your ${modalBrokerLabel} API Key`
                       }
                       autoComplete="off"
                       className="min-h-[42px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 text-sm text-slate-100 focus:border-sky-400 focus:outline-none"
@@ -871,7 +884,7 @@ export default function App() {
 
                   <div>
                     <label htmlFor="modal-api-secret" className="mb-1.5 block text-[13px] font-semibold text-slate-200">
-                      Upstox API Secret
+                      {modalBrokerLabel} API Secret
                     </label>
                     <input
                       id="modal-api-secret"
@@ -879,9 +892,9 @@ export default function App() {
                       value={apiSecret}
                       onChange={(e) => setApiSecret(e.target.value)}
                       placeholder={
-                        upstoxCreds?.has_api_secret
-                          ? `Detected in ${formatCredentialSource(upstoxCreds.secret_source)} — enter only to override`
-                          : 'Enter your Upstox API Secret'
+                        activeCreds?.has_api_secret
+                          ? `Detected in ${formatCredentialSource(activeCreds.secret_source)} — enter only to override`
+                          : `Enter your ${modalBrokerLabel} API Secret`
                       }
                       autoComplete="off"
                       className="min-h-[42px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 text-sm text-slate-100 focus:border-sky-400 focus:outline-none"
@@ -917,7 +930,7 @@ export default function App() {
                 className="inline-flex min-h-[42px] w-full items-center justify-center gap-2 whitespace-nowrap rounded-lg bg-sky-400 px-4 py-2 text-sm font-semibold text-sky-950 hover:bg-sky-300"
               >
                 <ExternalLink className="h-4 w-4" />
-                <span>Login with Upstox (Auto-Capture)</span>
+                <span>Login with {modalBrokerLabel} (Auto-Capture)</span>
               </button>
 
               {captureStatus && (
@@ -937,12 +950,12 @@ export default function App() {
                       {captureStatus.status === 'connected'
                         ? 'Connected automatically'
                         : captureStatus.status === 'exchanging'
-                          ? 'Code captured — verifying session...'
+                          ? 'Token captured — verifying session...'
                           : captureStatus.status === 'timeout'
                             ? 'Auto-capture timed out'
                             : captureStatus.status === 'error'
                               ? 'Auto-capture failed'
-                              : 'Listening for Upstox browser redirect...'}
+                              : `Listening for ${modalBrokerLabel} browser redirect...`}
                     </span>
                   </div>
                   <p className="text-xs text-slate-400">{captureStatus.message}</p>
@@ -953,7 +966,7 @@ export default function App() {
                       rel="noreferrer"
                       className="inline-block font-mono text-[11px] text-sky-400 underline underline-offset-4"
                     >
-                      Open Upstox login link (if popup was blocked)
+                      Open {modalBrokerLabel} login link (if popup was blocked)
                     </a>
                   )}
                 </div>
@@ -966,19 +979,23 @@ export default function App() {
                 onToggle={(e) => setManualOpen((e.currentTarget as HTMLDetailsElement).open)}
               >
                 <summary className="cursor-pointer select-none text-[13px] font-semibold text-slate-400 hover:text-slate-200">
-                  Manual Fallback: Paste Redirect URL or Authorization Code
+                  Manual Fallback: Paste Redirect URL or Authorization Token
                 </summary>
                 <div className="mt-3 space-y-3">
                   <div>
                     <label htmlFor="modal-callback-input" className="mb-1.5 block text-[13px] font-semibold text-slate-200">
-                      Redirected Callback URL or Code
+                      Redirected Callback URL or Token
                     </label>
                     <input
                       id="modal-callback-input"
                       type="text"
                       value={callbackInput}
                       onChange={(e) => setCallbackInput(e.target.value)}
-                      placeholder="https://127.0.0.1:5000/?code=... or bare code"
+                      placeholder={
+                        modalBrokerId === 'zerodha'
+                          ? 'http://127.0.0.1:8000/auth/zerodha/callback?request_token=... or bare token'
+                          : 'https://127.0.0.1:5000/?code=... or bare code'
+                      }
                       autoComplete="off"
                       className="min-h-[42px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 font-mono text-xs text-slate-100 focus:border-sky-400 focus:outline-none"
                     />
@@ -993,7 +1010,7 @@ export default function App() {
                     disabled={exchanging}
                     className="min-h-[40px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-4 py-2 text-[13px] font-semibold text-slate-200 hover:bg-slate-800 disabled:opacity-50"
                   >
-                    {exchanging ? 'Exchanging Code...' : 'Exchange Code & Connect'}
+                    {exchanging ? 'Exchanging Token...' : 'Exchange Token & Connect'}
                   </button>
                 </div>
               </details>

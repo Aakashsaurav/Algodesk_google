@@ -434,14 +434,14 @@
           <div class="roadmap-phase mono">Phase 01</div>
           <div>
             <div class="roadmap-title">Hardened Upstox Hub &amp; Security Fixes</div>
-            <div class="roadmap-detail">Fixed Upstox logout endpoint, IST 03:30 AM token boundary validation, macOS Keychain persistence, and decoupled M2-friendly broker health probing.</div>
+            <div class="roadmap-detail">Fixed Upstox logout endpoint, IST 03:30 AM token boundary validation, 0o600 local vault secret storage (opt-in Keychain), and decoupled M2-friendly broker health probing.</div>
           </div>
         </div>
         <div class="roadmap-item">
           <div class="roadmap-phase mono">Phase 02</div>
           <div>
-            <div class="roadmap-title">Zerodha Kite Connect Adapter</div>
-            <div class="roadmap-detail">Implement Kite OAuth SHA-256 checksum login, KiteTicker WebSocket feed, and promote Zerodha from Planned to Active in BrokerRegistry.</div>
+            <div class="roadmap-title">Zerodha Kite Connect Adapter (Active)</div>
+            <div class="roadmap-detail">Implemented Kite OAuth SHA-256 checksum login, 06:00 AM IST boundary validation, lazy KiteTicker WebSocket feed, and active BrokerRegistry routing.</div>
           </div>
         </div>
         <div class="roadmap-item">
@@ -472,7 +472,7 @@
   <div id="reconnectModal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
     <div class="modal">
       <div class="modal-head">
-        <h3 id="modalTitle">Reconnect Upstox Session</h3>
+        <h3 id="modalTitle">Reconnect Broker Session</h3>
         <button id="closeModalBtn" class="btn" type="button">Close</button>
       </div>
       <div class="stack">
@@ -497,28 +497,28 @@
 
         <div id="credsFormFields" class="stack" style="display:none;">
           <div class="field">
-            <label for="credApiKey">Upstox API Key</label>
-            <input id="credApiKey" type="text" placeholder="Enter your Upstox API Key" autocomplete="off" />
+            <label id="credApiKeyLabel" for="credApiKey">Broker API Key</label>
+            <input id="credApiKey" type="text" placeholder="Enter API Key" autocomplete="off" />
           </div>
           <div class="field">
-            <label for="credApiSecret">Upstox API Secret</label>
-            <input id="credApiSecret" type="password" placeholder="Stored in macOS Keychain / .env (never returned)" autocomplete="off" />
+            <label id="credApiSecretLabel" for="credApiSecret">Broker API Secret</label>
+            <input id="credApiSecret" type="password" placeholder="Stored locally in .env / 0o600 vault (never returned)" autocomplete="off" />
           </div>
           <div class="field">
             <label for="credRedirectUri">OAuth Redirect URI</label>
-            <input id="credRedirectUri" type="text" placeholder="https://127.0.0.1:5000/" />
+            <input id="credRedirectUri" type="text" placeholder="http://127.0.0.1:8000/auth/upstox/callback" />
           </div>
           <div>
             <button id="saveCredsBtn" class="btn" type="button">Save Credentials</button>
           </div>
         </div>
 
-        <button id="openLoginBtn" class="btn btn-primary" type="button" style="width:100%;">Login with Upstox (Auto-Capture)</button>
+        <button id="openLoginBtn" class="btn btn-primary" type="button" style="width:100%;">Login &amp; Auto-Capture</button>
 
         <div id="captureStatusBox" class="capture-box">
           <div class="led-row" style="font-size:13px;">
             <span id="captureLed" class="led connecting" aria-hidden="true"></span>
-            <span id="captureTitle">Waiting for Upstox authorization...</span>
+            <span id="captureTitle">Waiting for broker authorization...</span>
           </div>
           <div id="captureDetail" class="broker-sub"></div>
           <div id="oauthUrlBox" class="mono" style="font-size:11px; color:#94a3b8; word-break:break-all;"></div>
@@ -527,14 +527,14 @@
         <hr class="divider" />
 
         <details id="manualFallbackDetails" class="disclosure">
-          <summary>Manual Fallback: Paste Redirect URL or Authorization Code</summary>
+          <summary>Manual Fallback: Paste Redirect URL or Authorization Token</summary>
           <div class="stack">
             <div class="field">
-              <label for="callbackCodeInput">Redirected Callback URL or Code</label>
-              <input id="callbackCodeInput" type="text" placeholder="https://127.0.0.1:5000/?code=... or bare code" autocomplete="off" />
+              <label id="callbackCodeLabel" for="callbackCodeInput">Redirected Callback URL or Token</label>
+              <input id="callbackCodeInput" type="text" placeholder="Paste redirected URL or token" autocomplete="off" />
               <span class="hint">Use this only if browser auto-capture is blocked by a browser warning or proxy.</span>
             </div>
-            <button id="exchangeCodeBtn" class="btn" type="button">Exchange Code &amp; Connect</button>
+            <button id="exchangeCodeBtn" class="btn" type="button">Exchange Token &amp; Connect</button>
           </div>
         </details>
 
@@ -562,12 +562,15 @@
       routingFeedback: document.getElementById('routingFeedback'),
       directory: document.getElementById('brokerDirectory'),
       modal: document.getElementById('reconnectModal'),
+      modalTitle: document.getElementById('modalTitle'),
       closeModalBtn: document.getElementById('closeModalBtn'),
       toggleCredsBtn: document.getElementById('toggleCredsBtn'),
       credsFormFields: document.getElementById('credsFormFields'),
       detApiKey: document.getElementById('detApiKey'),
       detApiSecret: document.getElementById('detApiSecret'),
       detRedirectUri: document.getElementById('detRedirectUri'),
+      credApiKeyLabel: document.getElementById('credApiKeyLabel'),
+      credApiSecretLabel: document.getElementById('credApiSecretLabel'),
       credApiKey: document.getElementById('credApiKey'),
       credApiSecret: document.getElementById('credApiSecret'),
       credRedirectUri: document.getElementById('credRedirectUri'),
@@ -795,6 +798,7 @@
 
     function sourceLabel(src) {
       if (src === 'env') return '.env';
+      if (src === 'local_vault') return 'Local 0o600 Vault';
       if (src === 'keychain') return 'macOS Keychain';
       return 'Default';
     }
@@ -820,8 +824,23 @@
       els.toggleCredsBtn.textContent = expanded ? 'Hide Inputs' : 'Edit Credentials';
     }
 
+    function brokerDisplayName(brokerId) {
+      const match = (state.overview && state.overview.brokers || []).find((b) => b.broker_id === brokerId);
+      if (match) return match.display_name;
+      return brokerId === 'zerodha' ? 'Zerodha Kite' : 'Upstox';
+    }
+
     function syncDetectedCredsUI(brokerId) {
+      const label = brokerDisplayName(brokerId);
       const creds = (state.overview && state.overview.credentials && state.overview.credentials[brokerId]) || {};
+      els.modalTitle.textContent = `Reconnect ${label} Session`;
+      els.credApiKeyLabel.textContent = `${label} API Key`;
+      els.credApiSecretLabel.textContent = `${label} API Secret`;
+      els.openLoginBtn.textContent = `Login with ${label} (Auto-Capture)`;
+      els.callbackCodeInput.placeholder = brokerId === 'zerodha'
+        ? 'http://127.0.0.1:8000/auth/zerodha/callback?request_token=... or bare token'
+        : 'https://127.0.0.1:5000/?code=... or bare code';
+
       els.detApiKey.textContent = creds.has_api_key
         ? `${creds.api_key_preview} (${sourceLabel(creds.key_source)})`
         : 'Missing';
@@ -833,10 +852,10 @@
         : `${window.location.origin}/auth/${brokerId}/callback (Default)`;
       els.credApiKey.placeholder = creds.has_api_key
         ? `Detected (${creds.api_key_preview}) — enter only to override`
-        : 'Enter your Upstox API Key';
+        : `Enter your ${label} API Key`;
       els.credApiSecret.placeholder = creds.has_api_secret
         ? `Detected in ${sourceLabel(creds.secret_source)} — enter only to override`
-        : 'Enter your Upstox API Secret';
+        : `Enter your ${label} API Secret`;
       els.credRedirectUri.value = creds.redirect_uri || `${window.location.origin}/auth/${brokerId}/callback`;
       return Boolean(creds.has_api_key && creds.has_api_secret);
     }
@@ -867,6 +886,7 @@
       const apiKey = els.credApiKey.value.trim();
       const apiSecret = els.credApiSecret.value.trim();
       const redirectUri = els.credRedirectUri.value.trim();
+      const label = brokerDisplayName(state.activeBrokerModal);
       els.modalFeedback.className = 'feedback';
       try {
         const res = await fetch(`/api/brokers/${state.activeBrokerModal}/credentials`, {
@@ -880,7 +900,7 @@
         syncDetectedCredsUI(state.activeBrokerModal);
         setCredsExpanded(false);
         els.modalFeedback.className = 'feedback ok';
-        els.modalFeedback.textContent = 'Credentials saved securely. Click Login with Upstox (Auto-Capture).';
+        els.modalFeedback.textContent = `Credentials saved securely. Click Login with ${label} (Auto-Capture).`;
       } catch (err) {
         els.modalFeedback.className = 'feedback err';
         els.modalFeedback.textContent = err.message;
@@ -889,25 +909,26 @@
 
     async function pollCaptureStatus() {
       if (!state.captureActive) return;
+      const label = brokerDisplayName(state.activeBrokerModal);
       try {
         const res = await fetch(`/api/brokers/${state.activeBrokerModal}/reconnect-status`);
         if (!res.ok) return;
         const st = await res.json();
         if (st.status === 'listening') {
           els.captureLed.className = 'led connecting';
-          els.captureTitle.textContent = 'Waiting for Upstox browser redirect...';
+          els.captureTitle.textContent = `Waiting for ${label} browser redirect...`;
           els.captureDetail.textContent = st.message || '';
         } else if (st.status === 'exchanging') {
           els.captureLed.className = 'led connecting';
-          els.captureTitle.textContent = 'Code captured — verifying session...';
+          els.captureTitle.textContent = 'Token captured — verifying session...';
           els.captureDetail.textContent = st.message || '';
         } else if (st.status === 'connected') {
           stopCapturePolling(false);
           els.captureLed.className = 'led connected';
           els.captureTitle.textContent = 'Connected automatically';
-          els.captureDetail.textContent = st.message || 'Upstox token exchanged and verified.';
+          els.captureDetail.textContent = st.message || `${label} token exchanged and verified.`;
           els.modalFeedback.className = 'feedback ok';
-          els.modalFeedback.textContent = 'Connected and verified against Upstox profile API.';
+          els.modalFeedback.textContent = `Connected and verified against ${label} profile API.`;
           await loadOverview(true);
           setTimeout(() => {
             if (els.modal.classList.contains('open')) {
@@ -927,10 +948,10 @@
     }
 
     async function startOAuth() {
+      const label = brokerDisplayName(state.activeBrokerModal);
       els.modalFeedback.className = 'feedback';
       els.modalFeedback.textContent = '';
 
-      // If user typed fresh credentials in expanded fields, persist them automatically first
       const typedKey = els.credApiKey.value.trim();
       const typedSecret = els.credApiSecret.value.trim();
       if (typedKey && typedSecret) {
@@ -971,7 +992,7 @@
           els.captureStatusBox.classList.add('visible');
           els.captureLed.className = 'led connecting';
           els.captureTitle.textContent = payload.capture_mode === 'manual_only'
-            ? 'Manual code paste needed for this port'
+            ? 'Manual token paste needed for this port'
             : 'Listening for automatic OAuth callback...';
           const httpsHint = (payload.redirect_uri || '').startsWith('https://127.0.0.1')
             ? ' Note: if the browser warns about the local self-signed cert on 127.0.0.1, click Advanced -> Proceed so capture completes automatically.'
@@ -982,7 +1003,7 @@
           link.href = payload.login_url;
           link.target = 'algodesk_oauth_login';
           link.style.color = '#38bdf8';
-          link.textContent = 'Open Upstox login link (click if popup was blocked)';
+          link.textContent = `Open ${label} login link (click if popup was blocked)`;
           els.oauthUrlBox.appendChild(link);
 
           window.open(payload.login_url, 'algodesk_oauth_login', 'width=640,height=760');
@@ -1003,14 +1024,15 @@
 
     async function exchangeCode() {
       const codeOrUrl = els.callbackCodeInput.value.trim();
+      const label = brokerDisplayName(state.activeBrokerModal);
       if (!codeOrUrl) {
         els.modalFeedback.className = 'feedback err';
-        els.modalFeedback.textContent = 'Paste the redirected callback URL or authorization code first.';
+        els.modalFeedback.textContent = 'Paste the redirected callback URL or authorization token first.';
         return;
       }
       els.exchangeCodeBtn.disabled = true;
       els.modalFeedback.className = 'feedback';
-      els.modalFeedback.textContent = 'Exchanging authorization code and verifying live profile...';
+      els.modalFeedback.textContent = 'Exchanging authorization token and verifying live profile...';
       try {
         const res = await fetch(`/api/brokers/${state.activeBrokerModal}/callback-exchange`, {
           method: 'POST',
@@ -1026,7 +1048,7 @@
         els.captureLed.className = 'led connected';
         els.captureTitle.textContent = 'Connected';
         els.modalFeedback.className = 'feedback ok';
-        els.modalFeedback.textContent = 'Connected and verified against Upstox profile API.';
+        els.modalFeedback.textContent = `Connected and verified against ${label} profile API.`;
         await loadOverview(true);
         setTimeout(() => els.modal.classList.remove('open'), 600);
       } catch (err) {

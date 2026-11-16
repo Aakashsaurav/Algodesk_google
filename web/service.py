@@ -26,10 +26,16 @@ from urllib.parse import urlparse
 
 from broker.base import BrokerHealthSnapshot, ConnectionState
 from broker.registry import BrokerRegistry, SelectionStore
-from broker.upstox.auth import auth_manager
+from broker.upstox.auth import auth_manager as upstox_auth_manager
+from broker.zerodha.auth import zerodha_auth_manager
 from config import IST_TZ, config
 
 logger = logging.getLogger(__name__)
+
+_AUTH_MANAGERS = {
+    "upstox": upstox_auth_manager,
+    "zerodha": zerodha_auth_manager,
+}
 
 
 def _mask_key(key: str) -> str:
@@ -62,21 +68,35 @@ class BrokerHubService:
         self._cached_snapshots: Dict[str, BrokerHealthSnapshot] = {}
         self._capture_sessions: Dict[str, _AutoCaptureSession] = {}
 
+    @staticmethod
+    def _auth_for(broker_id: str):
+        bid = broker_id.strip().lower()
+        if bid not in _AUTH_MANAGERS:
+            raise ValueError(f"Credential & OAuth management is not supported for '{broker_id}'.")
+        return _AUTH_MANAGERS[bid]
+
+    def _broker_cred_entry(self, broker_id: str) -> Dict[str, Any]:
+        prefix = broker_id.upper()
+        acct_prefix = broker_id.lower()
+        auth = self._auth_for(broker_id)
+        key = auth.api_key
+        secret = auth.api_secret
+        redirect = auth.redirect_uri
+        return {
+            "has_api_key": bool(key),
+            "has_api_secret": bool(secret),
+            "api_key_preview": _mask_key(key),
+            "redirect_uri": redirect,
+            "key_source": config.credential_source(f"{prefix}_API_KEY", f"{acct_prefix}_api_key"),
+            "secret_source": config.credential_source(f"{prefix}_API_SECRET", f"{acct_prefix}_api_secret"),
+            "redirect_source": config.credential_source(f"{prefix}_REDIRECT_URI", f"{acct_prefix}_redirect_uri"),
+        }
+
     def _credential_summary(self) -> Dict[str, Any]:
         config.reload_if_changed()
-        key = config.UPSTOX_API_KEY
-        secret = config.UPSTOX_API_SECRET
-        redirect = config.UPSTOX_REDIRECT_URI
         return {
-            "upstox": {
-                "has_api_key": bool(key),
-                "has_api_secret": bool(secret),
-                "api_key_preview": _mask_key(key),
-                "redirect_uri": redirect,
-                "key_source": config.credential_source("UPSTOX_API_KEY", "upstox_api_key"),
-                "secret_source": config.credential_source("UPSTOX_API_SECRET", "upstox_api_secret"),
-                "redirect_source": config.credential_source("UPSTOX_REDIRECT_URI", "upstox_redirect_uri"),
-            }
+            "upstox": self._broker_cred_entry("upstox"),
+            "zerodha": self._broker_cred_entry("zerodha"),
         }
 
     def _probe_single(self, broker_id: str, timeout: float = 3.5) -> BrokerHealthSnapshot:
@@ -171,9 +191,8 @@ class BrokerHubService:
         redirect_uri: Optional[str] = None,
     ) -> Dict[str, Any]:
         bid = broker_id.strip().lower()
-        if bid != "upstox":
-            raise ValueError(f"Credential configuration is not active for '{broker_id}' yet.")
-        auth_manager.save_credentials(api_key=api_key, api_secret=api_secret, redirect_uri=redirect_uri)
+        auth = self._auth_for(bid)
+        auth.save_credentials(api_key=api_key, api_secret=api_secret, redirect_uri=redirect_uri)
         snap = self.probe_one(bid)
         return {
             "ok": True,
@@ -219,21 +238,22 @@ class BrokerHubService:
         bid = broker_id.strip().lower()
         adapter = BrokerRegistry.get(bid)
         if adapter.stage == "planned":
-            raise ValueError(f"{adapter.display_name} is planned for Phase 2.")
+            raise ValueError(f"{adapter.display_name} is planned for future rollout.")
 
         if not adapter.capabilities.requires_oauth:
             snap = self.probe_one(bid)
             return {"mode": "probe", "broker": snap}
 
-        effective_redirect = (redirect_uri or config.UPSTOX_REDIRECT_URI).strip()
+        auth = self._auth_for(bid)
+        effective_redirect = (redirect_uri or auth.redirect_uri).strip()
 
-        if bid == "upstox" and not auth_manager.has_credentials():
+        if not auth.has_credentials():
             return {
                 "mode": "needs_credentials",
                 "broker_id": bid,
                 "redirect_uri": effective_redirect,
-                "credentials": self._credential_summary().get("upstox"),
-                "message": "No Upstox API Key/Secret found in .env or macOS Keychain. Configure them to continue.",
+                "credentials": self._credential_summary().get(bid),
+                "message": f"No {adapter.display_name} API Key/Secret found in .env or local vault. Configure them to continue.",
             }
 
         login_url = adapter.get_login_url(redirect_uri=effective_redirect)
@@ -244,9 +264,9 @@ class BrokerHubService:
         capture_mode = "web_callback"
         capture_msg = f"Listening on {effective_redirect} for automatic OAuth callback..."
 
-        if bid == "upstox" and self._needs_separate_loopback_listener(effective_redirect, server_port):
+        if self._needs_separate_loopback_listener(effective_redirect, server_port):
             try:
-                server, event, captured = auth_manager.build_redirect_listener(redirect_uri=effective_redirect)
+                server, event, captured = auth.build_redirect_listener(redirect_uri=effective_redirect)
                 stop_event = threading.Event()
                 session = _AutoCaptureSession(
                     broker_id=bid,
@@ -284,7 +304,7 @@ class BrokerHubService:
 
                         with self._lock:
                             session.status = "exchanging"
-                            session.message = "Authorization code captured automatically. Exchanging for token..."
+                            session.message = "Authorization token captured automatically. Exchanging for session..."
 
                         res = self.complete_reconnect(
                             broker_id=bid,
@@ -294,7 +314,7 @@ class BrokerHubService:
                         with self._lock:
                             if res.get("ok"):
                                 session.status = "connected"
-                                session.message = "Connected automatically and verified with Upstox."
+                                session.message = f"Connected automatically and verified with {adapter.display_name}."
                                 session.broker_snapshot = res.get("broker")
                             else:
                                 session.status = "error"
@@ -315,7 +335,7 @@ class BrokerHubService:
                             pass
                         session.server = None
 
-                threading.Thread(target=_loopback_worker, name="UpstoxAutoCapture", daemon=True).start()
+                threading.Thread(target=_loopback_worker, name=f"{bid.title()}AutoCapture", daemon=True).start()
                 capture_mode = "loopback_listener"
                 capture_msg = session.message
             except Exception as exc:
@@ -348,7 +368,7 @@ class BrokerHubService:
             "capture_mode": capture_mode,
             "capture_status": "listening",
             "message": capture_msg,
-            "credentials": self._credential_summary().get("upstox"),
+            "credentials": self._credential_summary().get(bid),
         }
 
     def get_reconnect_status(self, broker_id: str) -> Dict[str, Any]:

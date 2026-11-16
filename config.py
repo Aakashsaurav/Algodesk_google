@@ -8,14 +8,18 @@ Refactored from Algodesk_R4:
   or broker-selection updates made via the local web UI apply without restart.
 - Avoids heavy directory creation side effects on module import (directories
   are created lazily only when persisting state).
-- Resolves secrets cleanly from environment variables, .env, or macOS Keychain.
+- Resolves secrets cleanly from environment variables / .env, local 0o600 vault,
+  or opt-in macOS Keychain (disabled by default to prevent macOS Keychain
+  password/ACL popups on unsigned local Python processes).
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import platform
+import stat
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -29,6 +33,19 @@ except ImportError:  # pragma: no cover - fallback parser provided below
 
 IST: timezone = timezone(timedelta(hours=5, minutes=30))
 IST_TZ: ZoneInfo = ZoneInfo("Asia/Kolkata")
+
+# If the user denies/cancels a macOS Keychain prompt once (when opt-in is enabled),
+# stop nagging for the rest of the process lifetime.
+_KEYCHAIN_PROMPT_DENIED = False
+
+
+def is_keychain_enabled() -> bool:
+    """
+    OS Keychain integration is opt-in (default False) because unsigned local
+    Python / venv binaries on macOS trigger repeated SecurityAgent login/ACL
+    popups on read/write. Local 0o600 vault + .env storage requires zero popups.
+    """
+    return os.getenv("ALGODESK_USE_KEYCHAIN", "false").strip().lower() in {"1", "true", "yes"}
 
 
 def _parse_env_file(env_path: Path) -> Dict[str, str]:
@@ -63,15 +80,21 @@ def _load_env(base_dir: Path, override: bool = False) -> None:
 
 
 def keychain_get(service: str, account: str) -> Optional[str]:
-    """Read a secret from macOS Keychain or optional keyring backend."""
+    """Read a secret from OS Keychain ONLY when opt-in ALGODESK_USE_KEYCHAIN=true."""
+    global _KEYCHAIN_PROMPT_DENIED
+    if not is_keychain_enabled() or _KEYCHAIN_PROMPT_DENIED:
+        return None
+
     try:
         import keyring  # type: ignore
 
         secret = keyring.get_password(service, account)
-        if secret:
-            return secret
-    except Exception:
+        return secret or None
+    except ImportError:
         pass
+    except Exception:
+        _KEYCHAIN_PROMPT_DENIED = True
+        return None
 
     if platform.system() != "Darwin":
         return None
@@ -84,20 +107,30 @@ def keychain_get(service: str, account: str) -> Optional[str]:
         )
         if res.returncode == 0:
             return res.stdout.strip()
+        # Exit code 128 = user canceled Keychain prompt; 51/36 = ACL/lock denied
+        if res.returncode in {36, 51, 128}:
+            _KEYCHAIN_PROMPT_DENIED = True
     except Exception:
         pass
     return None
 
 
 def keychain_set(service: str, account: str, secret: str) -> bool:
-    """Persist a secret into keyring or macOS Keychain."""
+    """Persist a secret into OS Keychain ONLY when opt-in ALGODESK_USE_KEYCHAIN=true."""
+    global _KEYCHAIN_PROMPT_DENIED
+    if not is_keychain_enabled() or _KEYCHAIN_PROMPT_DENIED:
+        return False
+
     try:
         import keyring  # type: ignore
 
         keyring.set_password(service, account, secret)
         return True
-    except Exception:
+    except ImportError:
         pass
+    except Exception:
+        _KEYCHAIN_PROMPT_DENIED = True
+        return False
 
     if platform.system() != "Darwin":
         return False
@@ -108,21 +141,27 @@ def keychain_set(service: str, account: str, secret: str) -> bool:
             text=True,
             timeout=3,
         )
+        if res.returncode in {36, 51, 128}:
+            _KEYCHAIN_PROMPT_DENIED = True
         return res.returncode == 0
     except Exception:
         return False
 
 
 def keychain_delete(service: str, account: str) -> bool:
-    """Remove a secret from keyring or macOS Keychain."""
-    deleted = False
+    """Remove a secret from OS Keychain ONLY when opt-in ALGODESK_USE_KEYCHAIN=true."""
+    if not is_keychain_enabled():
+        return False
+
     try:
         import keyring  # type: ignore
 
         keyring.delete_password(service, account)
-        deleted = True
-    except Exception:
+        return True
+    except ImportError:
         pass
+    except Exception:
+        return False
 
     if platform.system() == "Darwin":
         try:
@@ -132,11 +171,10 @@ def keychain_delete(service: str, account: str) -> bool:
                 text=True,
                 timeout=3,
             )
-            if res.returncode == 0:
-                deleted = True
+            return res.returncode == 0
         except Exception:
             pass
-    return deleted
+    return False
 
 
 class AppConfig:
@@ -153,6 +191,11 @@ class AppConfig:
     UPSTOX_AUTH_DIALOG_URL: str = "https://api.upstox.com/v2/login/authorization/dialog"
     UPSTOX_PROFILE_URL: str = "https://api.upstox.com/v2/user/profile"
 
+    ZERODHA_BASE_URL: str = "https://api.kite.trade"
+    ZERODHA_LOGIN_URL: str = "https://kite.zerodha.com/connect/login"
+    ZERODHA_SESSION_URL: str = "https://api.kite.trade/session/token"
+    ZERODHA_PROFILE_URL: str = "https://api.kite.trade/user/profile"
+
     # Legacy alias kept only so older callers referencing BASE_URL never crash
     BASE_URL: str = UPSTOX_BASE_URL
 
@@ -161,6 +204,10 @@ class AppConfig:
     def __init__(self) -> None:
         self._env_mtime: Optional[float] = None
         self.reload_if_changed(force=True)
+
+    @property
+    def USE_KEYCHAIN(self) -> bool:
+        return is_keychain_enabled()
 
     def _current_env_mtime(self) -> Optional[float]:
         env_path = self.BASE_DIR / ".env"
@@ -182,15 +229,6 @@ class AppConfig:
         """Re-read .env variables cleanly without restarting the process."""
         self.reload_if_changed(force=True)
 
-    def credential_source(self, env_key: str, keychain_account: str) -> str:
-        """Return where a setting was detected ('env', 'keychain', or 'none') without exposing it."""
-        self.reload_if_changed()
-        if os.getenv(env_key, "").strip():
-            return "env"
-        if keychain_get(self.KEYRING_SERVICE, keychain_account):
-            return "keychain"
-        return "none"
-
     # ── Paths (lazy, no import-time mkdir storm) ──────────────────────────
     @property
     def DATA_DIR(self) -> Path:
@@ -209,8 +247,92 @@ class AppConfig:
         return self.DATA_DIR / "broker_selection.json"
 
     @property
+    def CREDENTIALS_VAULT_FILE(self) -> Path:
+        rel = os.getenv("ALGODESK_VAULT_FILE", "").strip()
+        if rel:
+            p = Path(rel)
+            return p if p.is_absolute() else (self.BASE_DIR / p)
+        return self.DATA_DIR / ".credentials.json"
+
+    # ── Local 0o600 Credentials Vault (popup-free persistence) ────────────
+    def _read_local_vault(self) -> Dict[str, str]:
+        path = self.CREDENTIALS_VAULT_FILE
+        if not path.exists():
+            return {}
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                return {str(k): str(v) for k, v in raw.items() if v is not None}
+        except (OSError, json.JSONDecodeError):
+            pass
+        return {}
+
+    def save_local_credential(
+        self,
+        env_key: str,
+        vault_account: str,
+        value: str,
+    ) -> None:
+        """
+        Persist credential into process env and local 0o600 vault file without
+        triggering macOS Keychain UI prompts. Optionally mirrors to Keychain only
+        when ALGODESK_USE_KEYCHAIN=true.
+        """
+        clean = value.strip()
+        if not clean:
+            return
+        os.environ[env_key] = clean
+
+        try:
+            self.ensure_runtime_dirs()
+            vault_path = self.CREDENTIALS_VAULT_FILE
+            vault = self._read_local_vault()
+            vault[vault_account] = clean
+            vault_path.write_text(json.dumps(vault, indent=2), encoding="utf-8")
+            os.chmod(vault_path, stat.S_IRUSR | stat.S_IWUSR)
+        except OSError as exc:
+            logging.getLogger(__name__).warning("Could not write local credentials vault: %s", exc)
+
+        if self.USE_KEYCHAIN:
+            keychain_set(self.KEYRING_SERVICE, vault_account, clean)
+
+    def _resolve_credential(self, env_key: str, account_key: str, default: str = "") -> str:
+        self.reload_if_changed()
+        env_val = os.getenv(env_key, "").strip()
+        if env_val:
+            return env_val
+
+        vault_val = self._read_local_vault().get(account_key, "").strip()
+        if vault_val:
+            return vault_val
+
+        if self.USE_KEYCHAIN:
+            kc_val = keychain_get(self.KEYRING_SERVICE, account_key)
+            if kc_val:
+                return kc_val.strip()
+
+        return default
+
+    def credential_source(self, env_key: str, keychain_account: str) -> str:
+        """Return where a setting was detected ('env', 'local_vault', 'keychain', or 'none')."""
+        self.reload_if_changed()
+        if os.getenv(env_key, "").strip():
+            return "env"
+        if self._read_local_vault().get(keychain_account, "").strip():
+            return "local_vault"
+        if self.USE_KEYCHAIN and keychain_get(self.KEYRING_SERVICE, keychain_account):
+            return "keychain"
+        return "none"
+
+    @property
     def UPSTOX_TOKEN_FILE_PATH(self) -> Path:
         rel = os.getenv("TOKEN_FILE_PATH", "broker/upstox/token.json")
+        p = Path(rel)
+        return p if p.is_absolute() else (self.BASE_DIR / p)
+
+    @property
+    def ZERODHA_TOKEN_FILE_PATH(self) -> Path:
+        rel = os.getenv("ZERODHA_TOKEN_FILE_PATH", "broker/zerodha/token.json")
         p = Path(rel)
         return p if p.is_absolute() else (self.BASE_DIR / p)
 
@@ -222,31 +344,38 @@ class AppConfig:
     def INSTRUMENT_KEY_PATH(self) -> Path:
         return self.BASE_DIR / "broker" / "upstox" / "complete_instru_list.json"
 
-    # ── Broker Credentials (.env / env > macOS Keychain) ──────────────────
+    # ── Broker Credentials (.env / env > 0o600 local vault > opt-in Keychain)
     @property
     def UPSTOX_API_KEY(self) -> str:
-        self.reload_if_changed()
-        val = os.getenv("UPSTOX_API_KEY", "").strip()
-        if val:
-            return val
-        return keychain_get(self.KEYRING_SERVICE, "upstox_api_key") or ""
+        return self._resolve_credential("UPSTOX_API_KEY", "upstox_api_key")
 
     @property
     def UPSTOX_API_SECRET(self) -> str:
-        self.reload_if_changed()
-        val = os.getenv("UPSTOX_API_SECRET", "").strip()
-        if val:
-            return val
-        return keychain_get(self.KEYRING_SERVICE, "upstox_api_secret") or ""
+        return self._resolve_credential("UPSTOX_API_SECRET", "upstox_api_secret")
 
     @property
     def UPSTOX_REDIRECT_URI(self) -> str:
-        self.reload_if_changed()
-        return (
-            os.getenv("UPSTOX_REDIRECT_URI", "").strip()
-            or keychain_get(self.KEYRING_SERVICE, "upstox_redirect_uri")
-            or "http://127.0.0.1:8000/auth/upstox/callback"
-        ).strip()
+        return self._resolve_credential(
+            "UPSTOX_REDIRECT_URI",
+            "upstox_redirect_uri",
+            default="http://127.0.0.1:8000/auth/upstox/callback",
+        )
+
+    @property
+    def ZERODHA_API_KEY(self) -> str:
+        return self._resolve_credential("ZERODHA_API_KEY", "zerodha_api_key")
+
+    @property
+    def ZERODHA_API_SECRET(self) -> str:
+        return self._resolve_credential("ZERODHA_API_SECRET", "zerodha_api_secret")
+
+    @property
+    def ZERODHA_REDIRECT_URI(self) -> str:
+        return self._resolve_credential(
+            "ZERODHA_REDIRECT_URI",
+            "zerodha_redirect_uri",
+            default="http://127.0.0.1:8000/auth/zerodha/callback",
+        )
 
     @property
     def UPSTOX_REDIRECT_SSL_CERT_FILE(self) -> str:
@@ -294,7 +423,12 @@ class AppConfig:
 
     def ensure_runtime_dirs(self) -> None:
         """Create only essential local runtime directories on demand."""
-        for directory in (self.DATA_DIR, self.BASE_DIR / "logs", self.UPSTOX_TOKEN_FILE_PATH.parent):
+        for directory in (
+            self.DATA_DIR,
+            self.BASE_DIR / "logs",
+            self.UPSTOX_TOKEN_FILE_PATH.parent,
+            self.ZERODHA_TOKEN_FILE_PATH.parent,
+        ):
             try:
                 directory.mkdir(parents=True, exist_ok=True)
             except OSError:
@@ -332,6 +466,7 @@ __all__: List[str] = [
     "IST_TZ",
     "config",
     "current_ist",
+    "is_keychain_enabled",
     "keychain_delete",
     "keychain_get",
     "keychain_set",

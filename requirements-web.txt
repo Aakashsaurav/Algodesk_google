@@ -6,3 +6,4 @@ requests>=2.32.0
 python-dotenv>=1.0.1
 keyring>=25.5.0
 upstox-python-sdk>=2.12.0
+kiteconnect>=5.0.1

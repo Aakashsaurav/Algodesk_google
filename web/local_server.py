@@ -85,25 +85,29 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
         if path.startswith("/auth/") and path.endswith("/callback"):
             broker_id = parts[1] if len(parts) >= 3 else "upstox"
             error = query.get("error", [None])[0]
+            status = query.get("status", [None])[0]
             code = query.get("code", [None])[0]
-            if error:
+            request_token = query.get("request_token", [None])[0]
+            auth_token = request_token or code
+            if error or (status and status.lower() not in {"success", "ok"}):
+                err_text = error or f"Broker returned status={status}"
                 self._send_html(
                     400,
                     f"<!doctype html><html><body style='font-family:sans-serif;background:#0b1120;color:#f1f5f9;padding:2rem'>"
-                    f"<h2>Authorization declined</h2><p style='color:#94a3b8'>{html.escape(error)}</p>"
+                    f"<h2>Authorization declined</h2><p style='color:#94a3b8'>{html.escape(err_text)}</p>"
                     f"<a href='/' style='color:#38bdf8'>Return to AlgoDesk</a></body></html>",
                 )
                 return
-            if not code:
+            if not auth_token:
                 self._send_html(
                     400,
                     "<!doctype html><html><body style='font-family:sans-serif;background:#0b1120;color:#f1f5f9;padding:2rem'>"
-                    "<h2>Missing authorization code</h2>"
+                    "<h2>Missing authorization token</h2>"
                     "<a href='/' style='color:#38bdf8'>Return to AlgoDesk</a></body></html>",
                 )
                 return
             try:
-                result = hub_service.complete_reconnect(broker_id=broker_id, code_or_url=code)
+                result = hub_service.complete_reconnect(broker_id=broker_id, code_or_url=auth_token)
                 state = result.get("broker", {}).get("state", "UNKNOWN")
                 js_broker = json.dumps(broker_id)
                 self._send_html(
