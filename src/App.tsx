@@ -1,0 +1,812 @@
+import { useCallback, useEffect, useState } from 'react';
+import { RefreshCw, ExternalLink, X, Check, AlertCircle } from 'lucide-react';
+
+type ConnectionState =
+  | 'CONNECTED'
+  | 'DISCONNECTED'
+  | 'CONNECTING'
+  | 'EXPIRED'
+  | 'UNCONFIGURED'
+  | 'PLANNED'
+  | 'ERROR';
+
+interface BrokerCapabilities {
+  supports_trading: boolean;
+  supports_market_data: boolean;
+  supports_websocket: boolean;
+  requires_oauth: boolean;
+}
+
+interface BrokerSnapshot {
+  broker_id: string;
+  display_name: string;
+  stage: 'active' | 'planned' | 'standby';
+  state: ConnectionState;
+  is_connected: boolean;
+  capabilities: BrokerCapabilities;
+  latency_ms: number | null;
+  account_name: string;
+  client_id: string;
+  token_expires_at_ist: string | null;
+  last_checked_at: string;
+  message: string;
+  can_reconnect: boolean;
+  has_credentials: boolean;
+  auth_mode: string;
+  roadmap_note: string;
+}
+
+interface OverviewPayload {
+  brokers: BrokerSnapshot[];
+  selections: {
+    trading_broker: string;
+    data_connection: string;
+    updated_at: string;
+  };
+  credentials: {
+    upstox?: {
+      has_api_key: boolean;
+      has_api_secret: boolean;
+      api_key_preview: string;
+      redirect_uri: string;
+    };
+  };
+  runtime: {
+    python_version: string;
+    machine: string;
+    system: string;
+    ist_time: string;
+    eager_instruments_loaded: boolean;
+  };
+}
+
+const ROADMAP_PHASES = [
+  {
+    phase: 'Phase 01',
+    title: 'Hardened Upstox Hub & Security Fixes',
+    detail:
+      'Fixed Upstox logout endpoint, IST 03:30 AM daily reset boundary validation, macOS Keychain secret storage, and decoupled M2-friendly broker health probing.',
+  },
+  {
+    phase: 'Phase 02',
+    title: 'Zerodha Kite Connect Adapter',
+    detail:
+      'Implement Kite OAuth SHA-256 checksum login, KiteTicker WebSocket feed, and promote Zerodha from Planned to Active inside BrokerRegistry without UI rewrites.',
+  },
+  {
+    phase: 'Phase 03',
+    title: 'SQLite Instrument Index & Core Consolidation',
+    detail:
+      'Replace eager 100k-entry JSON parsing with an indexed SQLite instrument lookup under 5 MB RSS and unify core/live execution managers.',
+  },
+  {
+    phase: 'Phase 04',
+    title: 'Hot-Standby Feed Failover & Kill Switch',
+    detail:
+      'Surface WebSocket tick telemetry, automatic primary-to-fallback feed switching, preflight margin checks, and SEBI hash-chained kill switch controls.',
+  },
+  {
+    phase: 'Phase 05',
+    title: 'Screener, Backtester & Risk Console',
+    detail:
+      'Connect existing screener, vectorized backtester, and risk limits to the selected Data Connection as async FastAPI background tasks.',
+  },
+];
+
+function getStatusLabel(state: ConnectionState, isProbing: boolean): string {
+  if (isProbing) return 'Checking';
+  switch (state) {
+    case 'CONNECTED':
+      return 'Connected';
+    case 'DISCONNECTED':
+      return 'Disconnected';
+    case 'EXPIRED':
+      return 'Token Expired';
+    case 'UNCONFIGURED':
+      return 'Credentials Needed';
+    case 'PLANNED':
+      return 'Planned (Phase 2)';
+    case 'CONNECTING':
+      return 'Connecting';
+    default:
+      return 'Error';
+  }
+}
+
+function getLedColorClass(state: ConnectionState, isProbing: boolean): string {
+  if (isProbing || state === 'CONNECTING') {
+    return 'bg-amber-600 shadow-[0_0_10px_rgba(217,119,6,0.7)]';
+  }
+  switch (state) {
+    case 'CONNECTED':
+      return 'bg-emerald-600 shadow-[0_0_10px_rgba(22,163,74,0.7)]';
+    case 'PLANNED':
+      return 'bg-slate-600';
+    default:
+      return 'bg-red-600 shadow-[0_0_10px_rgba(220,38,38,0.65)]';
+  }
+}
+
+export default function App() {
+  const [overview, setOverview] = useState<OverviewPayload | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+
+  const [tradingSelection, setTradingSelection] = useState('upstox');
+  const [dataSelection, setDataSelection] = useState('upstox');
+  const [savingRouting, setSavingRouting] = useState(false);
+  const [routingFeedback, setRoutingFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+
+  const [probingIds, setProbingIds] = useState<Record<string, boolean>>({});
+
+  // Reconnect / OAuth modal state
+  const [modalBrokerId, setModalBrokerId] = useState<string | null>(null);
+  const [apiKey, setApiKey] = useState('');
+  const [apiSecret, setApiSecret] = useState('');
+  const [redirectUri, setRedirectUri] = useState('');
+  const [oauthUrl, setOauthUrl] = useState('');
+  const [callbackInput, setCallbackInput] = useState('');
+  const [modalFeedback, setModalFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+  const [exchanging, setExchanging] = useState(false);
+
+  const fetchOverview = useCallback(async (refresh = true) => {
+    setRefreshing(true);
+    setLoadError(null);
+    try {
+      const res = await fetch(`/api/overview?refresh=${refresh}`);
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}));
+        throw new Error(body.detail || `Server error (${res.status})`);
+      }
+      const data: OverviewPayload = await res.json();
+      setOverview(data);
+      setTradingSelection(data.selections.trading_broker);
+      setDataSelection(data.selections.data_connection);
+    } catch (err) {
+      setLoadError(err instanceof Error ? err.message : 'Unable to reach Python broker service.');
+    } finally {
+      setLoading(false);
+      setRefreshing(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void fetchOverview(true);
+  }, [fetchOverview]);
+
+  const handleProbeBroker = async (brokerId: string) => {
+    setProbingIds((prev) => ({ ...prev, [brokerId]: true }));
+    try {
+      const res = await fetch(`/api/brokers/${brokerId}/probe`, { method: 'POST' });
+      const data = await res.json();
+      if (data.broker) {
+        setOverview((prev) =>
+          prev
+            ? {
+                ...prev,
+                brokers: prev.brokers.map((b) => (b.broker_id === brokerId ? data.broker : b)),
+              }
+            : prev
+        );
+      }
+    } finally {
+      setProbingIds((prev) => ({ ...prev, [brokerId]: false }));
+    }
+  };
+
+  const handleDisconnectBroker = async (brokerId: string) => {
+    setProbingIds((prev) => ({ ...prev, [brokerId]: true }));
+    try {
+      const res = await fetch(`/api/brokers/${brokerId}/disconnect`, { method: 'POST' });
+      const data = await res.json();
+      if (data.broker) {
+        setOverview((prev) =>
+          prev
+            ? {
+                ...prev,
+                brokers: prev.brokers.map((b) => (b.broker_id === brokerId ? data.broker : b)),
+              }
+            : prev
+        );
+      }
+    } finally {
+      setProbingIds((prev) => ({ ...prev, [brokerId]: false }));
+    }
+  };
+
+  const handleSaveRouting = async () => {
+    setSavingRouting(true);
+    setRoutingFeedback(null);
+    try {
+      const res = await fetch('/api/selection', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          trading_broker: tradingSelection,
+          data_connection: dataSelection,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Could not save routing assignment.');
+      setOverview((prev) => (prev ? { ...prev, selections: data.selections } : prev));
+      setRoutingFeedback({
+        type: 'ok',
+        text: `Saved: Trading=${data.selections.trading_broker.toUpperCase()} · Data=${data.selections.data_connection.toUpperCase()}`,
+      });
+    } catch (err) {
+      setRoutingFeedback({
+        type: 'err',
+        text: err instanceof Error ? err.message : 'Save failed.',
+      });
+    } finally {
+      setSavingRouting(false);
+    }
+  };
+
+  const openReconnectModal = (brokerId: string) => {
+    const creds = overview?.credentials?.upstox;
+    setModalBrokerId(brokerId);
+    setApiKey('');
+    setApiSecret('');
+    setRedirectUri(creds?.redirect_uri || `${window.location.origin}/auth/${brokerId}/callback`);
+    setOauthUrl('');
+    setCallbackInput('');
+    setModalFeedback(null);
+  };
+
+  const handleSaveCredentials = async () => {
+    if (!modalBrokerId) return;
+    setModalFeedback(null);
+    try {
+      const res = await fetch(`/api/brokers/${modalBrokerId}/credentials`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          api_key: apiKey.trim(),
+          api_secret: apiSecret.trim(),
+          redirect_uri: redirectUri.trim() || null,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Credential save failed.');
+      setModalFeedback({
+        type: 'ok',
+        text: 'Credentials saved securely in Keychain/env. Click Open Upstox Login to authenticate.',
+      });
+      await fetchOverview(false);
+    } catch (err) {
+      setModalFeedback({
+        type: 'err',
+        text: err instanceof Error ? err.message : 'Failed to save credentials.',
+      });
+    }
+  };
+
+  const handleStartOAuth = async () => {
+    if (!modalBrokerId) return;
+    setModalFeedback(null);
+    try {
+      const res = await fetch(`/api/brokers/${modalBrokerId}/reconnect`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ redirect_uri: redirectUri.trim() || null }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Could not start OAuth login.');
+      if (data.mode === 'needs_credentials') {
+        setModalFeedback({ type: 'err', text: data.message });
+        return;
+      }
+      if (data.login_url) {
+        setOauthUrl(data.login_url);
+        window.open(data.login_url, '_blank', 'noopener,noreferrer');
+        setModalFeedback({
+          type: 'ok',
+          text: 'Upstox login opened in a new tab. Complete login or paste the redirected URL below.',
+        });
+      }
+    } catch (err) {
+      setModalFeedback({
+        type: 'err',
+        text: err instanceof Error ? err.message : 'OAuth launch failed.',
+      });
+    }
+  };
+
+  const handleExchangeCode = async () => {
+    if (!modalBrokerId) return;
+    if (!callbackInput.trim()) {
+      setModalFeedback({ type: 'err', text: 'Paste the redirected callback URL or authorization code first.' });
+      return;
+    }
+    setExchanging(true);
+    setModalFeedback(null);
+    try {
+      const res = await fetch(`/api/brokers/${modalBrokerId}/callback-exchange`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          code_or_url: callbackInput.trim(),
+          redirect_uri: redirectUri.trim() || null,
+        }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Authorization code exchange failed.');
+      setModalFeedback({ type: 'ok', text: 'Connected and verified against Upstox profile API.' });
+      await fetchOverview(true);
+      setTimeout(() => setModalBrokerId(null), 650);
+    } catch (err) {
+      setModalFeedback({
+        type: 'err',
+        text: err instanceof Error ? err.message : 'Token exchange failed.',
+      });
+    } finally {
+      setExchanging(false);
+    }
+  };
+
+  const brokers = overview?.brokers ?? [];
+  const upstoxCreds = overview?.credentials?.upstox;
+
+  return (
+    <div className="min-h-screen bg-[#0b1120] text-slate-100">
+      {/* 3-Zone Top Bar */}
+      <header className="border-b border-slate-800 bg-[#0b1120]">
+        <div className="mx-auto flex h-16 max-w-[1160px] items-center justify-between gap-8 px-6">
+          <a href="#routing" className="shrink-0 whitespace-nowrap text-lg font-bold tracking-tight text-slate-100">
+            AlgoDesk
+          </a>
+
+          <nav className="hidden items-center gap-7 md:flex" aria-label="Primary">
+            <a
+              href="#routing"
+              className="shrink-0 whitespace-nowrap text-sm font-medium text-slate-400 transition-colors hover:text-slate-100 hover:underline hover:underline-offset-8"
+            >
+              Routing
+            </a>
+            <a
+              href="#connections"
+              className="shrink-0 whitespace-nowrap text-sm font-medium text-slate-400 transition-colors hover:text-slate-100 hover:underline hover:underline-offset-8"
+            >
+              Connections
+            </a>
+            <a
+              href="#roadmap"
+              className="shrink-0 whitespace-nowrap text-sm font-medium text-slate-400 transition-colors hover:text-slate-100 hover:underline hover:underline-offset-8"
+            >
+              Roadmap
+            </a>
+          </nav>
+
+          <button
+            type="button"
+            onClick={() => void fetchOverview(true)}
+            disabled={refreshing}
+            className="inline-flex min-h-[40px] shrink-0 items-center gap-2 whitespace-nowrap rounded-lg bg-sky-400 px-4 py-2 text-[13px] font-semibold text-sky-950 transition-colors hover:bg-sky-300 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-sky-400 disabled:opacity-50"
+          >
+            <RefreshCw className={`h-3.5 w-3.5 ${refreshing ? 'animate-spin' : ''}`} />
+            <span>{refreshing ? 'Refreshing' : 'Refresh Status'}</span>
+          </button>
+        </div>
+      </header>
+
+      <main className="mx-auto flex max-w-[1160px] flex-col gap-10 px-6 py-10 pb-16">
+        {/* Page Heading */}
+        <div className="space-y-2">
+          <h1 className="text-[clamp(1.5rem,3vw,2rem)] font-bold tracking-tight text-slate-100 text-balance">
+            Broker &amp; Data Connectivity
+          </h1>
+          <p className="max-w-[68ch] text-[15px] text-slate-400">
+            Verify live broker sessions, recover disconnected OAuth links, and assign independent providers for order execution and market data.
+          </p>
+          {overview?.runtime && (
+            <p className="pt-1 font-mono text-xs text-slate-500">
+              Python {overview.runtime.python_version} · {overview.runtime.system} {overview.runtime.machine} ·{' '}
+              {overview.runtime.ist_time} · Instrument Master: Lazy
+            </p>
+          )}
+        </div>
+
+        {loadError && (
+          <div className="flex items-center justify-between gap-4 rounded-xl border border-red-900/70 bg-red-950/40 px-5 py-4 text-sm text-red-200">
+            <div className="flex items-center gap-2.5">
+              <AlertCircle className="h-4 w-4 shrink-0 text-red-400" />
+              <span>{loadError}</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => void fetchOverview(true)}
+              className="shrink-0 whitespace-nowrap rounded-lg border border-red-700/60 px-3 py-1.5 text-xs font-semibold text-red-100 hover:bg-red-900/40"
+            >
+              Retry
+            </button>
+          </div>
+        )}
+
+        {/* Section 1: Active Connection Routing */}
+        <section id="routing" className="space-y-4">
+          <div>
+            <h2 className="text-lg font-semibold tracking-tight text-slate-100">Active Connection Routing</h2>
+            <p className="text-sm text-slate-400">
+              Assign one verified broker for order execution and one provider for historical and live market data.
+            </p>
+          </div>
+
+          <div className="rounded-xl border border-slate-800 bg-[#111827] p-6">
+            <div className="grid grid-cols-1 items-end gap-5 md:grid-cols-[1fr_1fr_auto]">
+              <div>
+                <label htmlFor="trading-select" className="mb-1.5 block text-[13px] font-semibold text-slate-200">
+                  Trading Connection (Order Execution)
+                </label>
+                <select
+                  id="trading-select"
+                  value={tradingSelection}
+                  onChange={(e) => setTradingSelection(e.target.value)}
+                  disabled={loading}
+                  className="min-h-[42px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 text-sm text-slate-100 focus:border-sky-400 focus:outline-none"
+                >
+                  {brokers
+                    .filter((b) => b.capabilities.supports_trading)
+                    .map((b) => (
+                      <option key={b.broker_id} value={b.broker_id} disabled={b.stage === 'planned'}>
+                        {b.stage === 'planned'
+                          ? `${b.display_name} — Planned (Phase 2)`
+                          : `${b.display_name} (${getStatusLabel(b.state, false)})`}
+                      </option>
+                    ))}
+                </select>
+                <span className="mt-1.5 block text-xs text-slate-500">
+                  Only brokers with active execution support can be selected.
+                </span>
+              </div>
+
+              <div>
+                <label htmlFor="data-select" className="mb-1.5 block text-[13px] font-semibold text-slate-200">
+                  Data Connection (Market Feed &amp; OHLCV)
+                </label>
+                <select
+                  id="data-select"
+                  value={dataSelection}
+                  onChange={(e) => setDataSelection(e.target.value)}
+                  disabled={loading}
+                  className="min-h-[42px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 text-sm text-slate-100 focus:border-sky-400 focus:outline-none"
+                >
+                  {brokers
+                    .filter((b) => b.capabilities.supports_market_data)
+                    .map((b) => (
+                      <option key={b.broker_id} value={b.broker_id} disabled={b.stage === 'planned'}>
+                        {b.stage === 'planned'
+                          ? `${b.display_name} — Planned (Phase 2)`
+                          : `${b.display_name} (${getStatusLabel(b.state, false)})`}
+                      </option>
+                    ))}
+                </select>
+                <span className="mt-1.5 block text-xs text-slate-500">
+                  Supports broker feeds or Yahoo Finance historical fallback.
+                </span>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => void handleSaveRouting()}
+                disabled={loading || savingRouting}
+                className="inline-flex min-h-[42px] shrink-0 items-center justify-center whitespace-nowrap rounded-lg bg-sky-400 px-5 py-2 text-sm font-semibold text-sky-950 transition-colors hover:bg-sky-300 disabled:opacity-50"
+              >
+                {savingRouting ? 'Saving...' : 'Save Assignment'}
+              </button>
+            </div>
+
+            {routingFeedback && (
+              <div
+                className={`mt-3.5 flex items-center gap-2 text-[13px] ${
+                  routingFeedback.type === 'ok' ? 'text-emerald-400' : 'text-red-400'
+                }`}
+                role="status"
+                aria-live="polite"
+              >
+                {routingFeedback.type === 'ok' ? <Check className="h-4 w-4" /> : <AlertCircle className="h-4 w-4" />}
+                <span>{routingFeedback.text}</span>
+              </div>
+            )}
+          </div>
+        </section>
+
+        {/* Section 2: Broker & Provider Directory */}
+        <section id="connections" className="space-y-4">
+          <div>
+            <h2 className="text-lg font-semibold tracking-tight text-slate-100">Broker &amp; Provider Directory</h2>
+            <p className="text-sm text-slate-400">
+              Live connection status probed directly against broker endpoints. Disconnected sessions provide an immediate Reconnect action.
+            </p>
+          </div>
+
+          <div className="overflow-hidden rounded-xl border border-slate-800 bg-[#111827]">
+            {loading ? (
+              <div className="divide-y divide-slate-800">
+                {[0, 1, 2].map((idx) => (
+                  <div key={idx} className="grid grid-cols-1 gap-4 px-6 py-5 md:grid-cols-[1.4fr_1.1fr_1.1fr_auto]">
+                    <div className="h-10 animate-pulse rounded bg-slate-800/70" />
+                    <div className="h-10 animate-pulse rounded bg-slate-800/60" />
+                    <div className="h-10 animate-pulse rounded bg-slate-800/50" />
+                    <div className="h-10 w-28 animate-pulse rounded bg-slate-800/70" />
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <div className="divide-y divide-slate-800">
+                {brokers.map((b) => {
+                  const isProbing = Boolean(probingIds[b.broker_id]);
+                  const capLabels: string[] = [];
+                  if (b.capabilities.supports_trading) capLabels.push('Trading');
+                  if (b.capabilities.supports_market_data) capLabels.push('Market Data');
+                  if (b.capabilities.supports_websocket) capLabels.push('WebSocket');
+
+                  const assignments: string[] = [];
+                  if (overview?.selections.trading_broker === b.broker_id) assignments.push('Assigned: Trading');
+                  if (overview?.selections.data_connection === b.broker_id) assignments.push('Assigned: Data');
+
+                  return (
+                    <div
+                      key={b.broker_id}
+                      className="grid grid-cols-1 items-center gap-5 px-6 py-5 md:grid-cols-[1.4fr_1.1fr_1.1fr_auto]"
+                    >
+                      <div>
+                        <div className="text-base font-semibold text-slate-100">{b.display_name}</div>
+                        <div className="mt-0.5 text-[13px] text-slate-400">
+                          {capLabels.join(' · ')}
+                          {assignments.length > 0 ? ` · ${assignments.join(' · ')}` : ''}
+                        </div>
+                        <div className="mt-1 text-[13px] text-slate-500">{b.message}</div>
+                      </div>
+
+                      <div className="space-y-1">
+                        <div className="inline-flex items-center gap-2.5 text-sm font-semibold text-slate-100">
+                          <span
+                            className={`h-2.5 w-2.5 shrink-0 rounded-full ${getLedColorClass(b.state, isProbing)}`}
+                            aria-hidden="true"
+                          />
+                          <span>{getStatusLabel(b.state, isProbing)}</span>
+                        </div>
+                        <div className="font-mono text-xs text-slate-400">
+                          {b.account_name || 'Session Inactive'}
+                          {b.client_id ? ` · ${b.client_id}` : ''}
+                        </div>
+                      </div>
+
+                      <div className="space-y-0.5 font-mono text-xs text-slate-400">
+                        <div>Probe: {b.latency_ms !== null ? `${b.latency_ms} ms` : '—'}</div>
+                        <div>Reset: {b.token_expires_at_ist || 'N/A'}</div>
+                        <div>
+                          Checked: {b.last_checked_at ? b.last_checked_at.slice(11, 19) : '—'} IST
+                        </div>
+                      </div>
+
+                      <div className="flex flex-wrap items-center justify-start gap-2.5 md:justify-end">
+                        {b.stage === 'planned' ? (
+                          <button
+                            type="button"
+                            disabled
+                            className="min-h-[40px] shrink-0 whitespace-nowrap rounded-lg border border-slate-700 bg-slate-900 px-4 py-2 text-[13px] font-semibold text-slate-500 opacity-60"
+                          >
+                            Coming in Phase 2
+                          </button>
+                        ) : (
+                          <>
+                            <button
+                              type="button"
+                              onClick={() => void handleProbeBroker(b.broker_id)}
+                              disabled={isProbing}
+                              className="min-h-[40px] shrink-0 whitespace-nowrap rounded-lg border border-slate-700 bg-[#0b1120] px-4 py-2 text-[13px] font-semibold text-slate-200 transition-colors hover:border-slate-500 hover:bg-slate-800 disabled:opacity-50"
+                            >
+                              {isProbing ? 'Checking...' : 'Test'}
+                            </button>
+
+                            {!b.is_connected && b.can_reconnect && (
+                              <button
+                                type="button"
+                                onClick={() => openReconnectModal(b.broker_id)}
+                                className="min-h-[40px] shrink-0 whitespace-nowrap rounded-lg bg-sky-400 px-4 py-2 text-[13px] font-semibold text-sky-950 transition-colors hover:bg-sky-300"
+                              >
+                                Reconnect
+                              </button>
+                            )}
+
+                            {b.is_connected && b.capabilities.requires_oauth && (
+                              <button
+                                type="button"
+                                onClick={() => void handleDisconnectBroker(b.broker_id)}
+                                disabled={isProbing}
+                                className="min-h-[40px] shrink-0 whitespace-nowrap rounded-lg border border-red-800/70 bg-transparent px-4 py-2 text-[13px] font-semibold text-red-300 transition-colors hover:bg-red-950/50 disabled:opacity-50"
+                              >
+                                Disconnect
+                              </button>
+                            )}
+                          </>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        </section>
+
+        {/* Section 3: Modular Expansion Roadmap */}
+        <section id="roadmap" className="space-y-4">
+          <div>
+            <h2 className="text-lg font-semibold tracking-tight text-slate-100">Modular Expansion Roadmap</h2>
+            <p className="text-sm text-slate-400">
+              Each adapter satisfies the unified capability and health contract, enabling Zerodha and trading modules to plug in incrementally.
+            </p>
+          </div>
+
+          <div className="divide-y divide-slate-800 border-t border-slate-800">
+            {ROADMAP_PHASES.map((item) => (
+              <div key={item.phase} className="grid grid-cols-1 gap-3 py-4 md:grid-cols-[110px_1fr] md:gap-5">
+                <div className="font-mono text-[13px] font-semibold text-sky-400">{item.phase}</div>
+                <div>
+                  <div className="font-semibold text-slate-100">{item.title}</div>
+                  <div className="mt-1 text-sm text-slate-400">{item.detail}</div>
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+      </main>
+
+      {/* OAuth Reconnect & Credential Modal */}
+      {modalBrokerId && (
+        <div
+          className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 p-5"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="reconnect-modal-title"
+          onClick={(e) => {
+            if (e.target === e.currentTarget) setModalBrokerId(null);
+          }}
+        >
+          <div className="w-full max-w-[540px] rounded-xl border border-slate-700 bg-[#111827] p-6">
+            <div className="mb-5 flex items-center justify-between gap-4">
+              <h3 id="reconnect-modal-title" className="text-lg font-semibold text-slate-100">
+                Reconnect {modalBrokerId.charAt(0).toUpperCase() + modalBrokerId.slice(1)} Session
+              </h3>
+              <button
+                type="button"
+                onClick={() => setModalBrokerId(null)}
+                className="inline-flex min-h-[36px] items-center gap-1.5 rounded-lg border border-slate-700 px-3 py-1.5 text-xs font-semibold text-slate-300 hover:bg-slate-800"
+              >
+                <X className="h-3.5 w-3.5" />
+                <span>Close</span>
+              </button>
+            </div>
+
+            <div className="space-y-4">
+              <div>
+                <label htmlFor="modal-api-key" className="mb-1.5 block text-[13px] font-semibold text-slate-200">
+                  Upstox API Key
+                </label>
+                <input
+                  id="modal-api-key"
+                  type="text"
+                  value={apiKey}
+                  onChange={(e) => setApiKey(e.target.value)}
+                  placeholder={
+                    upstoxCreds?.has_api_key
+                      ? `Configured (${upstoxCreds.api_key_preview})`
+                      : 'Enter your Upstox API Key'
+                  }
+                  autoComplete="off"
+                  className="min-h-[42px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 text-sm text-slate-100 focus:border-sky-400 focus:outline-none"
+                />
+              </div>
+
+              <div>
+                <label htmlFor="modal-api-secret" className="mb-1.5 block text-[13px] font-semibold text-slate-200">
+                  Upstox API Secret
+                </label>
+                <input
+                  id="modal-api-secret"
+                  type="password"
+                  value={apiSecret}
+                  onChange={(e) => setApiSecret(e.target.value)}
+                  placeholder={
+                    upstoxCreds?.has_api_secret
+                      ? 'Configured in Keychain/env (enter only to replace)'
+                      : 'Enter your Upstox API Secret'
+                  }
+                  autoComplete="off"
+                  className="min-h-[42px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 text-sm text-slate-100 focus:border-sky-400 focus:outline-none"
+                />
+              </div>
+
+              <div>
+                <label htmlFor="modal-redirect-uri" className="mb-1.5 block text-[13px] font-semibold text-slate-200">
+                  OAuth Redirect URI
+                </label>
+                <input
+                  id="modal-redirect-uri"
+                  type="text"
+                  value={redirectUri}
+                  onChange={(e) => setRedirectUri(e.target.value)}
+                  className="min-h-[42px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 font-mono text-xs text-slate-100 focus:border-sky-400 focus:outline-none"
+                />
+              </div>
+
+              <div className="flex flex-wrap gap-2.5 pt-1">
+                <button
+                  type="button"
+                  onClick={() => void handleSaveCredentials()}
+                  className="min-h-[40px] shrink-0 whitespace-nowrap rounded-lg border border-slate-700 bg-[#0b1120] px-4 py-2 text-[13px] font-semibold text-slate-200 hover:bg-slate-800"
+                >
+                  Save Credentials
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleStartOAuth()}
+                  className="inline-flex min-h-[40px] shrink-0 items-center gap-2 whitespace-nowrap rounded-lg bg-sky-400 px-4 py-2 text-[13px] font-semibold text-sky-950 hover:bg-sky-300"
+                >
+                  <ExternalLink className="h-3.5 w-3.5" />
+                  <span>Open Upstox OAuth Login</span>
+                </button>
+              </div>
+
+              {oauthUrl && (
+                <div className="rounded-lg border border-slate-800 bg-[#0b1120] p-3 font-mono text-xs break-all text-slate-400">
+                  {oauthUrl}
+                </div>
+              )}
+
+              <hr className="border-slate-800" />
+
+              <div>
+                <label htmlFor="modal-callback-input" className="mb-1.5 block text-[13px] font-semibold text-slate-200">
+                  Paste Redirect URL or Authorization Code
+                </label>
+                <input
+                  id="modal-callback-input"
+                  type="text"
+                  value={callbackInput}
+                  onChange={(e) => setCallbackInput(e.target.value)}
+                  placeholder="https://127.0.0.1:5000/?code=... or bare code"
+                  autoComplete="off"
+                  className="min-h-[42px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 font-mono text-xs text-slate-100 focus:border-sky-400 focus:outline-none"
+                />
+                <span className="mt-1.5 block text-xs text-slate-500">
+                  If your Upstox developer app redirects to port 5000 instead of /auth/upstox/callback, paste the redirected URL here.
+                </span>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => void handleExchangeCode()}
+                disabled={exchanging}
+                className="min-h-[42px] w-full rounded-lg bg-sky-400 px-4 py-2 text-sm font-semibold text-sky-950 hover:bg-sky-300 disabled:opacity-50"
+              >
+                {exchanging ? 'Exchanging Code...' : 'Exchange Code & Connect'}
+              </button>
+
+              {modalFeedback && (
+                <div
+                  className={`flex items-start gap-2 text-[13px] ${
+                    modalFeedback.type === 'ok' ? 'text-emerald-400' : 'text-red-400'
+                  }`}
+                  role="status"
+                  aria-live="polite"
+                >
+                  {modalFeedback.type === 'ok' ? (
+                    <Check className="mt-0.5 h-4 w-4 shrink-0" />
+                  ) : (
+                    <AlertCircle className="mt-0.5 h-4 w-4 shrink-0" />
+                  )}
+                  <span>{modalFeedback.text}</span>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

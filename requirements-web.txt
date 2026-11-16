@@ -1,0 +1,8 @@
+# Lightweight web hub dependencies for MacBook Air M2 (8GB)
+fastapi>=0.115.0
+uvicorn[standard]>=0.32.0
+pydantic>=2.9.0
+requests>=2.32.0
+python-dotenv>=1.0.1
+keyring>=25.5.0
+upstox-python-sdk>=2.12.0

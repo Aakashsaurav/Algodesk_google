@@ -1,0 +1,6 @@
+{
+  "name": "AlgoDesk",
+  "description": "Modular Indian market algorithmic trading broker connectivity and data routing hub.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

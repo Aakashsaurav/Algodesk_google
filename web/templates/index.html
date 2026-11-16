@@ -1,0 +1,816 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AlgoDesk — Broker & Data Connectivity</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --bg: #0b1120;
+      --surface: #111827;
+      --surface-hover: #172033;
+      --border: #1e293b;
+      --border-strong: #334155;
+      --text: #f1f5f9;
+      --text-muted: #94a3b8;
+      --text-subtle: #64748b;
+      --accent: #38bdf8;
+      --accent-ink: #082f49;
+      --green: #16a34a;
+      --amber: #d97706;
+      --red: #dc2626;
+      --slate: #475569;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: 'Plus Jakarta Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+      font-size: 15px;
+      line-height: 1.55;
+      letter-spacing: 0.01em;
+      -webkit-font-smoothing: antialiased;
+    }
+    .mono {
+      font-family: 'IBM Plex Mono', ui-monospace, SFMono-Regular, monospace;
+      font-variant-numeric: tabular-nums;
+    }
+    .container {
+      max-width: 1160px;
+      margin: 0 auto;
+      padding: 0 24px;
+    }
+    /* Strict 3-zone Top Bar */
+    header {
+      border-bottom: 1px solid var(--border);
+      background: var(--bg);
+    }
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 32px;
+      height: 64px;
+    }
+    .brand {
+      font-size: 18px;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      color: var(--text);
+      text-decoration: none;
+      white-space: nowrap;
+      flex-shrink: 0;
+    }
+    nav {
+      display: flex;
+      align-items: center;
+      gap: 28px;
+    }
+    nav a {
+      color: var(--text-muted);
+      text-decoration: none;
+      font-size: 14px;
+      font-weight: 500;
+      white-space: nowrap;
+      flex-shrink: 0;
+      transition: color 150ms cubic-bezier(0.16, 1, 0.3, 1);
+    }
+    nav a:hover {
+      color: var(--text);
+      text-decoration: underline;
+      text-underline-offset: 6px;
+    }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      padding: 8px 16px;
+      font-family: inherit;
+      font-size: 13px;
+      font-weight: 600;
+      border-radius: 8px;
+      border: 1px solid var(--border-strong);
+      background: var(--surface);
+      color: var(--text);
+      cursor: pointer;
+      white-space: nowrap;
+      flex-shrink: 0;
+      min-height: 40px;
+      transition: background-color 150ms cubic-bezier(0.16, 1, 0.3, 1), border-color 150ms, opacity 150ms;
+    }
+    .btn:hover:not(:disabled) { background: var(--surface-hover); border-color: #475569; }
+    .btn:disabled { opacity: 0.45; cursor: not-allowed; }
+    .btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    .btn-primary {
+      background: var(--accent);
+      color: var(--accent-ink);
+      border-color: var(--accent);
+    }
+    .btn-primary:hover:not(:disabled) {
+      background: #7dd3fc;
+      border-color: #7dd3fc;
+    }
+    .btn-danger {
+      border-color: rgba(220, 38, 38, 0.45);
+      color: #fca5a5;
+    }
+    .btn-danger:hover:not(:disabled) {
+      background: rgba(220, 38, 38, 0.14);
+      border-color: #ef4444;
+    }
+
+    main {
+      padding: 40px 0 64px;
+      display: flex;
+      flex-direction: column;
+      gap: 40px;
+    }
+    .page-header h1 {
+      margin: 0 0 8px;
+      font-size: clamp(24px, 3vw, 32px);
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      text-wrap: balance;
+    }
+    .page-header p {
+      margin: 0;
+      color: var(--text-muted);
+      max-width: 68ch;
+      font-size: 15px;
+    }
+    .meta-line {
+      margin-top: 12px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      font-size: 13px;
+      color: var(--text-subtle);
+    }
+
+    section h2 {
+      margin: 0 0 6px;
+      font-size: 18px;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+    }
+    .section-desc {
+      margin: 0 0 18px;
+      font-size: 14px;
+      color: var(--text-muted);
+    }
+
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 24px;
+    }
+
+    /* Routing Selector Grid */
+    .routing-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr auto;
+      gap: 20px;
+      align-items: end;
+    }
+    .field label {
+      display: block;
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--text);
+      margin-bottom: 6px;
+    }
+    .field .hint {
+      display: block;
+      font-size: 12px;
+      color: var(--text-subtle);
+      margin-top: 6px;
+    }
+    select, input[type="text"], input[type="password"] {
+      width: 100%;
+      min-height: 42px;
+      padding: 9px 12px;
+      border-radius: 8px;
+      border: 1px solid var(--border-strong);
+      background: var(--bg);
+      color: var(--text);
+      font-family: inherit;
+      font-size: 14px;
+    }
+    select:focus, input:focus {
+      outline: 2px solid var(--accent);
+      outline-offset: 1px;
+      border-color: var(--accent);
+    }
+    .feedback {
+      margin-top: 14px;
+      font-size: 13px;
+      color: var(--text-muted);
+      min-height: 20px;
+    }
+    .feedback.ok { color: #4ade80; }
+    .feedback.err { color: #f87171; }
+
+    /* Directory Rows */
+    .directory {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    .broker-row {
+      display: grid;
+      grid-template-columns: 1.4fr 1.1fr 1.1fr auto;
+      gap: 20px;
+      align-items: center;
+      padding: 20px 24px;
+      border-bottom: 1px solid var(--border);
+    }
+    .broker-row:last-child { border-bottom: none; }
+    .broker-name {
+      font-size: 16px;
+      font-weight: 600;
+      color: var(--text);
+      margin-bottom: 4px;
+    }
+    .broker-sub {
+      font-size: 13px;
+      color: var(--text-muted);
+    }
+    .status-cell {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .led-row {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      font-size: 14px;
+      font-weight: 600;
+    }
+    .led {
+      width: 11px;
+      height: 11px;
+      border-radius: 50%;
+      flex-shrink: 0;
+    }
+    .led.connected { background: var(--green); box-shadow: 0 0 10px rgba(22, 163, 74, 0.7); }
+    .led.disconnected, .led.expired, .led.unconfigured, .led.error {
+      background: var(--red);
+      box-shadow: 0 0 10px rgba(220, 38, 38, 0.65);
+    }
+    .led.connecting { background: var(--amber); box-shadow: 0 0 10px rgba(217, 119, 6, 0.7); }
+    .led.planned { background: var(--slate); }
+    .actions-cell {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      justify-content: flex-end;
+    }
+
+    /* Roadmap List */
+    .roadmap-list {
+      border-top: 1px solid var(--border);
+    }
+    .roadmap-item {
+      display: grid;
+      grid-template-columns: 110px 1fr;
+      gap: 20px;
+      padding: 16px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .roadmap-item:last-child { border-bottom: none; }
+    .roadmap-phase {
+      font-size: 13px;
+      font-weight: 600;
+      color: var(--accent);
+    }
+    .roadmap-title {
+      font-weight: 600;
+      margin-bottom: 4px;
+    }
+    .roadmap-detail {
+      font-size: 14px;
+      color: var(--text-muted);
+    }
+
+    /* Modal */
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(2, 6, 23, 0.78);
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+      z-index: 50;
+    }
+    .modal-backdrop.open { display: flex; }
+    .modal {
+      width: 100%;
+      max-width: 560px;
+      background: var(--surface);
+      border: 1px solid var(--border-strong);
+      border-radius: 12px;
+      padding: 24px;
+    }
+    .modal-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-bottom: 16px;
+    }
+    .modal-head h3 { margin: 0; font-size: 18px; }
+    .stack { display: flex; flex-direction: column; gap: 14px; }
+    .divider { border: 0; border-top: 1px solid var(--border); margin: 18px 0; }
+
+    @media (max-width: 900px) {
+      .routing-grid { grid-template-columns: 1fr; }
+      .broker-row { grid-template-columns: 1fr; gap: 14px; }
+      .actions-cell { justify-content: flex-start; flex-wrap: wrap; }
+      nav { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="container topbar">
+      <a href="/" class="brand">AlgoDesk</a>
+      <nav aria-label="Primary">
+        <a href="#routing">Routing</a>
+        <a href="#connections">Connections</a>
+        <a href="#roadmap">Roadmap</a>
+      </nav>
+      <button id="refreshBtn" class="btn btn-primary" type="button">Refresh Status</button>
+    </div>
+  </header>
+
+  <main class="container">
+    <div class="page-header">
+      <h1>Broker &amp; Data Connectivity</h1>
+      <p>Verify live broker sessions, recover disconnected OAuth links, and assign independent providers for order execution and market data.</p>
+      <div id="runtimeMeta" class="meta-line mono">Loading local Python runtime details...</div>
+    </div>
+
+    <section id="routing">
+      <h2>Active Connection Routing</h2>
+      <p class="section-desc">Assign one verified broker for order execution and one provider for historical and live market data.</p>
+      <div class="panel">
+        <div class="routing-grid">
+          <div class="field">
+            <label for="tradingSelect">Trading Connection (Order Execution)</label>
+            <select id="tradingSelect"></select>
+            <span class="hint">Only brokers with active execution support can be selected.</span>
+          </div>
+          <div class="field">
+            <label for="dataSelect">Data Connection (Market Feed &amp; OHLCV)</label>
+            <select id="dataSelect"></select>
+            <span class="hint">Supports broker feeds or Yahoo Finance historical fallback.</span>
+          </div>
+          <button id="saveRoutingBtn" class="btn btn-primary" type="button">Save Assignment</button>
+        </div>
+        <div id="routingFeedback" class="feedback" role="status" aria-live="polite"></div>
+      </div>
+    </section>
+
+    <section id="connections">
+      <h2>Broker &amp; Provider Directory</h2>
+      <p class="section-desc">Live connection status probed directly against broker endpoints. Disconnected sessions surface an immediate Reconnect action.</p>
+      <div id="brokerDirectory" class="directory"></div>
+    </section>
+
+    <section id="roadmap">
+      <h2>Modular Expansion Roadmap</h2>
+      <p class="section-desc">Each adapter implements the unified broker capability and health contract, allowing incremental expansion without rewriting UI or strategy code.</p>
+      <div class="roadmap-list">
+        <div class="roadmap-item">
+          <div class="roadmap-phase mono">Phase 01</div>
+          <div>
+            <div class="roadmap-title">Hardened Upstox Hub &amp; Security Fixes</div>
+            <div class="roadmap-detail">Fixed Upstox logout endpoint, IST 03:30 AM token boundary validation, macOS Keychain persistence, and decoupled M2-friendly broker health probing.</div>
+          </div>
+        </div>
+        <div class="roadmap-item">
+          <div class="roadmap-phase mono">Phase 02</div>
+          <div>
+            <div class="roadmap-title">Zerodha Kite Connect Adapter</div>
+            <div class="roadmap-detail">Implement Kite OAuth SHA-256 checksum login, KiteTicker WebSocket feed, and promote Zerodha from Planned to Active in BrokerRegistry.</div>
+          </div>
+        </div>
+        <div class="roadmap-item">
+          <div class="roadmap-phase mono">Phase 03</div>
+          <div>
+            <div class="roadmap-title">SQLite Instrument Index &amp; Core Consolidation</div>
+            <div class="roadmap-detail">Replace eager 100k-entry JSON parsing with an indexed local SQLite instrument store under 5 MB RSS and unify core/live execution managers.</div>
+          </div>
+        </div>
+        <div class="roadmap-item">
+          <div class="roadmap-phase mono">Phase 04</div>
+          <div>
+            <div class="roadmap-title">Hot-Standby Feed Failover &amp; Kill Switch</div>
+            <div class="roadmap-detail">Expose WebSocket tick telemetry, automatic primary-to-fallback feed switching, preflight margin checks, and SEBI hash-chained kill switch controls.</div>
+          </div>
+        </div>
+        <div class="roadmap-item">
+          <div class="roadmap-phase mono">Phase 05</div>
+          <div>
+            <div class="roadmap-title">Screener, Backtester &amp; Risk Console</div>
+            <div class="roadmap-detail">Connect existing screener, vectorized backtester, and risk limits to the selected Data Connection as async FastAPI endpoints.</div>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <div id="reconnectModal" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+    <div class="modal">
+      <div class="modal-head">
+        <h3 id="modalTitle">Reconnect Upstox Session</h3>
+        <button id="closeModalBtn" class="btn" type="button">Close</button>
+      </div>
+      <div class="stack">
+        <div class="field">
+          <label for="credApiKey">Upstox API Key</label>
+          <input id="credApiKey" type="text" placeholder="Enter your Upstox API Key" autocomplete="off" />
+        </div>
+        <div class="field">
+          <label for="credApiSecret">Upstox API Secret</label>
+          <input id="credApiSecret" type="password" placeholder="Stored in macOS Keychain / env (never returned)" autocomplete="off" />
+        </div>
+        <div class="field">
+          <label for="credRedirectUri">OAuth Redirect URI</label>
+          <input id="credRedirectUri" type="text" placeholder="http://127.0.0.1:8000/auth/upstox/callback" />
+        </div>
+        <div style="display:flex; gap:10px; flex-wrap:wrap;">
+          <button id="saveCredsBtn" class="btn" type="button">Save Credentials</button>
+          <button id="openLoginBtn" class="btn btn-primary" type="button">Open Upstox OAuth Login</button>
+        </div>
+        <div id="oauthUrlBox" class="mono" style="font-size:12px; color:#94a3b8; word-break:break-all;"></div>
+        <hr class="divider" />
+        <div class="field">
+          <label for="callbackCodeInput">Paste Redirect URL or Authorization Code</label>
+          <input id="callbackCodeInput" type="text" placeholder="https://127.0.0.1:5000/?code=... or bare code" autocomplete="off" />
+          <span class="hint">If your Upstox app redirects to port 5000 instead of /auth/upstox/callback, paste the redirected URL here.</span>
+        </div>
+        <button id="exchangeCodeBtn" class="btn btn-primary" type="button">Exchange Code &amp; Connect</button>
+        <div id="modalFeedback" class="feedback" role="status" aria-live="polite"></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    const state = {
+      overview: null,
+      activeBrokerModal: 'upstox',
+      probingIds: new Set(),
+    };
+
+    const els = {
+      refreshBtn: document.getElementById('refreshBtn'),
+      runtimeMeta: document.getElementById('runtimeMeta'),
+      tradingSelect: document.getElementById('tradingSelect'),
+      dataSelect: document.getElementById('dataSelect'),
+      saveRoutingBtn: document.getElementById('saveRoutingBtn'),
+      routingFeedback: document.getElementById('routingFeedback'),
+      directory: document.getElementById('brokerDirectory'),
+      modal: document.getElementById('reconnectModal'),
+      closeModalBtn: document.getElementById('closeModalBtn'),
+      credApiKey: document.getElementById('credApiKey'),
+      credApiSecret: document.getElementById('credApiSecret'),
+      credRedirectUri: document.getElementById('credRedirectUri'),
+      saveCredsBtn: document.getElementById('saveCredsBtn'),
+      openLoginBtn: document.getElementById('openLoginBtn'),
+      oauthUrlBox: document.getElementById('oauthUrlBox'),
+      callbackCodeInput: document.getElementById('callbackCodeInput'),
+      exchangeCodeBtn: document.getElementById('exchangeCodeBtn'),
+      modalFeedback: document.getElementById('modalFeedback'),
+    };
+
+    function ledClass(status, isProbing) {
+      if (isProbing) return 'connecting';
+      switch (status) {
+        case 'CONNECTED': return 'connected';
+        case 'PLANNED': return 'planned';
+        case 'CONNECTING': return 'connecting';
+        default: return 'disconnected';
+      }
+    }
+
+    function statusLabel(status, isProbing) {
+      if (isProbing) return 'Checking';
+      const labels = {
+        CONNECTED: 'Connected',
+        DISCONNECTED: 'Disconnected',
+        EXPIRED: 'Token Expired',
+        UNCONFIGURED: 'Credentials Needed',
+        PLANNED: 'Planned (Phase 2)',
+        ERROR: 'Error',
+      };
+      return labels[status] || status;
+    }
+
+    function renderOverview() {
+      const data = state.overview;
+      if (!data) return;
+
+      const rt = data.runtime || {};
+      els.runtimeMeta.textContent =
+        `Python ${rt.python_version || '3'} · ${rt.system || 'macOS'} ${rt.machine || ''} · ${rt.ist_time || ''} · Instrument Master: Lazy`;
+
+      // Routing selectors
+      const brokers = data.brokers || [];
+      const sel = data.selections || {};
+
+      els.tradingSelect.innerHTML = '';
+      els.dataSelect.innerHTML = '';
+
+      brokers.forEach((b) => {
+        if (b.capabilities.supports_trading) {
+          const opt = document.createElement('option');
+          opt.value = b.broker_id;
+          opt.disabled = b.stage === 'planned';
+          opt.textContent = b.stage === 'planned'
+            ? `${b.display_name} — Planned (Phase 2)`
+            : `${b.display_name} (${statusLabel(b.state, false)})`;
+          if (sel.trading_broker === b.broker_id) opt.selected = true;
+          els.tradingSelect.appendChild(opt);
+        }
+        if (b.capabilities.supports_market_data) {
+          const opt = document.createElement('option');
+          opt.value = b.broker_id;
+          opt.disabled = b.stage === 'planned';
+          opt.textContent = b.stage === 'planned'
+            ? `${b.display_name} — Planned (Phase 2)`
+            : `${b.display_name} (${statusLabel(b.state, false)})`;
+          if (sel.data_connection === b.broker_id) opt.selected = true;
+          els.dataSelect.appendChild(opt);
+        }
+      });
+
+      // Directory rows
+      els.directory.innerHTML = '';
+      brokers.forEach((b) => {
+        const probing = state.probingIds.has(b.broker_id);
+        const row = document.createElement('div');
+        row.className = 'broker-row';
+
+        const capParts = [];
+        if (b.capabilities.supports_trading) capParts.push('Trading');
+        if (b.capabilities.supports_market_data) capParts.push('Market Data');
+        if (b.capabilities.supports_websocket) capParts.push('WebSocket');
+
+        const latencyText = b.latency_ms !== null && b.latency_ms !== undefined ? `${b.latency_ms} ms` : '—';
+        const roleAssigned = [];
+        if (sel.trading_broker === b.broker_id) roleAssigned.push('Assigned: Trading');
+        if (sel.data_connection === b.broker_id) roleAssigned.push('Assigned: Data');
+
+        row.innerHTML = `
+          <div>
+            <div class="broker-name">${b.display_name}</div>
+            <div class="broker-sub">${capParts.join(' · ')}${roleAssigned.length ? ' · ' + roleAssigned.join(' · ') : ''}</div>
+            <div class="broker-sub" style="margin-top:4px">${b.message || ''}</div>
+          </div>
+          <div class="status-cell">
+            <div class="led-row">
+              <span class="led ${ledClass(b.state, probing)}" aria-hidden="true"></span>
+              <span>${statusLabel(b.state, probing)}</span>
+            </div>
+            <div class="broker-sub mono">${b.account_name || 'Session Inactive'}${b.client_id ? ' · ' + b.client_id : ''}</div>
+          </div>
+          <div class="status-cell mono" style="font-size:12px; color:#94a3b8;">
+            <div>Probe: ${latencyText}</div>
+            <div>Reset: ${b.token_expires_at_ist || 'N/A'}</div>
+            <div>Checked: ${b.last_checked_at ? b.last_checked_at.slice(11, 19) : '—'} IST</div>
+          </div>
+          <div class="actions-cell"></div>
+        `;
+
+        const actions = row.querySelector('.actions-cell');
+        if (b.stage === 'planned') {
+          const btn = document.createElement('button');
+          btn.className = 'btn';
+          btn.disabled = true;
+          btn.textContent = 'Coming in Phase 2';
+          actions.appendChild(btn);
+        } else {
+          const testBtn = document.createElement('button');
+          testBtn.className = 'btn';
+          testBtn.textContent = probing ? 'Checking...' : 'Test';
+          testBtn.disabled = probing;
+          testBtn.onclick = () => probeBroker(b.broker_id);
+          actions.appendChild(testBtn);
+
+          if (!b.is_connected && b.can_reconnect) {
+            const reconBtn = document.createElement('button');
+            reconBtn.className = 'btn btn-primary';
+            reconBtn.textContent = 'Reconnect';
+            reconBtn.onclick = () => openReconnectModal(b.broker_id);
+            actions.appendChild(reconBtn);
+          } else if (b.is_connected && b.capabilities.requires_oauth) {
+            const discBtn = document.createElement('button');
+            discBtn.className = 'btn btn-danger';
+            discBtn.textContent = 'Disconnect';
+            discBtn.onclick = () => disconnectBroker(b.broker_id);
+            actions.appendChild(discBtn);
+          }
+        }
+        els.directory.appendChild(row);
+      });
+    }
+
+    async function loadOverview(refresh = true) {
+      els.refreshBtn.disabled = true;
+      els.refreshBtn.textContent = 'Refreshing...';
+      try {
+        const res = await fetch(`/api/overview?refresh=${refresh}`);
+        state.overview = await res.json();
+        renderOverview();
+      } catch (err) {
+        els.routingFeedback.className = 'feedback err';
+        els.routingFeedback.textContent = `Failed to load broker overview: ${err.message}`;
+      } finally {
+        els.refreshBtn.disabled = false;
+        els.refreshBtn.textContent = 'Refresh Status';
+      }
+    }
+
+    async function probeBroker(brokerId) {
+      state.probingIds.add(brokerId);
+      renderOverview();
+      try {
+        const res = await fetch(`/api/brokers/${brokerId}/probe`, { method: 'POST' });
+        const payload = await res.json();
+        if (payload.broker && state.overview) {
+          state.overview.brokers = state.overview.brokers.map((item) =>
+            item.broker_id === brokerId ? payload.broker : item
+          );
+        }
+      } finally {
+        state.probingIds.delete(brokerId);
+        renderOverview();
+      }
+    }
+
+    async function disconnectBroker(brokerId) {
+      state.probingIds.add(brokerId);
+      renderOverview();
+      try {
+        const res = await fetch(`/api/brokers/${brokerId}/disconnect`, { method: 'POST' });
+        const payload = await res.json();
+        if (payload.broker && state.overview) {
+          state.overview.brokers = state.overview.brokers.map((item) =>
+            item.broker_id === brokerId ? payload.broker : item
+          );
+        }
+      } finally {
+        state.probingIds.delete(brokerId);
+        renderOverview();
+      }
+    }
+
+    async function saveRouting() {
+      els.saveRoutingBtn.disabled = true;
+      els.routingFeedback.className = 'feedback';
+      els.routingFeedback.textContent = 'Saving routing assignment...';
+      try {
+        const res = await fetch('/api/selection', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            trading_broker: els.tradingSelect.value,
+            data_connection: els.dataSelect.value,
+          }),
+        });
+        const payload = await res.json();
+        if (!res.ok) throw new Error(payload.detail || 'Could not save assignment');
+        state.overview.selections = payload.selections;
+        els.routingFeedback.className = 'feedback ok';
+        els.routingFeedback.textContent = `Saved: Trading=${payload.selections.trading_broker.toUpperCase()} · Data=${payload.selections.data_connection.toUpperCase()}`;
+        renderOverview();
+      } catch (err) {
+        els.routingFeedback.className = 'feedback err';
+        els.routingFeedback.textContent = err.message;
+      } finally {
+        els.saveRoutingBtn.disabled = false;
+      }
+    }
+
+    function openReconnectModal(brokerId) {
+      state.activeBrokerModal = brokerId;
+      const creds = (state.overview && state.overview.credentials && state.overview.credentials[brokerId]) || {};
+      els.credApiKey.value = '';
+      els.credApiSecret.value = '';
+      els.credApiKey.placeholder = creds.has_api_key ? `Configured (${creds.api_key_preview})` : 'Enter your Upstox API Key';
+      els.credApiSecret.placeholder = creds.has_api_secret ? 'Configured in Keychain/env (leave blank to keep)' : 'Enter your Upstox API Secret';
+      els.credRedirectUri.value = creds.redirect_uri || `${window.location.origin}/auth/${brokerId}/callback`;
+      els.oauthUrlBox.textContent = '';
+      els.callbackCodeInput.value = '';
+      els.modalFeedback.textContent = '';
+      els.modal.classList.add('open');
+    }
+
+    function closeModal() {
+      els.modal.classList.remove('open');
+    }
+
+    async function saveCredentials() {
+      const apiKey = els.credApiKey.value.trim();
+      const apiSecret = els.credApiSecret.value.trim();
+      const redirectUri = els.credRedirectUri.value.trim();
+      els.modalFeedback.className = 'feedback';
+      try {
+        const res = await fetch(`/api/brokers/${state.activeBrokerModal}/credentials`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ api_key: apiKey, api_secret: apiSecret, redirect_uri: redirectUri }),
+        });
+        const payload = await res.json();
+        if (!res.ok) throw new Error(payload.detail || 'Credential save failed');
+        els.modalFeedback.className = 'feedback ok';
+        els.modalFeedback.textContent = 'Credentials saved securely. You can now open Upstox OAuth login.';
+        await loadOverview(false);
+      } catch (err) {
+        els.modalFeedback.className = 'feedback err';
+        els.modalFeedback.textContent = err.message;
+      }
+    }
+
+    async function startOAuth() {
+      els.modalFeedback.className = 'feedback';
+      try {
+        const res = await fetch(`/api/brokers/${state.activeBrokerModal}/reconnect`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ redirect_uri: els.credRedirectUri.value.trim() || null }),
+        });
+        const payload = await res.json();
+        if (!res.ok) throw new Error(payload.detail || 'Could not generate OAuth link');
+        if (payload.mode === 'needs_credentials') {
+          els.modalFeedback.className = 'feedback err';
+          els.modalFeedback.textContent = payload.message;
+          return;
+        }
+        if (payload.login_url) {
+          els.oauthUrlBox.textContent = `OAuth URL: ${payload.login_url}`;
+          window.open(payload.login_url, '_blank', 'noopener');
+          els.modalFeedback.className = 'feedback ok';
+          els.modalFeedback.textContent = 'OAuth login opened in a new tab. Complete login or paste the redirected URL below.';
+        }
+      } catch (err) {
+        els.modalFeedback.className = 'feedback err';
+        els.modalFeedback.textContent = err.message;
+      }
+    }
+
+    async function exchangeCode() {
+      const codeOrUrl = els.callbackCodeInput.value.trim();
+      if (!codeOrUrl) {
+        els.modalFeedback.className = 'feedback err';
+        els.modalFeedback.textContent = 'Paste the redirected callback URL or authorization code first.';
+        return;
+      }
+      els.exchangeCodeBtn.disabled = true;
+      els.modalFeedback.className = 'feedback';
+      els.modalFeedback.textContent = 'Exchanging authorization code and verifying live profile...';
+      try {
+        const res = await fetch(`/api/brokers/${state.activeBrokerModal}/callback-exchange`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            code_or_url: codeOrUrl,
+            redirect_uri: els.credRedirectUri.value.trim() || null,
+          }),
+        });
+        const payload = await res.json();
+        if (!res.ok) throw new Error(payload.detail || 'Token exchange failed');
+        els.modalFeedback.className = 'feedback ok';
+        els.modalFeedback.textContent = 'Connected and verified against Upstox profile API.';
+        await loadOverview(true);
+        setTimeout(closeModal, 600);
+      } catch (err) {
+        els.modalFeedback.className = 'feedback err';
+        els.modalFeedback.textContent = err.message;
+      } finally {
+        els.exchangeCodeBtn.disabled = false;
+      }
+    }
+
+    els.refreshBtn.addEventListener('click', () => loadOverview(true));
+    els.saveRoutingBtn.addEventListener('click', saveRouting);
+    els.closeModalBtn.addEventListener('click', closeModal);
+    els.saveCredsBtn.addEventListener('click', saveCredentials);
+    els.openLoginBtn.addEventListener('click', startOAuth);
+    els.exchangeCodeBtn.addEventListener('click', exchangeCode);
+    els.modal.addEventListener('click', (e) => { if (e.target === els.modal) closeModal(); });
+
+    loadOverview(true);
+  </script>
+</body>
+</html>
