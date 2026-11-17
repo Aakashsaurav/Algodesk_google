@@ -2,6 +2,7 @@ import express from 'express';
 import type { Request, Response } from 'express';
 import { spawn } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
+import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -14,11 +15,30 @@ const PYTHON_ORIGIN = `http://127.0.0.1:${PYTHON_PORT}`;
 const IS_PROD = process.env.NODE_ENV === 'production';
 
 let pythonProc: ChildProcess | null = null;
+let pythonReadyPromise: Promise<boolean> | null = null;
+
+function resolvePythonBin(): string {
+  if (process.env.PYTHON_BIN?.trim()) {
+    return process.env.PYTHON_BIN.trim();
+  }
+  const venvCandidates = [
+    path.join(__dirname, '.venv', 'bin', 'python3'),
+    path.join(__dirname, '.venv', 'bin', 'python'),
+    path.join(__dirname, '.venv', 'Scripts', 'python.exe'),
+  ];
+  for (const candidate of venvCandidates) {
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return 'python3';
+}
 
 function startPythonHub(): void {
-  if (pythonProc) return;
+  if (pythonProc && pythonProc.exitCode === null && !pythonProc.killed) return;
+  const pythonBin = resolvePythonBin();
   pythonProc = spawn(
-    'python3',
+    pythonBin,
     ['-m', 'web.local_server', '--host', '127.0.0.1', '--port', String(PYTHON_PORT), '--no-browser'],
     {
       cwd: __dirname,
@@ -37,27 +57,46 @@ function startPythonHub(): void {
     if (line) console.error(`[python-hub] ${line}`);
   });
 
+  pythonProc.on('error', (err) => {
+    console.error(`[python-hub] spawn error: ${err.message}`);
+    pythonProc = null;
+  });
+
   pythonProc.on('exit', (code) => {
     console.warn(`[python-hub] exited with code ${code}`);
     pythonProc = null;
   });
 }
 
-async function waitForPythonHub(retries = 25): Promise<boolean> {
+async function waitForPythonHub(retries = 20): Promise<boolean> {
+  startPythonHub();
   for (let i = 0; i < retries; i++) {
     try {
-      const res = await fetch(`${PYTHON_ORIGIN}/api/overview?refresh=false`, {
-        signal: AbortSignal.timeout(500),
+      const res = await fetch(`${PYTHON_ORIGIN}/api/health`, {
+        signal: AbortSignal.timeout(400),
       });
       if (res.ok) return true;
     } catch {
-      await new Promise((r) => setTimeout(r, 120));
+      await new Promise((r) => setTimeout(r, 100));
     }
   }
   return false;
 }
 
+async function ensurePythonReady(): Promise<boolean> {
+  if (!pythonProc || pythonProc.exitCode !== null || pythonProc.killed) {
+    pythonReadyPromise = null;
+  }
+  if (!pythonReadyPromise) {
+    pythonReadyPromise = waitForPythonHub().finally(() => {
+      pythonReadyPromise = null;
+    });
+  }
+  return pythonReadyPromise;
+}
+
 async function proxyToPython(req: Request, res: Response): Promise<void> {
+  await ensurePythonReady();
   const targetUrl = `${PYTHON_ORIGIN}${req.originalUrl}`;
   try {
     const headers: Record<string, string> = {};
@@ -89,8 +128,8 @@ async function proxyToPython(req: Request, res: Response): Promise<void> {
 }
 
 async function bootstrap(): Promise<void> {
+  // Spawn Python hub immediately in the background without blocking port 3000 bind.
   startPythonHub();
-  await waitForPythonHub();
 
   const app = express();
   app.use(express.json({ limit: '1mb' }));

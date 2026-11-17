@@ -71,10 +71,77 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
             self._send_html(200, TEMPLATE_PATH.read_text(encoding="utf-8"))
             return
 
+        if path == "/api/health":
+            self._send_json(200, {"ok": True, "service": "algodesk"})
+            return
+
         if path == "/api/overview":
             refresh_raw = query.get("refresh", ["true"])[0].lower()
             refresh = refresh_raw != "false"
             self._send_json(200, hub_service.get_overview(refresh=refresh))
+            return
+
+        if path == "/api/instruments/stats":
+            self._send_json(200, hub_service.instrument_stats())
+            return
+
+        if path == "/api/instruments/search":
+            q = query.get("q", [""])[0]
+            broker_id = query.get("broker_id", [None])[0]
+            exchange = query.get("exchange", [None])[0]
+            limit = int(query.get("limit", ["25"])[0] or 25)
+            self._send_json(
+                200,
+                hub_service.search_instruments(query=q, broker_id=broker_id, exchange=exchange, limit=limit),
+            )
+            return
+
+        if path == "/api/data/catalog":
+            self._send_json(200, hub_service.list_historical_catalog())
+            return
+
+        if path == "/api/data/records":
+            try:
+                symbol = query.get("symbol", [""])[0]
+                if not symbol.strip():
+                    self._send_json(400, {"detail": "symbol query parameter is required."})
+                    return
+                limit_raw = query.get("limit", [None])[0]
+                self._send_json(
+                    200,
+                    hub_service.get_historical_records(
+                        symbol=symbol,
+                        exchange=query.get("exchange", ["NSE"])[0],
+                        timeframe=query.get("timeframe", ["1day"])[0],
+                        from_date=query.get("from_date", [None])[0],
+                        to_date=query.get("to_date", [None])[0],
+                        view=query.get("view", ["snapshot"])[0],
+                        limit=int(limit_raw) if limit_raw else None,
+                        offset=int(query.get("offset", ["0"])[0] or 0),
+                    ),
+                )
+            except Exception as exc:
+                self._send_json(400, {"detail": str(exc)})
+            return
+
+        if path == "/api/data/export.csv":
+            symbol = query.get("symbol", [""])[0]
+            timeframe = query.get("timeframe", ["1day"])[0]
+            csv_text = hub_service.export_historical_csv(
+                symbol=symbol,
+                exchange=query.get("exchange", ["NSE"])[0],
+                timeframe=timeframe,
+                from_date=query.get("from_date", [None])[0],
+                to_date=query.get("to_date", [None])[0],
+            )
+            raw = csv_text.encode("utf-8")
+            safe_sym = (symbol.strip().upper() or "DATA")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/csv; charset=utf-8")
+            self.send_header("Content-Length", str(len(raw)))
+            self.send_header("Content-Disposition", f'attachment; filename="{safe_sym}_{timeframe}.csv"')
+            self.end_headers()
+            self.wfile.write(raw)
             return
 
         parts = path.strip("/").split("/")
@@ -198,11 +265,33 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
                     self._send_json(200, hub_service.disconnect_broker(broker_id))
                     return
 
+            if path == "/api/instruments/sync":
+                res = hub_service.sync_instruments(str(body.get("broker_id", "upstox")))
+                self._send_json(200, res)
+                return
+
+            if path == "/api/data/download":
+                res = hub_service.download_historical(
+                    symbol=str(body.get("symbol", "")),
+                    exchange=str(body.get("exchange", "NSE")),
+                    timeframe=str(body.get("timeframe", "1day")),
+                    from_date=body.get("from_date"),
+                    to_date=body.get("to_date"),
+                    provider=body.get("provider"),
+                )
+                self._send_json(200, res)
+                return
+
             self._send_json(404, {"detail": "Not Found"})
         except ValueError as exc:
             self._send_json(400, {"detail": str(exc)})
         except Exception as exc:
             self._send_json(500, {"detail": str(exc)})
+
+
+class _AlgoDeskHTTPServer(ThreadingHTTPServer):
+    allow_reuse_address = True
+    daemon_threads = True
 
 
 def run_server(host: str = "127.0.0.1", port: int = 8000, open_browser: bool = True) -> None:
@@ -221,7 +310,7 @@ def run_server(host: str = "127.0.0.1", port: int = 8000, open_browser: bool = T
     except ImportError:
         logger.info("FastAPI/Uvicorn not installed; running lightweight Python stdlib server.")
 
-    server = ThreadingHTTPServer((host, port), _StdlibBrokerHandler)
+    server = _AlgoDeskHTTPServer((host, port), _StdlibBrokerHandler)
     if open_browser:
         webbrowser.open(url)
     try:

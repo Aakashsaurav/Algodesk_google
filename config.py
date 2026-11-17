@@ -239,6 +239,26 @@ class AppConfig:
         return self.DATA_DIR / "sqlite"
 
     @property
+    def INSTRUMENTS_DB_PATH(self) -> Path:
+        rel = os.getenv("ALGODESK_INSTRUMENTS_DB", "").strip()
+        if rel:
+            p = Path(rel)
+            return p if p.is_absolute() else (self.BASE_DIR / p)
+        return self.SQLITE_DIR / "instruments.db"
+
+    @property
+    def OHLCV_DB_PATH(self) -> Path:
+        rel = os.getenv("ALGODESK_OHLCV_DB", "").strip()
+        if rel:
+            p = Path(rel)
+            return p if p.is_absolute() else (self.BASE_DIR / p)
+        return self.SQLITE_DIR / "ohlcv.db"
+
+    @property
+    def ZERODHA_INSTRUMENT_URL(self) -> str:
+        return "https://api.kite.trade/instruments"
+
+    @property
     def LOG_FILE(self) -> Path:
         return self.BASE_DIR / "logs" / "app.log"
 
@@ -425,6 +445,7 @@ class AppConfig:
         """Create only essential local runtime directories on demand."""
         for directory in (
             self.DATA_DIR,
+            self.SQLITE_DIR,
             self.BASE_DIR / "logs",
             self.UPSTOX_TOKEN_FILE_PATH.parent,
             self.ZERODHA_TOKEN_FILE_PATH.parent,

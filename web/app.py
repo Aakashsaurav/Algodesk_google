@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from pydantic import BaseModel
 
 from web.service import hub_service
@@ -40,6 +40,19 @@ class ReconnectStartRequest(BaseModel):
 class CallbackExchangeRequest(BaseModel):
     code_or_url: str
     redirect_uri: Optional[str] = None
+
+
+class InstrumentSyncRequest(BaseModel):
+    broker_id: str = "upstox"
+
+
+class HistoricalDownloadRequest(BaseModel):
+    symbol: str
+    exchange: str = "NSE"
+    timeframe: str = "1day"
+    from_date: Optional[str] = None
+    to_date: Optional[str] = None
+    provider: Optional[str] = None
 
 
 def _render_callback_page(title: str, detail: str, broker_id: str, success: bool) -> str:
@@ -81,6 +94,10 @@ def create_app() -> FastAPI:
         if not TEMPLATE_PATH.exists():
             raise HTTPException(status_code=500, detail="index.html template missing")
         return HTMLResponse(TEMPLATE_PATH.read_text(encoding="utf-8"))
+
+    @app.get("/api/health")
+    def api_health() -> dict:
+        return {"ok": True, "service": "algodesk"}
 
     @app.get("/api/overview")
     def api_overview(refresh: bool = Query(default=True)) -> dict:
@@ -204,6 +221,91 @@ def create_app() -> FastAPI:
                 ),
                 status_code=400,
             )
+
+    @app.get("/api/instruments/stats")
+    def api_instrument_stats() -> dict:
+        return hub_service.instrument_stats()
+
+    @app.get("/api/instruments/search")
+    def api_instrument_search(
+        q: str = Query(default=""),
+        broker_id: Optional[str] = Query(default=None),
+        exchange: Optional[str] = Query(default=None),
+        limit: int = Query(default=25),
+    ) -> dict:
+        return hub_service.search_instruments(query=q, broker_id=broker_id, exchange=exchange, limit=limit)
+
+    @app.post("/api/instruments/sync")
+    def api_instrument_sync(payload: InstrumentSyncRequest) -> dict:
+        try:
+            return hub_service.sync_instruments(payload.broker_id)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/data/catalog")
+    def api_data_catalog() -> dict:
+        return hub_service.list_historical_catalog()
+
+    @app.post("/api/data/download")
+    def api_data_download(payload: HistoricalDownloadRequest) -> dict:
+        try:
+            return hub_service.download_historical(
+                symbol=payload.symbol,
+                exchange=payload.exchange,
+                timeframe=payload.timeframe,
+                from_date=payload.from_date,
+                to_date=payload.to_date,
+                provider=payload.provider,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/data/records")
+    def api_data_records(
+        symbol: str = Query(...),
+        exchange: str = Query(default="NSE"),
+        timeframe: str = Query(default="1day"),
+        from_date: Optional[str] = Query(default=None),
+        to_date: Optional[str] = Query(default=None),
+        view: str = Query(default="snapshot"),
+        limit: Optional[int] = Query(default=None),
+        offset: int = Query(default=0),
+    ) -> dict:
+        try:
+            return hub_service.get_historical_records(
+                symbol=symbol,
+                exchange=exchange,
+                timeframe=timeframe,
+                from_date=from_date,
+                to_date=to_date,
+                view=view,
+                limit=limit,
+                offset=offset,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/data/export.csv")
+    def api_data_export_csv(
+        symbol: str = Query(...),
+        exchange: str = Query(default="NSE"),
+        timeframe: str = Query(default="1day"),
+        from_date: Optional[str] = Query(default=None),
+        to_date: Optional[str] = Query(default=None),
+    ) -> Response:
+        csv_text = hub_service.export_historical_csv(
+            symbol=symbol,
+            exchange=exchange,
+            timeframe=timeframe,
+            from_date=from_date,
+            to_date=to_date,
+        )
+        safe_sym = symbol.strip().upper() or "DATA"
+        return Response(
+            content=csv_text,
+            media_type="text/csv; charset=utf-8",
+            headers={"Content-Disposition": f'attachment; filename="{safe_sym}_{timeframe}.csv"'},
+        )
 
     return app
 

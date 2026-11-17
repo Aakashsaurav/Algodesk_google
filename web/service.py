@@ -29,6 +29,8 @@ from broker.registry import BrokerRegistry, SelectionStore
 from broker.upstox.auth import auth_manager as upstox_auth_manager
 from broker.zerodha.auth import zerodha_auth_manager
 from config import IST_TZ, config
+from core.instruments import instrument_index
+from data.historical import historical_data_manager
 
 logger = logging.getLogger(__name__)
 
@@ -430,6 +432,100 @@ class BrokerHubService:
         adapter.disconnect()
         snap = self.probe_one(bid)
         return {"ok": True, "broker": snap}
+
+    # ── Phase 3: SQLite Instrument Index & Gap-Only Historical Data ───────
+
+    def instrument_stats(self) -> Dict[str, Any]:
+        return instrument_index.stats()
+
+    def search_instruments(
+        self,
+        query: str = "",
+        broker_id: Optional[str] = None,
+        exchange: Optional[str] = None,
+        limit: int = 25,
+    ) -> Dict[str, Any]:
+        results = instrument_index.search(
+            query=query,
+            broker_id=broker_id,
+            exchange=exchange,
+            limit=limit,
+        )
+        return {"ok": True, "count": len(results), "results": results, "stats": instrument_index.stats()}
+
+    def sync_instruments(self, broker_id: str) -> Dict[str, Any]:
+        bid = (broker_id or "upstox").strip().lower()
+        if bid == "upstox":
+            res = instrument_index.sync_upstox_master()
+        elif bid == "zerodha":
+            res = instrument_index.sync_zerodha_master()
+        else:
+            raise ValueError(f"Instrument master sync is supported for 'upstox' or 'zerodha', not '{broker_id}'.")
+        res["stats"] = instrument_index.stats()
+        return res
+
+    def download_historical(
+        self,
+        *,
+        symbol: str,
+        exchange: str = "NSE",
+        timeframe: str = "1day",
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None,
+        provider: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        selected_provider = (provider or self._store.load().get("data_connection") or "yfinance").strip().lower()
+        return historical_data_manager.download(
+            symbol=symbol,
+            exchange=exchange,
+            timeframe=timeframe,
+            from_date=from_date,
+            to_date=to_date,
+            provider=selected_provider,
+        )
+
+    def get_historical_records(
+        self,
+        *,
+        symbol: str,
+        exchange: str = "NSE",
+        timeframe: str = "1day",
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None,
+        view: str = "snapshot",
+        limit: Optional[int] = None,
+        offset: int = 0,
+    ) -> Dict[str, Any]:
+        return historical_data_manager.get_records(
+            symbol=symbol,
+            exchange=exchange,
+            timeframe=timeframe,
+            from_date=from_date,
+            to_date=to_date,
+            view=view,
+            limit=limit,
+            offset=offset,
+        )
+
+    def list_historical_catalog(self) -> Dict[str, Any]:
+        return {"ok": True, "datasets": historical_data_manager.list_catalog()}
+
+    def export_historical_csv(
+        self,
+        *,
+        symbol: str,
+        exchange: str = "NSE",
+        timeframe: str = "1day",
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None,
+    ) -> str:
+        return historical_data_manager.export_csv(
+            symbol=symbol,
+            exchange=exchange,
+            timeframe=timeframe,
+            from_date=from_date,
+            to_date=to_date,
+        )
 
 
 hub_service = BrokerHubService()

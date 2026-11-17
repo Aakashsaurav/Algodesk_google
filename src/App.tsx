@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { RefreshCw, ExternalLink, X, Check, AlertCircle } from 'lucide-react';
+import { RefreshCw, ExternalLink, X, Check, AlertCircle, Download, Search, Database } from 'lucide-react';
 
 type ConnectionState =
   | 'CONNECTED'
@@ -70,6 +70,83 @@ function formatCredentialSource(src?: string): string {
   return 'Default';
 }
 
+interface InstrumentStats {
+  db_path: string;
+  db_size_mb: number;
+  total_instruments: number;
+  counts_by_broker: Record<string, number>;
+}
+
+interface InstrumentItem {
+  broker_id: string;
+  exchange: string;
+  segment: string;
+  trading_symbol: string;
+  name: string;
+  instrument_type: string;
+  instrument_key: string;
+  instrument_token: string | null;
+}
+
+interface OhlcvRow {
+  ts_ist: string;
+  trade_date: string;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+  oi: number;
+  source: string;
+}
+
+interface DataRecordsPayload {
+  symbol: string;
+  exchange: string;
+  timeframe: string;
+  view_mode: 'snapshot' | 'full';
+  total_rows: number;
+  returned_rows: number;
+  is_truncated: boolean;
+  summary: {
+    start_ts: string | null;
+    end_ts: string | null;
+    min_low: number | null;
+    max_high: number | null;
+    latest_close: number | null;
+    change_pct: number | null;
+    total_volume: number;
+  };
+  rows: OhlcvRow[];
+}
+
+interface DownloadResultPayload {
+  ok: boolean;
+  symbol: string;
+  exchange: string;
+  timeframe: string;
+  provider: string;
+  total_weekdays_in_range: number;
+  existing_days_skipped: number;
+  missing_days_count: number;
+  missing_ranges_fetched: Array<{ from: string; to: string }>;
+  api_calls_made: number;
+  rows_inserted: number;
+  cache_hit_only: boolean;
+  message: string;
+  snapshot: DataRecordsPayload;
+}
+
+interface CatalogDataset {
+  symbol: string;
+  exchange: string;
+  timeframe: string;
+  row_count: number;
+  start_date: string;
+  end_date: string;
+  provider: string;
+}
+
 const ROADMAP_PHASES = [
   {
     phase: 'Phase 01',
@@ -85,9 +162,9 @@ const ROADMAP_PHASES = [
   },
   {
     phase: 'Phase 03',
-    title: 'SQLite Instrument Index & Core Consolidation',
+    title: 'SQLite Instrument Index & Gap-Only Data Hub (Active)',
     detail:
-      'Replace eager 100k-entry JSON parsing with an indexed SQLite instrument lookup under 5 MB RSS and unify core/live execution managers.',
+      'Indexed SQLite instrument master under 5 MB RSS, consolidated canonical core runtime interfaces, gap-only historical OHLCV downloads (0 API calls for cached dates), and Snapshot/Full data inspection.',
   },
   {
     phase: 'Phase 04',
@@ -169,6 +246,31 @@ export default function App() {
   const [modalFeedback, setModalFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
   const [exchanging, setExchanging] = useState(false);
 
+  // Phase 3: SQLite Instrument Index & Gap-Only Historical Data state
+  const todayIso = new Date().toISOString().slice(0, 10);
+  const thirtyDaysAgoIso = new Date(Date.now() - 30 * 86400_000).toISOString().slice(0, 10);
+
+  const [instrQuery, setInstrQuery] = useState('');
+  const [instrResults, setInstrResults] = useState<InstrumentItem[]>([]);
+  const [instrStats, setInstrStats] = useState<InstrumentStats | null>(null);
+  const [syncingMaster, setSyncingMaster] = useState<string | null>(null);
+  const [instrFeedback, setInstrFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+
+  const [histSymbol, setHistSymbol] = useState('RELIANCE');
+  const [histExchange, setHistExchange] = useState('NSE');
+  const [histTimeframe, setHistTimeframe] = useState('1day');
+  const [histFrom, setHistFrom] = useState(thirtyDaysAgoIso);
+  const [histTo, setHistTo] = useState(todayIso);
+  const [histProvider, setHistProvider] = useState('auto');
+  const [downloadingHist, setDownloadingHist] = useState(false);
+  const [downloadAudit, setDownloadAudit] = useState<DownloadResultPayload | null>(null);
+  const [dataFeedback, setDataFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+
+  const [viewMode, setViewMode] = useState<'snapshot' | 'full'>('snapshot');
+  const [dataRecords, setDataRecords] = useState<DataRecordsPayload | null>(null);
+  const [loadingRecords, setLoadingRecords] = useState(false);
+  const [catalog, setCatalog] = useState<CatalogDataset[]>([]);
+
   const fetchOverview = useCallback(async (refresh = true): Promise<OverviewPayload | null> => {
     setRefreshing(true);
     setLoadError(null);
@@ -192,9 +294,146 @@ export default function App() {
     }
   }, []);
 
+  const searchInstruments = useCallback(async (q: string) => {
+    try {
+      const res = await fetch(`/api/instruments/search?q=${encodeURIComponent(q)}&limit=12`);
+      if (!res.ok) return;
+      const body = await res.json();
+      setInstrResults(body.results || []);
+      if (body.stats) setInstrStats(body.stats);
+    } catch {
+      // ignore transient error
+    }
+  }, []);
+
+  const fetchCatalog = useCallback(async () => {
+    try {
+      const res = await fetch('/api/data/catalog');
+      if (!res.ok) return;
+      const body = await res.json();
+      setCatalog(body.datasets || []);
+    } catch {
+      // ignore
+    }
+  }, []);
+
+  const fetchDataRecords = useCallback(
+    async (
+      sym: string,
+      exch: string,
+      tf: string,
+      mode: 'snapshot' | 'full',
+      fromD?: string,
+      toD?: string
+    ) => {
+      if (!sym.trim()) return;
+      setLoadingRecords(true);
+      try {
+        const params = new URLSearchParams({
+          symbol: sym.trim().toUpperCase(),
+          exchange: exch,
+          timeframe: tf,
+          view: mode,
+        });
+        if (fromD) params.set('from_date', fromD);
+        if (toD) params.set('to_date', toD);
+        const res = await fetch(`/api/data/records?${params.toString()}`);
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.detail || 'Could not load stored records.');
+        }
+        const payload: DataRecordsPayload = await res.json();
+        setDataRecords(payload);
+      } catch (err) {
+        setDataFeedback({
+          type: 'err',
+          text: err instanceof Error ? err.message : 'Could not load records.',
+        });
+      } finally {
+        setLoadingRecords(false);
+      }
+    },
+    []
+  );
+
   useEffect(() => {
     void fetchOverview(true);
-  }, [fetchOverview]);
+    void searchInstruments('');
+    void fetchCatalog();
+  }, [fetchOverview, searchInstruments, fetchCatalog]);
+
+  const handleSyncInstruments = async (brokerId: 'upstox' | 'zerodha') => {
+    setSyncingMaster(brokerId);
+    setInstrFeedback(null);
+    try {
+      const res = await fetch('/api/instruments/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ broker_id: brokerId }),
+      });
+      const body = await res.json();
+      if (!res.ok) throw new Error(body.detail || `Failed to sync ${brokerId} instruments.`);
+      if (body.stats) setInstrStats(body.stats);
+      setInstrFeedback({
+        type: 'ok',
+        text: `Indexed ${Number(body.indexed_count || 0).toLocaleString()} ${brokerId} instruments into SQLite.`,
+      });
+      await searchInstruments(instrQuery);
+    } catch (err) {
+      setInstrFeedback({
+        type: 'err',
+        text: err instanceof Error ? err.message : 'Instrument sync failed.',
+      });
+    } finally {
+      setSyncingMaster(null);
+    }
+  };
+
+  const handleDownloadHistorical = async () => {
+    if (!histSymbol.trim()) {
+      setDataFeedback({ type: 'err', text: 'Enter a trading symbol before downloading.' });
+      return;
+    }
+    setDownloadingHist(true);
+    setDataFeedback(null);
+    try {
+      const res = await fetch('/api/data/download', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          symbol: histSymbol.trim().toUpperCase(),
+          exchange: histExchange,
+          timeframe: histTimeframe,
+          from_date: histFrom,
+          to_date: histTo,
+          provider: histProvider === 'auto' ? null : histProvider,
+        }),
+      });
+      const body = await res.json();
+      if (!res.ok) throw new Error(body.detail || 'Historical download failed.');
+      const payload = body as DownloadResultPayload;
+      setDownloadAudit(payload);
+      setDataFeedback({ type: 'ok', text: payload.message });
+      await fetchCatalog();
+      if (viewMode === 'snapshot' && payload.snapshot) {
+        setDataRecords(payload.snapshot);
+      } else {
+        await fetchDataRecords(histSymbol, histExchange, histTimeframe, viewMode, histFrom, histTo);
+      }
+    } catch (err) {
+      setDataFeedback({
+        type: 'err',
+        text: err instanceof Error ? err.message : 'Historical download failed.',
+      });
+    } finally {
+      setDownloadingHist(false);
+    }
+  };
+
+  const handleSwitchViewMode = async (mode: 'snapshot' | 'full') => {
+    setViewMode(mode);
+    await fetchDataRecords(histSymbol, histExchange, histTimeframe, mode, histFrom, histTo);
+  };
 
   const handleProbeBroker = async (brokerId: string) => {
     setProbingIds((prev) => ({ ...prev, [brokerId]: true }));
@@ -512,6 +751,12 @@ export default function App() {
               Connections
             </a>
             <a
+              href="#historical-data"
+              className="shrink-0 whitespace-nowrap text-sm font-medium text-slate-400 transition-colors hover:text-slate-100 hover:underline hover:underline-offset-8"
+            >
+              Historical Data
+            </a>
+            <a
               href="#roadmap"
               className="shrink-0 whitespace-nowrap text-sm font-medium text-slate-400 transition-colors hover:text-slate-100 hover:underline hover:underline-offset-8"
             >
@@ -773,7 +1018,402 @@ export default function App() {
           </div>
         </section>
 
-        {/* Section 3: Modular Expansion Roadmap */}
+        {/* Section 3: Phase 3 — SQLite Instrument Index & Gap-Only Historical Data */}
+        <section id="historical-data" className="space-y-4">
+          <div className="flex flex-wrap items-end justify-between gap-4">
+            <div>
+              <h2 className="text-lg font-semibold tracking-tight text-slate-100">
+                Historical Data &amp; SQLite Instrument Index
+              </h2>
+              <p className="text-sm text-slate-400">
+                Downloads only missing trading days (zero API calls for dates already stored locally) and supports instant Snapshot or Full Data inspection.
+              </p>
+            </div>
+            {instrStats && (
+              <div className="font-mono text-xs tabular-nums text-slate-400">
+                Indexed Symbols: {instrStats.total_instruments.toLocaleString()} · DB: {instrStats.db_size_mb} MB
+              </div>
+            )}
+          </div>
+
+          <div className="space-y-6 rounded-xl border border-slate-800 bg-[#111827] p-6">
+            {/* Instrument Lookup & Master Sync */}
+            <div className="space-y-3 border-b border-slate-800 pb-6">
+              <div className="grid grid-cols-1 items-end gap-3 md:grid-cols-[1fr_auto_auto]">
+                <div>
+                  <label htmlFor="instr-search" className="mb-1.5 block text-[13px] font-semibold text-slate-200">
+                    SQLite Instrument Lookup (Under 5 MB RAM)
+                  </label>
+                  <div className="relative">
+                    <Search className="pointer-events-none absolute top-1/2 left-3 h-4 w-4 -translate-y-1/2 text-slate-500" />
+                    <input
+                      id="instr-search"
+                      type="text"
+                      value={instrQuery}
+                      onChange={(e) => {
+                        setInstrQuery(e.target.value);
+                        void searchInstruments(e.target.value);
+                      }}
+                      placeholder="Search symbol (e.g. RELIANCE, NIFTY, INFY, HDFCBANK)..."
+                      className="min-h-[42px] w-full rounded-lg border border-slate-700 bg-[#0b1120] py-2 pr-3 pl-9 text-sm text-slate-100 focus:border-sky-400 focus:outline-none"
+                    />
+                  </div>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => void handleSyncInstruments('upstox')}
+                  disabled={syncingMaster !== null}
+                  className="inline-flex min-h-[42px] shrink-0 items-center gap-2 whitespace-nowrap rounded-lg border border-slate-700 bg-[#0b1120] px-4 py-2 text-[13px] font-semibold text-slate-200 transition-colors hover:border-slate-500 hover:bg-slate-800 disabled:opacity-50"
+                >
+                  <Database className="h-3.5 w-3.5" />
+                  <span>{syncingMaster === 'upstox' ? 'Syncing Upstox...' : 'Sync Upstox Master'}</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => void handleSyncInstruments('zerodha')}
+                  disabled={syncingMaster !== null}
+                  className="inline-flex min-h-[42px] shrink-0 items-center gap-2 whitespace-nowrap rounded-lg border border-slate-700 bg-[#0b1120] px-4 py-2 text-[13px] font-semibold text-slate-200 transition-colors hover:border-slate-500 hover:bg-slate-800 disabled:opacity-50"
+                >
+                  <Database className="h-3.5 w-3.5" />
+                  <span>{syncingMaster === 'zerodha' ? 'Syncing Zerodha...' : 'Sync Zerodha Master'}</span>
+                </button>
+              </div>
+
+              {instrFeedback && (
+                <div
+                  className={`flex items-center gap-2 text-[13px] ${
+                    instrFeedback.type === 'ok' ? 'text-emerald-400' : 'text-red-400'
+                  }`}
+                >
+                  {instrFeedback.type === 'ok' ? <Check className="h-4 w-4" /> : <AlertCircle className="h-4 w-4" />}
+                  <span>{instrFeedback.text}</span>
+                </div>
+              )}
+
+              {instrResults.length > 0 && (
+                <div className="flex flex-wrap items-center gap-1.5 pt-1">
+                  {instrResults.slice(0, 8).map((item) => (
+                    <button
+                      key={`${item.broker_id}-${item.instrument_key}`}
+                      type="button"
+                      onClick={() => {
+                        setHistSymbol(item.trading_symbol);
+                        setHistExchange(item.exchange);
+                        void fetchDataRecords(
+                          item.trading_symbol,
+                          item.exchange,
+                          histTimeframe,
+                          viewMode,
+                          histFrom,
+                          histTo
+                        );
+                      }}
+                      className={`min-h-[32px] shrink-0 whitespace-nowrap rounded-md border px-2.5 py-1 text-xs font-medium transition-colors ${
+                        histSymbol === item.trading_symbol
+                          ? 'border-sky-400 bg-sky-400/15 text-sky-300'
+                          : 'border-slate-700 bg-[#0b1120] text-slate-300 hover:border-slate-500'
+                      }`}
+                    >
+                      {item.trading_symbol} · {item.exchange} ({item.broker_id})
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Gap-Only Historical Downloader Form */}
+            <div className="space-y-4">
+              <div className="grid grid-cols-1 items-end gap-4 sm:grid-cols-2 lg:grid-cols-[1.1fr_0.75fr_0.9fr_1fr_1fr_1fr_auto]">
+                <div>
+                  <label htmlFor="hist-symbol" className="mb-1.5 block text-[13px] font-semibold text-slate-200">
+                    Symbol
+                  </label>
+                  <input
+                    id="hist-symbol"
+                    type="text"
+                    value={histSymbol}
+                    onChange={(e) => setHistSymbol(e.target.value.toUpperCase())}
+                    placeholder="RELIANCE"
+                    className="min-h-[42px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 font-mono text-sm text-slate-100 focus:border-sky-400 focus:outline-none"
+                  />
+                </div>
+
+                <div>
+                  <label htmlFor="hist-exchange" className="mb-1.5 block text-[13px] font-semibold text-slate-200">
+                    Exchange
+                  </label>
+                  <select
+                    id="hist-exchange"
+                    value={histExchange}
+                    onChange={(e) => setHistExchange(e.target.value)}
+                    className="min-h-[42px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 text-sm text-slate-100 focus:border-sky-400 focus:outline-none"
+                  >
+                    <option value="NSE">NSE</option>
+                    <option value="BSE">BSE</option>
+                  </select>
+                </div>
+
+                <div>
+                  <label htmlFor="hist-tf" className="mb-1.5 block text-[13px] font-semibold text-slate-200">
+                    Timeframe
+                  </label>
+                  <select
+                    id="hist-tf"
+                    value={histTimeframe}
+                    onChange={(e) => setHistTimeframe(e.target.value)}
+                    className="min-h-[42px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 text-sm text-slate-100 focus:border-sky-400 focus:outline-none"
+                  >
+                    <option value="1day">1 Day</option>
+                    <option value="30minute">30 Min</option>
+                    <option value="1minute">1 Min</option>
+                  </select>
+                </div>
+
+                <div>
+                  <label htmlFor="hist-from" className="mb-1.5 block text-[13px] font-semibold text-slate-200">
+                    From Date
+                  </label>
+                  <input
+                    id="hist-from"
+                    type="date"
+                    value={histFrom}
+                    onChange={(e) => setHistFrom(e.target.value)}
+                    className="min-h-[42px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 font-mono text-sm text-slate-100 focus:border-sky-400 focus:outline-none"
+                  />
+                </div>
+
+                <div>
+                  <label htmlFor="hist-to" className="mb-1.5 block text-[13px] font-semibold text-slate-200">
+                    To Date
+                  </label>
+                  <input
+                    id="hist-to"
+                    type="date"
+                    value={histTo}
+                    onChange={(e) => setHistTo(e.target.value)}
+                    className="min-h-[42px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 font-mono text-sm text-slate-100 focus:border-sky-400 focus:outline-none"
+                  />
+                </div>
+
+                <div>
+                  <label htmlFor="hist-provider" className="mb-1.5 block text-[13px] font-semibold text-slate-200">
+                    Source
+                  </label>
+                  <select
+                    id="hist-provider"
+                    value={histProvider}
+                    onChange={(e) => setHistProvider(e.target.value)}
+                    className="min-h-[42px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 text-sm text-slate-100 focus:border-sky-400 focus:outline-none"
+                  >
+                    <option value="auto">Assigned ({dataSelection})</option>
+                    <option value="yfinance">Yahoo Finance</option>
+                    <option value="upstox">Upstox</option>
+                    <option value="zerodha">Zerodha Kite</option>
+                  </select>
+                </div>
+
+                <button
+                  type="button"
+                  onClick={() => void handleDownloadHistorical()}
+                  disabled={downloadingHist}
+                  className="inline-flex min-h-[42px] shrink-0 items-center justify-center gap-2 whitespace-nowrap rounded-lg bg-sky-400 px-4 py-2 text-sm font-semibold text-sky-950 transition-colors hover:bg-sky-300 disabled:opacity-50"
+                >
+                  <Download className="h-4 w-4" />
+                  <span>{downloadingHist ? 'Syncing...' : 'Download Missing Days'}</span>
+                </button>
+              </div>
+
+              {dataFeedback && (
+                <div
+                  className={`flex flex-wrap items-center justify-between gap-3 text-[13px] ${
+                    dataFeedback.type === 'ok' ? 'text-emerald-400' : 'text-red-400'
+                  }`}
+                  role="status"
+                  aria-live="polite"
+                >
+                  <span className="inline-flex items-center gap-2">
+                    {dataFeedback.type === 'ok' ? <Check className="h-4 w-4" /> : <AlertCircle className="h-4 w-4" />}
+                    <span>{dataFeedback.text}</span>
+                  </span>
+                  {downloadAudit && (
+                    <span className="font-mono text-xs tabular-nums text-slate-300">
+                      API Calls Made: {downloadAudit.api_calls_made} · Existing Days Skipped:{' '}
+                      {downloadAudit.existing_days_skipped} · Rows Inserted: {downloadAudit.rows_inserted}
+                    </span>
+                  )}
+                </div>
+              )}
+
+              {/* Cached datasets quick switcher */}
+              {catalog.length > 0 && (
+                <div className="flex flex-wrap items-center gap-2 pt-1">
+                  <span className="text-xs font-semibold text-slate-400">Cached Datasets:</span>
+                  {catalog.map((ds) => (
+                    <button
+                      key={`${ds.symbol}-${ds.exchange}-${ds.timeframe}`}
+                      type="button"
+                      onClick={() => {
+                        setHistSymbol(ds.symbol);
+                        setHistExchange(ds.exchange);
+                        setHistTimeframe(ds.timeframe);
+                        setHistFrom(ds.start_date);
+                        setHistTo(ds.end_date);
+                        void fetchDataRecords(ds.symbol, ds.exchange, ds.timeframe, viewMode, ds.start_date, ds.end_date);
+                      }}
+                      className="min-h-[30px] shrink-0 whitespace-nowrap rounded-md border border-slate-700 bg-[#0b1120] px-2.5 py-1 font-mono text-xs tabular-nums text-slate-300 transition-colors hover:border-sky-400"
+                    >
+                      {ds.symbol} · {ds.timeframe} ({ds.row_count} bars)
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Snapshot vs Full Data Viewer */}
+            <div className="space-y-4 border-t border-slate-800 pt-5">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div className="flex items-center gap-1 rounded-lg bg-[#0b1120] p-1">
+                  <button
+                    type="button"
+                    onClick={() => void handleSwitchViewMode('snapshot')}
+                    className={`min-h-[34px] shrink-0 whitespace-nowrap rounded-md px-3 py-1.5 text-xs font-semibold transition-colors ${
+                      viewMode === 'snapshot'
+                        ? 'bg-slate-800 text-slate-100'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    Snapshot View
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void handleSwitchViewMode('full')}
+                    className={`min-h-[34px] shrink-0 whitespace-nowrap rounded-md px-3 py-1.5 text-xs font-semibold transition-colors ${
+                      viewMode === 'full'
+                        ? 'bg-slate-800 text-slate-100'
+                        : 'text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    Full Data View
+                  </button>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-3">
+                  {dataRecords && (
+                    <span className="font-mono text-xs tabular-nums text-slate-400">
+                      Showing {dataRecords.returned_rows} of {dataRecords.total_rows} stored rows
+                    </span>
+                  )}
+                  <a
+                    href={`/api/data/export.csv?symbol=${encodeURIComponent(histSymbol)}&exchange=${encodeURIComponent(
+                      histExchange
+                    )}&timeframe=${encodeURIComponent(histTimeframe)}&from_date=${encodeURIComponent(
+                      histFrom
+                    )}&to_date=${encodeURIComponent(histTo)}`}
+                    className="inline-flex min-h-[36px] shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-1.5 text-xs font-semibold text-slate-200 transition-colors hover:border-slate-500 hover:bg-slate-800"
+                  >
+                    <Download className="h-3.5 w-3.5" />
+                    <span>Export CSV</span>
+                  </a>
+                </div>
+              </div>
+
+              {dataRecords && dataRecords.total_rows > 0 && (
+                <div className="grid grid-cols-2 gap-4 border-y border-slate-800 py-3 font-mono text-xs tabular-nums sm:grid-cols-5">
+                  <div>
+                    <div className="text-slate-500">Latest Close</div>
+                    <div className="mt-0.5 text-sm font-semibold text-slate-100">
+                      {dataRecords.summary.latest_close ?? '—'}
+                    </div>
+                  </div>
+                  <div>
+                    <div className="text-slate-500">Period Change</div>
+                    <div
+                      className={`mt-0.5 text-sm font-semibold ${
+                        (dataRecords.summary.change_pct || 0) >= 0 ? 'text-emerald-400' : 'text-red-400'
+                      }`}
+                    >
+                      {dataRecords.summary.change_pct !== null
+                        ? `${dataRecords.summary.change_pct > 0 ? '+' : ''}${dataRecords.summary.change_pct}%`
+                        : '—'}
+                    </div>
+                  </div>
+                  <div>
+                    <div className="text-slate-500">Range Low</div>
+                    <div className="mt-0.5 text-sm font-semibold text-slate-100">
+                      {dataRecords.summary.min_low ?? '—'}
+                    </div>
+                  </div>
+                  <div>
+                    <div className="text-slate-500">Range High</div>
+                    <div className="mt-0.5 text-sm font-semibold text-slate-100">
+                      {dataRecords.summary.max_high ?? '—'}
+                    </div>
+                  </div>
+                  <div>
+                    <div className="text-slate-500">Total Volume</div>
+                    <div className="mt-0.5 text-sm font-semibold text-slate-100">
+                      {dataRecords.summary.total_volume.toLocaleString()}
+                    </div>
+                  </div>
+                </div>
+              )}
+
+              {loadingRecords ? (
+                <div className="space-y-2 py-4">
+                  {[0, 1, 2, 3].map((idx) => (
+                    <div key={idx} className="h-9 animate-pulse rounded bg-slate-800/60" />
+                  ))}
+                </div>
+              ) : !dataRecords || dataRecords.rows.length === 0 ? (
+                <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-slate-800 bg-[#0b1120] px-4 py-4 text-sm text-slate-400">
+                  <span>
+                    No locally stored candles yet for {histSymbol} ({histTimeframe}). Click Download Missing Days or Load Stored Data.
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => void fetchDataRecords(histSymbol, histExchange, histTimeframe, viewMode, histFrom, histTo)}
+                    className="shrink-0 whitespace-nowrap rounded-lg border border-slate-700 px-3 py-1.5 text-xs font-semibold text-slate-200 hover:bg-slate-800"
+                  >
+                    Load Stored Data
+                  </button>
+                </div>
+              ) : (
+                <div className="max-h-[420px] overflow-auto rounded-lg border border-slate-800 bg-[#0b1120]">
+                  <table className="w-full border-collapse text-left font-mono text-xs tabular-nums">
+                    <thead className="sticky top-0 bg-[#111827] text-slate-400">
+                      <tr className="border-b border-slate-800">
+                        <th className="px-3.5 py-2.5 font-semibold">Timestamp (IST)</th>
+                        <th className="px-3.5 py-2.5 text-right font-semibold">Open</th>
+                        <th className="px-3.5 py-2.5 text-right font-semibold">High</th>
+                        <th className="px-3.5 py-2.5 text-right font-semibold">Low</th>
+                        <th className="px-3.5 py-2.5 text-right font-semibold">Close</th>
+                        <th className="px-3.5 py-2.5 text-right font-semibold">Volume</th>
+                        <th className="px-3.5 py-2.5 text-right font-semibold">Source</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-800/80 text-slate-200">
+                      {dataRecords.rows.map((row) => (
+                        <tr key={row.ts_ist} className="hover:bg-slate-900/60">
+                          <td className="px-3.5 py-2 whitespace-nowrap text-slate-300">{row.ts_ist}</td>
+                          <td className="px-3.5 py-2 text-right">{row.open.toFixed(2)}</td>
+                          <td className="px-3.5 py-2 text-right">{row.high.toFixed(2)}</td>
+                          <td className="px-3.5 py-2 text-right">{row.low.toFixed(2)}</td>
+                          <td className="px-3.5 py-2 text-right font-semibold text-slate-100">{row.close.toFixed(2)}</td>
+                          <td className="px-3.5 py-2 text-right text-slate-300">{row.volume.toLocaleString()}</td>
+                          <td className="px-3.5 py-2 text-right text-slate-400">{row.source}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          </div>
+        </section>
+
+        {/* Section 4: Modular Expansion Roadmap */}
         <section id="roadmap" className="space-y-4">
           <div>
             <h2 className="text-lg font-semibold tracking-tight text-slate-100">Modular Expansion Roadmap</h2>

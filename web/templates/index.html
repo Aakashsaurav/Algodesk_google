@@ -301,6 +301,119 @@
       color: var(--text-muted);
     }
 
+    /* Phase 3 Historical Data & Snapshot Table */
+    .hist-grid {
+      display: grid;
+      grid-template-columns: 1.1fr 0.7fr 0.9fr 1fr 1fr 1fr auto;
+      gap: 12px;
+      align-items: end;
+    }
+    .instr-bar {
+      display: grid;
+      grid-template-columns: 1fr auto auto;
+      gap: 12px;
+      align-items: end;
+      padding-bottom: 18px;
+      margin-bottom: 18px;
+      border-bottom: 1px solid var(--border);
+    }
+    .chip-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 10px;
+    }
+    .quick-btn {
+      min-height: 30px;
+      padding: 4px 10px;
+      font-size: 12px;
+      border-radius: 6px;
+      border: 1px solid var(--border-strong);
+      background: var(--bg);
+      color: var(--text-muted);
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .quick-btn.active, .quick-btn:hover {
+      border-color: var(--accent);
+      color: var(--text);
+    }
+    .seg-tabs {
+      display: inline-flex;
+      gap: 4px;
+      padding: 4px;
+      border-radius: 8px;
+      background: var(--bg);
+      border: 1px solid var(--border);
+    }
+    .seg-tab {
+      min-height: 32px;
+      padding: 5px 12px;
+      border: 0;
+      border-radius: 6px;
+      background: transparent;
+      color: var(--text-muted);
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .seg-tab.active {
+      background: #1e293b;
+      color: var(--text);
+    }
+    .summary-strip {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 14px;
+      padding: 12px 0;
+      border-top: 1px solid var(--border);
+      border-bottom: 1px solid var(--border);
+      margin-top: 12px;
+      font-size: 12px;
+    }
+    .summary-val {
+      margin-top: 2px;
+      font-size: 14px;
+      font-weight: 600;
+      color: var(--text);
+    }
+    .table-wrap {
+      margin-top: 14px;
+      max-height: 400px;
+      overflow: auto;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--bg);
+    }
+    .ohlcv-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+    }
+    .ohlcv-table th {
+      position: sticky;
+      top: 0;
+      background: var(--surface);
+      color: var(--text-muted);
+      font-weight: 600;
+      text-align: right;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+    }
+    .ohlcv-table th:first-child, .ohlcv-table td:first-child { text-align: left; }
+    .ohlcv-table td {
+      text-align: right;
+      padding: 8px 12px;
+      border-bottom: 1px solid rgba(30, 41, 59, 0.7);
+      white-space: nowrap;
+    }
+    @media (max-width: 960px) {
+      .hist-grid, .instr-bar { grid-template-columns: 1fr; }
+      .summary-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+
     /* Modal */
     .modal-backdrop {
       position: fixed;
@@ -386,6 +499,7 @@
       <nav aria-label="Primary">
         <a href="#routing">Routing</a>
         <a href="#connections">Connections</a>
+        <a href="#historical-data">Historical Data</a>
         <a href="#roadmap">Roadmap</a>
       </nav>
       <button id="refreshBtn" class="btn btn-primary" type="button">Refresh Status</button>
@@ -426,6 +540,87 @@
       <div id="brokerDirectory" class="directory"></div>
     </section>
 
+    <section id="historical-data">
+      <div style="display:flex; align-items:flex-end; justify-content:space-between; gap:12px; flex-wrap:wrap;">
+        <div>
+          <h2>Historical Data &amp; SQLite Instrument Index</h2>
+          <p class="section-desc">Downloads only missing trading days (zero API calls for cached dates) and provides Snapshot and Full Data views.</p>
+        </div>
+        <div id="instrStatsMeta" class="mono" style="font-size:12px; color:var(--text-muted);">SQLite Index Ready</div>
+      </div>
+      <div class="panel">
+        <div class="instr-bar">
+          <div class="field">
+            <label for="instrSearchInput">SQLite Instrument Lookup (Under 5 MB RAM)</label>
+            <input id="instrSearchInput" type="text" placeholder="Search symbol (RELIANCE, NIFTY, INFY, HDFCBANK)..." />
+          </div>
+          <button id="syncUpstoxInstrBtn" class="btn" type="button">Sync Upstox Master</button>
+          <button id="syncZerodhaInstrBtn" class="btn" type="button">Sync Zerodha Master</button>
+        </div>
+        <div id="instrFeedback" class="feedback" role="status" aria-live="polite"></div>
+        <div id="instrChipRow" class="chip-row"></div>
+
+        <div class="hist-grid" style="margin-top:16px;">
+          <div class="field">
+            <label for="histSymbol">Symbol</label>
+            <input id="histSymbol" type="text" value="RELIANCE" class="mono" />
+          </div>
+          <div class="field">
+            <label for="histExchange">Exchange</label>
+            <select id="histExchange">
+              <option value="NSE">NSE</option>
+              <option value="BSE">BSE</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="histTimeframe">Timeframe</label>
+            <select id="histTimeframe">
+              <option value="1day">1 Day</option>
+              <option value="30minute">30 Min</option>
+              <option value="1minute">1 Min</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="histFrom">From Date</label>
+            <input id="histFrom" type="date" class="mono" />
+          </div>
+          <div class="field">
+            <label for="histTo">To Date</label>
+            <input id="histTo" type="date" class="mono" />
+          </div>
+          <div class="field">
+            <label for="histProvider">Source</label>
+            <select id="histProvider">
+              <option value="auto">Assigned Data Connection</option>
+              <option value="yfinance">Yahoo Finance</option>
+              <option value="upstox">Upstox</option>
+              <option value="zerodha">Zerodha Kite</option>
+            </select>
+          </div>
+          <button id="downloadHistBtn" class="btn btn-primary" type="button">Download Missing Days</button>
+        </div>
+
+        <div id="histFeedback" class="feedback" role="status" aria-live="polite"></div>
+        <div id="histAuditLine" class="mono" style="font-size:12px; color:var(--text-muted); margin-top:6px;"></div>
+        <div id="catalogChipRow" class="chip-row"></div>
+
+        <div style="margin-top:20px; padding-top:16px; border-top:1px solid var(--border); display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap;">
+          <div class="seg-tabs">
+            <button id="viewSnapshotBtn" class="seg-tab active" type="button">Snapshot View</button>
+            <button id="viewFullBtn" class="seg-tab" type="button">Full Data View</button>
+          </div>
+          <div style="display:flex; align-items:center; gap:12px;">
+            <span id="recordsMetaLine" class="mono" style="font-size:12px; color:var(--text-muted);"></span>
+            <button id="loadStoredBtn" class="btn" type="button" style="min-height:34px; padding:5px 12px; font-size:12px;">Load Stored</button>
+            <a id="exportCsvLink" href="#" class="btn" style="min-height:34px; padding:5px 12px; font-size:12px; text-decoration:none;">Export CSV</a>
+          </div>
+        </div>
+
+        <div id="summaryStrip" class="summary-strip mono" style="display:none;"></div>
+        <div id="recordsTableContainer" style="margin-top:12px;"></div>
+      </div>
+    </section>
+
     <section id="roadmap">
       <h2>Modular Expansion Roadmap</h2>
       <p class="section-desc">Each adapter implements the unified broker capability and health contract, allowing incremental expansion without rewriting UI or strategy code.</p>
@@ -447,8 +642,8 @@
         <div class="roadmap-item">
           <div class="roadmap-phase mono">Phase 03</div>
           <div>
-            <div class="roadmap-title">SQLite Instrument Index &amp; Core Consolidation</div>
-            <div class="roadmap-detail">Replace eager 100k-entry JSON parsing with an indexed local SQLite instrument store under 5 MB RSS and unify core/live execution managers.</div>
+            <div class="roadmap-title">SQLite Instrument Index &amp; Gap-Only Data Hub (Active)</div>
+            <div class="roadmap-detail">Indexed local SQLite instrument store under 5 MB RSS, consolidated core runtime managers, gap-only OHLCV downloads (0 API calls for existing days), and Snapshot/Full data inspection.</div>
           </div>
         </div>
         <div class="roadmap-item">
@@ -1074,7 +1269,233 @@
     els.exchangeCodeBtn.addEventListener('click', exchangeCode);
     els.modal.addEventListener('click', (e) => { if (e.target === els.modal) closeModal(); });
 
+    // Phase 3: SQLite Instrument Index & Historical Data JS
+    const p3 = {
+      viewMode: 'snapshot',
+      instrInput: document.getElementById('instrSearchInput'),
+      instrStats: document.getElementById('instrStatsMeta'),
+      instrFeedback: document.getElementById('instrFeedback'),
+      instrChips: document.getElementById('instrChipRow'),
+      syncUpstox: document.getElementById('syncUpstoxInstrBtn'),
+      syncZerodha: document.getElementById('syncZerodhaInstrBtn'),
+      sym: document.getElementById('histSymbol'),
+      exch: document.getElementById('histExchange'),
+      tf: document.getElementById('histTimeframe'),
+      from: document.getElementById('histFrom'),
+      to: document.getElementById('histTo'),
+      prov: document.getElementById('histProvider'),
+      dlBtn: document.getElementById('downloadHistBtn'),
+      feedback: document.getElementById('histFeedback'),
+      audit: document.getElementById('histAuditLine'),
+      catalogRow: document.getElementById('catalogChipRow'),
+      snapBtn: document.getElementById('viewSnapshotBtn'),
+      fullBtn: document.getElementById('viewFullBtn'),
+      metaLine: document.getElementById('recordsMetaLine'),
+      loadBtn: document.getElementById('loadStoredBtn'),
+      csvLink: document.getElementById('exportCsvLink'),
+      summaryStrip: document.getElementById('summaryStrip'),
+      tableContainer: document.getElementById('recordsTableContainer'),
+    };
+    p3.to.value = new Date().toISOString().slice(0, 10);
+    p3.from.value = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
+
+    function syncCsvHref() {
+      const qs = new URLSearchParams({
+        symbol: p3.sym.value.trim().toUpperCase(),
+        exchange: p3.exch.value,
+        timeframe: p3.tf.value,
+        from_date: p3.from.value,
+        to_date: p3.to.value,
+      });
+      p3.csvLink.href = `/api/data/export.csv?${qs.toString()}`;
+    }
+    syncCsvHref();
+
+    async function searchInstruments(q) {
+      const res = await fetch(`/api/instruments/search?q=${encodeURIComponent(q || '')}&limit=10`);
+      if (!res.ok) return;
+      const body = await res.json();
+      if (body.stats) {
+        p3.instrStats.textContent = `Indexed Symbols: ${Number(body.stats.total_instruments).toLocaleString()} · DB: ${body.stats.db_size_mb} MB`;
+      }
+      p3.instrChips.innerHTML = '';
+      (body.results || []).slice(0, 8).forEach((item) => {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'quick-btn' + (p3.sym.value.toUpperCase() === item.trading_symbol ? ' active' : '');
+        b.textContent = `${item.trading_symbol} · ${item.exchange} (${item.broker_id})`;
+        b.addEventListener('click', () => {
+          p3.sym.value = item.trading_symbol;
+          p3.exch.value = item.exchange;
+          syncCsvHref();
+          loadRecords();
+        });
+        p3.instrChips.appendChild(b);
+      });
+    }
+
+    async function syncMaster(brokerId) {
+      p3.syncUpstox.disabled = true;
+      p3.syncZerodha.disabled = true;
+      p3.instrFeedback.className = 'feedback';
+      p3.instrFeedback.textContent = `Syncing ${brokerId} instrument master into SQLite...`;
+      try {
+        const res = await fetch('/api/instruments/sync', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ broker_id: brokerId }),
+        });
+        const body = await res.json();
+        if (!res.ok) throw new Error(body.detail || 'Sync failed');
+        p3.instrFeedback.className = 'feedback ok';
+        p3.instrFeedback.textContent = `Indexed ${Number(body.indexed_count || 0).toLocaleString()} ${brokerId} instruments.`;
+        await searchInstruments(p3.instrInput.value);
+      } catch (err) {
+        p3.instrFeedback.className = 'feedback err';
+        p3.instrFeedback.textContent = err.message;
+      } finally {
+        p3.syncUpstox.disabled = false;
+        p3.syncZerodha.disabled = false;
+      }
+    }
+
+    async function loadCatalog() {
+      const res = await fetch('/api/data/catalog');
+      if (!res.ok) return;
+      const body = await res.json();
+      p3.catalogRow.innerHTML = '';
+      const dsList = body.datasets || [];
+      if (dsList.length === 0) return;
+      const lbl = document.createElement('span');
+      lbl.style.fontSize = '12px';
+      lbl.style.color = 'var(--text-muted)';
+      lbl.style.alignSelf = 'center';
+      lbl.textContent = 'Cached Datasets:';
+      p3.catalogRow.appendChild(lbl);
+      dsList.forEach((ds) => {
+        const b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'quick-btn mono';
+        b.textContent = `${ds.symbol} · ${ds.timeframe} (${ds.row_count} bars)`;
+        b.addEventListener('click', () => {
+          p3.sym.value = ds.symbol;
+          p3.exch.value = ds.exchange;
+          p3.tf.value = ds.timeframe;
+          p3.from.value = ds.start_date;
+          p3.to.value = ds.end_date;
+          syncCsvHref();
+          loadRecords();
+        });
+        p3.catalogRow.appendChild(b);
+      });
+    }
+
+    function renderRecordsPayload(payload) {
+      syncCsvHref();
+      p3.metaLine.textContent = payload ? `Showing ${payload.returned_rows} of ${payload.total_rows} stored rows` : '';
+      p3.tableContainer.innerHTML = '';
+      if (!payload || !payload.rows || payload.rows.length === 0) {
+        p3.summaryStrip.style.display = 'none';
+        const empty = document.createElement('div');
+        empty.style.cssText = 'padding:14px; border:1px solid var(--border); border-radius:8px; background:var(--bg); font-size:13px; color:var(--text-muted);';
+        empty.textContent = `No locally stored candles yet for ${p3.sym.value.toUpperCase()} (${p3.tf.value}).`;
+        p3.tableContainer.appendChild(empty);
+        return;
+      }
+      const s = payload.summary || {};
+      p3.summaryStrip.style.display = 'grid';
+      const chg = s.change_pct !== null && s.change_pct !== undefined ? `${s.change_pct > 0 ? '+' : ''}${s.change_pct}%` : '—';
+      p3.summaryStrip.innerHTML = `
+        <div><div style="color:var(--text-muted)">Latest Close</div><div class="summary-val">${s.latest_close ?? '—'}</div></div>
+        <div><div style="color:var(--text-muted)">Period Change</div><div class="summary-val">${chg}</div></div>
+        <div><div style="color:var(--text-muted)">Range Low</div><div class="summary-val">${s.min_low ?? '—'}</div></div>
+        <div><div style="color:var(--text-muted)">Range High</div><div class="summary-val">${s.max_high ?? '—'}</div></div>
+        <div><div style="color:var(--text-muted)">Total Volume</div><div class="summary-val">${Number(s.total_volume || 0).toLocaleString()}</div></div>
+      `;
+      const wrap = document.createElement('div');
+      wrap.className = 'table-wrap';
+      const tbl = document.createElement('table');
+      tbl.className = 'ohlcv-table mono';
+      tbl.innerHTML = '<thead><tr><th>Timestamp (IST)</th><th>Open</th><th>High</th><th>Low</th><th>Close</th><th>Volume</th><th>Source</th></tr></thead>';
+      const tb = document.createElement('tbody');
+      payload.rows.forEach((r) => {
+        const tr = document.createElement('tr');
+        tr.innerHTML = `<td>${r.ts_ist}</td><td>${Number(r.open).toFixed(2)}</td><td>${Number(r.high).toFixed(2)}</td><td>${Number(r.low).toFixed(2)}</td><td style="font-weight:600">${Number(r.close).toFixed(2)}</td><td>${Number(r.volume).toLocaleString()}</td><td style="color:var(--text-muted)">${r.source}</td>`;
+        tb.appendChild(tr);
+      });
+      tbl.appendChild(tb);
+      wrap.appendChild(tbl);
+      p3.tableContainer.appendChild(wrap);
+    }
+
+    async function loadRecords() {
+      syncCsvHref();
+      const qs = new URLSearchParams({
+        symbol: p3.sym.value.trim().toUpperCase(),
+        exchange: p3.exch.value,
+        timeframe: p3.tf.value,
+        from_date: p3.from.value,
+        to_date: p3.to.value,
+        view: p3.viewMode,
+      });
+      const res = await fetch(`/api/data/records?${qs.toString()}`);
+      if (res.ok) renderRecordsPayload(await res.json());
+    }
+
+    async function downloadMissingDays() {
+      p3.dlBtn.disabled = true;
+      p3.feedback.className = 'feedback';
+      p3.feedback.textContent = 'Checking local SQLite coverage and fetching missing days...';
+      try {
+        const res = await fetch('/api/data/download', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            symbol: p3.sym.value.trim().toUpperCase(),
+            exchange: p3.exch.value,
+            timeframe: p3.tf.value,
+            from_date: p3.from.value,
+            to_date: p3.to.value,
+            provider: p3.prov.value === 'auto' ? null : p3.prov.value,
+          }),
+        });
+        const body = await res.json();
+        if (!res.ok) throw new Error(body.detail || 'Download failed');
+        p3.feedback.className = 'feedback ok';
+        p3.feedback.textContent = body.message;
+        p3.audit.textContent = `API Calls Made: ${body.api_calls_made} · Existing Days Skipped: ${body.existing_days_skipped} · Rows Inserted: ${body.rows_inserted}`;
+        await loadCatalog();
+        if (p3.viewMode === 'snapshot' && body.snapshot) renderRecordsPayload(body.snapshot);
+        else await loadRecords();
+      } catch (err) {
+        p3.feedback.className = 'feedback err';
+        p3.feedback.textContent = err.message;
+      } finally {
+        p3.dlBtn.disabled = false;
+      }
+    }
+
+    p3.instrInput.addEventListener('input', () => searchInstruments(p3.instrInput.value));
+    p3.syncUpstox.addEventListener('click', () => syncMaster('upstox'));
+    p3.syncZerodha.addEventListener('click', () => syncMaster('zerodha'));
+    p3.dlBtn.addEventListener('click', downloadMissingDays);
+    p3.loadBtn.addEventListener('click', loadRecords);
+    p3.snapBtn.addEventListener('click', () => {
+      p3.viewMode = 'snapshot';
+      p3.snapBtn.classList.add('active');
+      p3.fullBtn.classList.remove('active');
+      loadRecords();
+    });
+    p3.fullBtn.addEventListener('click', () => {
+      p3.viewMode = 'full';
+      p3.fullBtn.classList.add('active');
+      p3.snapBtn.classList.remove('active');
+      loadRecords();
+    });
+
     loadOverview(true);
+    searchInstruments('');
+    loadCatalog();
   </script>
 </body>
 </html>
