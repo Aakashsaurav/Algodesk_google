@@ -42,9 +42,33 @@ from core.instruments import instrument_index
 logger = logging.getLogger(__name__)
 
 VALID_TIMEFRAMES = {
-    "1day": {"label": "1 Day", "upstox": "day", "zerodha": "day", "yahoo": "1d", "max_chunk_days": 365},
-    "30minute": {"label": "30 Min", "upstox": "30minute", "zerodha": "30minute", "yahoo": "30m", "max_chunk_days": 30},
-    "1minute": {"label": "1 Min", "upstox": "1minute", "zerodha": "minute", "yahoo": "1m", "max_chunk_days": 7},
+    "1day": {
+        "label": "1 Day",
+        "upstox": "day",
+        "upstox_unit": "days",
+        "upstox_interval": "1",
+        "zerodha": "day",
+        "yahoo": "1d",
+        "max_chunk_days": 365,
+    },
+    "30minute": {
+        "label": "30 Min",
+        "upstox": "30minute",
+        "upstox_unit": "minutes",
+        "upstox_interval": "30",
+        "zerodha": "30minute",
+        "yahoo": "30m",
+        "max_chunk_days": 30,
+    },
+    "1minute": {
+        "label": "1 Min",
+        "upstox": "1minute",
+        "upstox_unit": "minutes",
+        "upstox_interval": "1",
+        "zerodha": "minute",
+        "yahoo": "1m",
+        "max_chunk_days": 7,
+    },
 }
 
 _YAHOO_SYMBOL_OVERRIDES = {
@@ -331,13 +355,19 @@ class HistoricalDataManager:
                 f"Contract '{symbol}' ({exchange}) was not found in Upstox instruments. "
                 "Click Sync Upstox Master or select the exact contract from the F&O Finder."
             )
-        interval = VALID_TIMEFRAMES[timeframe]["upstox"]
+        tf_meta = VALID_TIMEFRAMES[timeframe]
+        unit = tf_meta["upstox_unit"]
+        interval = tf_meta["upstox_interval"]
         encoded_key = urllib.parse.quote(ikey, safe="")
         url = (
-            f"{config.UPSTOX_BASE_URL}/v2/historical-candle/"
-            f"{encoded_key}/{interval}/{chunk_end.isoformat()}/{chunk_start.isoformat()}"
+            f"{config.UPSTOX_BASE_URL}/v3/historical-candle/"
+            f"{encoded_key}/{unit}/{interval}/{chunk_end.isoformat()}/{chunk_start.isoformat()}"
         )
-        headers = {"Accept": "application/json", "User-Agent": "AlgoDesk/3.0"}
+        headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "User-Agent": "AlgoDesk/5.0",
+        }
         try:
             headers["Authorization"] = f"Bearer {upstox_auth.get_valid_token()}"
         except RuntimeError:
@@ -353,7 +383,7 @@ class HistoricalDataManager:
                 raise ValueError(
                     f"Upstox returned no historical candles for {exchange}:{symbol} ({timeframe}). Try Yahoo Finance or verify symbol."
                 ) from exc
-            raise RuntimeError(f"Upstox historical API HTTP {exc.code}: {err_body[:180]}") from exc
+            raise RuntimeError(f"Upstox V3 historical API HTTP {exc.code}: {err_body[:180]}") from exc
 
         candles = ((payload.get("data") or {}).get("candles")) or []
         by_ts: Dict[str, Dict[str, Any]] = {}
@@ -380,11 +410,14 @@ class HistoricalDataManager:
 
         _ingest_candles(candles)
 
-        # Upstox /v2/historical-candle excludes the ongoing/unsettled current day;
-        # merge /v2/historical-candle/intraday when the requested window reaches today.
+        # Upstox V3 /v3/historical-candle covers settled sessions; merge
+        # /v3/historical-candle/intraday/{key}/{unit}/{interval} when window reaches today.
         today_ist = datetime.now(tz=IST_TZ).date()
         if chunk_end >= today_ist:
-            intra_url = f"{config.UPSTOX_BASE_URL}/v2/historical-candle/intraday/{encoded_key}/{interval}"
+            intra_url = (
+                f"{config.UPSTOX_BASE_URL}/v3/historical-candle/intraday/"
+                f"{encoded_key}/{unit}/{interval}"
+            )
             intra_req = urllib.request.Request(intra_url, headers=headers, method="GET")
             try:
                 with urllib.request.urlopen(intra_req, timeout=8) as resp:

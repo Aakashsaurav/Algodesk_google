@@ -1043,7 +1043,8 @@ class TestBrokerHubArchitecture(unittest.TestCase):
                     instrument_key="NSE_FO|NEW_100",
                 )
 
-            self.assertTrue(any("/historical-candle/intraday/" in u for u in requested_urls))
+            self.assertTrue(any("/v3/historical-candle/" in u and "/minutes/30/" in u for u in requested_urls))
+            self.assertTrue(any("/v3/historical-candle/intraday/" in u and "/minutes/30" in u for u in requested_urls))
             dates_returned = [r["trade_date"] for r in merged]
             self.assertIn(past_d.isoformat(), dates_returned)
             self.assertIn(today_d.isoformat(), dates_returned)
@@ -1085,6 +1086,118 @@ class TestBrokerHubArchitecture(unittest.TestCase):
         finally:
             srv.shutdown()
             srv.server_close()
+
+    def test_upstox_v3_quotes_and_hft_orders(self) -> None:
+        import io
+        import json as _json
+        from broker.base import BrokerOrder, OrderRequest as BrokerOrderRequest, OrderStatus
+        from broker.upstox.broker import UpstoxBroker
+        from core.feed_manager import _fetch_live_quotes_upstox
+
+        seen_quote_urls: list[str] = []
+
+        class _FakeJsonResp(io.BytesIO):
+            def __init__(self, data: dict, status: int = 200) -> None:
+                super().__init__(_json.dumps(data).encode("utf-8"))
+                self.status = status
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        def fake_quote_urlopen(req, timeout=5):
+            url = req.full_url
+            seen_quote_urls.append(url)
+            if "/v3/market-quote/ohlc" in url:
+                return _FakeJsonResp(
+                    {
+                        "status": "success",
+                        "data": {
+                            "NSE_EQ:RELIANCE": {
+                                "last_price": 2965.5,
+                                "instrument_token": "NSE_EQ|INE002A01018",
+                                "prev_ohlc": {"open": 2940.0, "high": 2960.0, "low": 2930.0, "close": 2950.0, "volume": 100000, "ts": 1794900000000},
+                                "live_ohlc": {"open": 2952.0, "high": 2970.0, "low": 2948.0, "close": 2965.5, "volume": 245000, "ts": 1794980000000},
+                            },
+                            "NSE_EQ:TCS": {
+                                "last_price": 3915.0,
+                                "instrument_token": "NSE_EQ|INE467B01029",
+                                "live_ohlc": {"open": 3900.0, "high": 3920.0, "low": 3895.0, "close": 3915.0, "volume": 0, "ts": 1794980000000},
+                            },
+                        },
+                    }
+                )
+            if "/v3/market-quote/ltp" in url:
+                return _FakeJsonResp(
+                    {
+                        "status": "success",
+                        "data": {
+                            "NSE_EQ:TCS": {
+                                "last_price": 3915.0,
+                                "instrument_token": "NSE_EQ|INE467B01029",
+                                "ltq": 10,
+                                "volume": 95000,
+                                "cp": 3900.0,
+                            }
+                        },
+                    }
+                )
+            raise AssertionError(f"Unexpected quote URL: {url}")
+
+        with (
+            patch("core.feed_manager.upstox_auth.get_valid_token", return_value="dummy-upstox-tok"),
+            patch("urllib.request.urlopen", side_effect=fake_quote_urlopen),
+        ):
+            quotes = _fetch_live_quotes_upstox(["RELIANCE", "TCS"])
+
+        self.assertTrue(any("/v3/market-quote/ohlc" in u for u in seen_quote_urls))
+        self.assertTrue(any("/v3/market-quote/ltp" in u for u in seen_quote_urls))
+        self.assertEqual(quotes["RELIANCE"]["ltp"], 2965.5)
+        self.assertEqual(quotes["RELIANCE"]["prev_close"], 2950.0)
+        self.assertEqual(quotes["RELIANCE"]["transport"], "v3_ohlc")
+        self.assertEqual(quotes["TCS"]["prev_close"], 3900.0)
+        self.assertEqual(quotes["TCS"]["volume"], 95000)
+
+        # Verify UpstoxBroker V3 HFT order endpoints & V3 WS feed authorization without upstox_client SDK
+        order_calls: list[tuple[str, str]] = []
+
+        def fake_broker_urlopen(req, timeout=6):
+            order_calls.append((req.get_method(), req.full_url))
+            if "/v3/feed/market-data-feed/authorize" in req.full_url:
+                return _FakeJsonResp({"status": "success", "data": {"authorized_redirect_uri": "wss://api.upstox.com/v3/feed/market-data-feed?code=abc"}})
+            if "/v3/order/place" in req.full_url:
+                return _FakeJsonResp({"status": "success", "data": {"order_ids": ["261118000012345"]}})
+            return _FakeJsonResp({"status": "success", "data": {"order_id": "261118000012345"}})
+
+        broker = UpstoxBroker(access_token="dummy-upstox-tok")
+        broker._connected = True
+        broker._sdk = None
+        broker._order_api = None
+
+        with patch("urllib.request.urlopen", side_effect=fake_broker_urlopen):
+            ws_uri = broker.authorize_ws_feed()
+            self.assertIn("/v3/feed/market-data-feed", ws_uri)
+
+            placed: BrokerOrder = broker.place_order(
+                BrokerOrderRequest(
+                    symbol="RELIANCE",
+                    side="BUY",
+                    quantity=2,
+                    order_type="LIMIT",
+                    price=2950.0,
+                    instrument_key="NSE_EQ|INE002A01018",
+                )
+            )
+            self.assertEqual(placed.order_id, "261118000012345")
+            self.assertEqual(placed.status, OrderStatus.PENDING)
+            self.assertTrue(broker.modify_order("261118000012345", price=2955.0))
+            self.assertTrue(broker.cancel_order("261118000012345"))
+
+        self.assertIn(("POST", "https://api-hft.upstox.com/v3/order/place"), order_calls)
+        self.assertIn(("PUT", "https://api-hft.upstox.com/v3/order/modify"), order_calls)
+        self.assertIn(("DELETE", "https://api-hft.upstox.com/v3/order/cancel?order_id=261118000012345"), order_calls)
 
 
 if __name__ == "__main__":

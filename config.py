@@ -187,9 +187,13 @@ class AppConfig:
     BASE_DIR: Path = Path(__file__).resolve().parent
 
     UPSTOX_BASE_URL: str = "https://api.upstox.com"
+    UPSTOX_HFT_URL: str = "https://api-hft.upstox.com"
+    # Note: OAuth2 dialog/token/logout and user profile/funds endpoints remain /v2 per Upstox docs;
+    # Trading, Market Quote (OHLC/LTP/Option Greek), Historical/Intraday Candles & WS Feed use /v3.
     UPSTOX_AUTH_URL: str = "https://api.upstox.com/v2/login/authorization/token"
     UPSTOX_AUTH_DIALOG_URL: str = "https://api.upstox.com/v2/login/authorization/dialog"
     UPSTOX_PROFILE_URL: str = "https://api.upstox.com/v2/user/profile"
+    UPSTOX_FEED_AUTH_URL: str = "https://api.upstox.com/v3/feed/market-data-feed/authorize"
 
     ZERODHA_BASE_URL: str = "https://api.kite.trade"
     ZERODHA_LOGIN_URL: str = "https://kite.zerodha.com/connect/login"

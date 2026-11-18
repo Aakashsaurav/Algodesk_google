@@ -309,7 +309,22 @@ class UpstoxBroker(BrokerBase):
                 pass
         return None
 
-    # ── Execution Surface (preserved from Algodesk_R4) ──────────────────────
+    # ── Execution & V3 Streaming Surface ──────────────────────────────────
+
+    def authorize_ws_feed(self, timeout: float = 5.0) -> str:
+        """Obtain single-use authorized WSS URL from Upstox Market Data Feed V3."""
+        token = self.access_token or auth_manager.get_valid_token()
+        req = urllib.request.Request(
+            config.UPSTOX_FEED_AUTH_URL,
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
+            method="GET",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        ws_url = str(((payload.get("data") or {}).get("authorized_redirect_uri")) or "").strip()
+        if not ws_url:
+            raise BrokerError("Upstox V3 feed authorize response missing authorized_redirect_uri.")
+        return ws_url
 
     def place_order(self, order: OrderRequest) -> Optional[BrokerOrder]:
         if not self._connected and not self.connect():
@@ -319,13 +334,6 @@ class UpstoxBroker(BrokerBase):
                 status=OrderStatus.REJECTED,
                 rejection_reason="Upstox broker is not connected",
             )
-        if self._sdk is None or self._order_api is None:
-            return BrokerOrder(
-                order_id=order.client_order_id or uuid.uuid4().hex[:16],
-                request=order,
-                status=OrderStatus.REJECTED,
-                rejection_reason="upstox_client SDK is not installed",
-            )
 
         payload = {
             "quantity": order.quantity,
@@ -333,7 +341,7 @@ class UpstoxBroker(BrokerBase):
             "validity": order.validity,
             "price": float(order.price or 0.0),
             "tag": order.tag or None,
-            "slice": False,
+            "slice": True,
             "instrument_token": order.instrument_key or order.symbol,
             "order_type": order.order_type,
             "transaction_type": "BUY" if order.side in {"BUY", "SHORT"} else "SELL",
@@ -341,14 +349,54 @@ class UpstoxBroker(BrokerBase):
             "trigger_price": float(order.trigger_price or 0.0),
             "is_amo": False,
         }
+
+        if self._sdk is not None and self._order_api is not None:
+            try:
+                resp = self._order_api.place_order(payload)
+                data_obj = _safe_get(resp, "data", resp)
+                order_ids = _safe_get(data_obj, "order_ids")
+                first_id = order_ids[0] if isinstance(order_ids, list) and order_ids else None
+                oid = str(first_id or _safe_get(data_obj, "order_id") or _safe_get(resp, "order_id") or _safe_get(resp, "id") or order.client_order_id)
+                broker_order = BrokerOrder(
+                    order_id=oid,
+                    request=order,
+                    status=_status_from_value(_safe_get(data_obj, "status") or "PENDING"),
+                    raw=resp if isinstance(resp, dict) else {"order_ids": order_ids or [oid]},
+                )
+                self._orders.append(broker_order)
+                return broker_order
+            except Exception as exc:
+                return BrokerOrder(
+                    order_id=order.client_order_id,
+                    request=order,
+                    status=OrderStatus.REJECTED,
+                    rejection_reason=str(exc),
+                )
+
+        # Direct Upstox Order API V3 (HFT endpoint) fallback when SDK is not installed
+        token = self.access_token or auth_manager.get_valid_token()
+        url = f"{config.UPSTOX_HFT_URL}/v3/order/place"
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
         try:
-            resp = self._order_api.place_order(payload)
-            oid = str(_safe_get(resp, "order_id") or _safe_get(resp, "id") or order.client_order_id)
+            with urllib.request.urlopen(req, timeout=6.0) as resp:
+                raw_resp = json.loads(resp.read().decode("utf-8"))
+            data_obj = raw_resp.get("data") or {}
+            order_ids = data_obj.get("order_ids") or []
+            oid = str((order_ids[0] if order_ids else None) or data_obj.get("order_id") or order.client_order_id)
             broker_order = BrokerOrder(
                 order_id=oid,
                 request=order,
-                status=_status_from_value(_safe_get(resp, "status")),
-                raw=resp if isinstance(resp, dict) else {},
+                status=OrderStatus.PENDING,
+                raw=raw_resp,
             )
             self._orders.append(broker_order)
             return broker_order
@@ -360,16 +408,84 @@ class UpstoxBroker(BrokerBase):
                 rejection_reason=str(exc),
             )
 
+    def modify_order(
+        self,
+        order_id: str,
+        *,
+        quantity: Optional[int] = None,
+        price: Optional[float] = None,
+        trigger_price: Optional[float] = None,
+        order_type: Optional[str] = None,
+        validity: Optional[str] = None,
+    ) -> bool:
+        """Modify an open Upstox order via Order API V3 (PUT /v3/order/modify)."""
+        if not order_id or (not self._connected and not self.connect()):
+            return False
+        payload: Dict[str, Any] = {"order_id": order_id}
+        if quantity is not None:
+            payload["quantity"] = int(quantity)
+        if price is not None:
+            payload["price"] = float(price)
+        if trigger_price is not None:
+            payload["trigger_price"] = float(trigger_price)
+        if order_type is not None:
+            payload["order_type"] = order_type
+        if validity is not None:
+            payload["validity"] = validity
+
+        if self._sdk is not None and self._order_api is not None and hasattr(self._order_api, "modify_order"):
+            try:
+                self._order_api.modify_order(payload)
+                return True
+            except Exception:
+                return False
+
+        token = self.access_token or auth_manager.get_valid_token()
+        url = f"{config.UPSTOX_HFT_URL}/v3/order/modify"
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+            method="PUT",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=6.0) as resp:
+                return resp.status < 300
+        except Exception:
+            return False
+
     def cancel_order(self, order_id: str) -> bool:
         if not order_id:
             return False
-        if self._connected and self._order_api is not None:
+        if not self._connected and not self.connect():
+            return False
+        if self._sdk is not None and self._order_api is not None:
             try:
                 self._order_api.cancel_order(order_id)
                 return True
             except Exception:
                 return False
-        return False
+
+        token = self.access_token or auth_manager.get_valid_token()
+        url = f"{config.UPSTOX_HFT_URL}/v3/order/cancel?order_id={order_id}"
+        req = urllib.request.Request(
+            url,
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            },
+            method="DELETE",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=6.0) as resp:
+                return resp.status < 300
+        except Exception:
+            return False
 
     def get_positions(self) -> Sequence[BrokerPosition]:
         return list(self._positions.values())

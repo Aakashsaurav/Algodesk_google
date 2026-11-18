@@ -28,7 +28,7 @@ import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -270,42 +270,65 @@ def _fetch_live_quotes_upstox(symbols: List[Any], timeout: float = 4.5) -> Dict[
     if not key_map:
         raise ValueError("No Upstox instrument keys resolved for subscribed symbols.")
 
-    qs = urllib.parse.urlencode({"instrument_key": ",".join(key_map.keys())})
-    url = f"{config.UPSTOX_BASE_URL}/v2/market-quote/quotes?{qs}"
-    req = urllib.request.Request(
-        url,
-        headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
-        method="GET",
-    )
+    qs_ohlc = urllib.parse.urlencode({"instrument_key": ",".join(key_map.keys()), "interval": "1d"})
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json"}
+    url = f"{config.UPSTOX_BASE_URL}/v3/market-quote/ohlc?{qs_ohlc}"
+    req = urllib.request.Request(url, headers=headers, method="GET")
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         payload = json.loads(resp.read().decode("utf-8"))
     data = payload.get("data") or {}
     now_ist = datetime.now(tz=IST_TZ).isoformat(timespec="seconds")
+
+    sym_to_meta = {meta["symbol"]: meta for meta in key_map.values()}
+    has_fno = any(
+        meta.get("exchange") in {"NFO", "BFO", "MCX", "NSE_FO", "BSE_FO", "MCX_FO"}
+        or meta.get("instrument_type") in {"FUT", "CE", "PE"}
+        for meta in key_map.values()
+    )
+
     quotes: Dict[str, Dict[str, Any]] = {}
-    for _, item in data.items():
+    missing_prev_keys: List[str] = []
+
+    for raw_key, item in data.items():
         if not isinstance(item, dict):
             continue
         itoken = str(item.get("instrument_token") or "")
-        meta = key_map.get(itoken) or {}
-        sym = meta.get("symbol") or str(item.get("symbol") or "").upper()
+        key_suffix = str(raw_key).split(":", 1)[-1].strip().upper()
+        meta = key_map.get(itoken) or sym_to_meta.get(key_suffix) or {}
+        sym = meta.get("symbol") or key_suffix
         if not sym:
             continue
+
         ltp = round(float(item.get("last_price") or 0.0), 2)
-        ohlc = item.get("ohlc") or {}
-        prev_close = ohlc.get("close")
-        net_chg = item.get("net_change")
-        if net_chg is None and prev_close:
-            net_chg = ltp - float(prev_close)
+        live_ohlc = item.get("live_ohlc") or {}
+        prev_ohlc = item.get("prev_ohlc") or {}
+        # Support both V3 (live_ohlc/prev_ohlc) and legacy flat ohlc dicts defensively
+        legacy_ohlc = item.get("ohlc") or {}
+        prev_close = prev_ohlc.get("close") if prev_ohlc.get("close") is not None else legacy_ohlc.get("close")
+        if prev_close is None and item.get("cp") is not None:
+            prev_close = item.get("cp")
+        if prev_close is None and itoken:
+            missing_prev_keys.append(itoken)
+
+        o_val = live_ohlc.get("open") if live_ohlc.get("open") is not None else legacy_ohlc.get("open")
+        h_val = live_ohlc.get("high") if live_ohlc.get("high") is not None else legacy_ohlc.get("high")
+        l_val = live_ohlc.get("low") if live_ohlc.get("low") is not None else legacy_ohlc.get("low")
+        vol_val = live_ohlc.get("volume") if live_ohlc.get("volume") is not None else item.get("volume")
+
+        net_chg = (ltp - float(prev_close)) if (prev_close is not None and float(prev_close) != 0) else item.get("net_change")
         chg_pct = (
             round((float(net_chg) / float(prev_close)) * 100.0, 2)
-            if (net_chg is not None and prev_close and float(prev_close) != 0)
+            if (net_chg is not None and prev_close is not None and float(prev_close) != 0)
             else 0.0
         )
-        depth = item.get("depth") or {}
-        buys = depth.get("buy") or []
-        sells = depth.get("sell") or []
-        bid = round(float(buys[0].get("price")), 2) if buys and buys[0].get("price") else None
-        ask = round(float(sells[0].get("price")), 2) if sells and sells[0].get("price") else None
+
+        ts_ms = live_ohlc.get("ts")
+        ts_str = now_ist
+        if ts_ms:
+            try:
+                ts_str = datetime.fromtimestamp(float(ts_ms) / 1000.0, tz=timezone.utc).astimezone(IST_TZ).isoformat(timespec="seconds")
+            except Exception:
+                ts_str = now_ist
 
         quotes[sym] = {
             "symbol": sym,
@@ -313,20 +336,82 @@ def _fetch_live_quotes_upstox(symbols: List[Any], timeout: float = 4.5) -> Dict[
             "instrument_type": meta.get("instrument_type", "EQUITY"),
             "ltp": ltp,
             "prev_close": round(float(prev_close), 2) if prev_close is not None else None,
-            "open": round(float(ohlc.get("open")), 2) if ohlc.get("open") is not None else ltp,
-            "high": round(float(ohlc.get("high")), 2) if ohlc.get("high") is not None else ltp,
-            "low": round(float(ohlc.get("low")), 2) if ohlc.get("low") is not None else ltp,
+            "open": round(float(o_val), 2) if o_val is not None else ltp,
+            "high": round(float(h_val), 2) if h_val is not None else ltp,
+            "low": round(float(l_val), 2) if l_val is not None else ltp,
             "change": round(float(net_chg), 2) if net_chg is not None else None,
             "change_pct": chg_pct,
-            "volume": int(item.get("volume") or 0),
+            "volume": int(vol_val or 0),
             "oi": int(item.get("oi") or 0),
-            "bid": bid,
-            "ask": ask,
+            "bid": None,
+            "ask": None,
             "source": "upstox",
-            "transport": "broker_ws+quote",
+            "transport": "v3_ohlc",
             "note": "",
-            "ts_ist": now_ist,
+            "ts_ist": ts_str,
         }
+
+    # If any instrument lacked prev_ohlc, pull cp/ltp via Upstox V3 LTP endpoint
+    if missing_prev_keys:
+        try:
+            qs_ltp = urllib.parse.urlencode({"instrument_key": ",".join(missing_prev_keys)})
+            ltp_url = f"{config.UPSTOX_BASE_URL}/v3/market-quote/ltp?{qs_ltp}"
+            ltp_req = urllib.request.Request(ltp_url, headers=headers, method="GET")
+            with urllib.request.urlopen(ltp_req, timeout=min(timeout, 3.0)) as resp:
+                ltp_data = (json.loads(resp.read().decode("utf-8"))).get("data") or {}
+            for raw_k, item in ltp_data.items():
+                if not isinstance(item, dict):
+                    continue
+                itoken = str(item.get("instrument_token") or "")
+                meta = key_map.get(itoken) or sym_to_meta.get(str(raw_k).split(":", 1)[-1].strip().upper()) or {}
+                sym = meta.get("symbol")
+                if not sym or sym not in quotes:
+                    continue
+                cp = item.get("cp")
+                if cp is not None and float(cp) != 0:
+                    quotes[sym]["prev_close"] = round(float(cp), 2)
+                    net_chg = quotes[sym]["ltp"] - float(cp)
+                    quotes[sym]["change"] = round(net_chg, 2)
+                    quotes[sym]["change_pct"] = round((net_chg / float(cp)) * 100.0, 2)
+                if not quotes[sym]["volume"] and item.get("volume"):
+                    quotes[sym]["volume"] = int(item["volume"])
+        except Exception:
+            pass
+
+    # For F&O contracts, optionally enrich OI & top-of-book bid/ask via Full Market Quote (depth/OI)
+    if has_fno and quotes:
+        try:
+            fno_keys = [
+                k for k, m in key_map.items()
+                if m.get("exchange") in {"NFO", "BFO", "MCX", "NSE_FO", "BSE_FO", "MCX_FO"}
+                or m.get("instrument_type") in {"FUT", "CE", "PE"}
+            ]
+            if fno_keys:
+                qs_full = urllib.parse.urlencode({"instrument_key": ",".join(fno_keys)})
+                full_url = f"{config.UPSTOX_BASE_URL}/v2/market-quote/quotes?{qs_full}"
+                full_req = urllib.request.Request(full_url, headers=headers, method="GET")
+                with urllib.request.urlopen(full_req, timeout=min(timeout, 3.0)) as resp:
+                    full_data = (json.loads(resp.read().decode("utf-8"))).get("data") or {}
+                for raw_k, item in full_data.items():
+                    if not isinstance(item, dict):
+                        continue
+                    itoken = str(item.get("instrument_token") or "")
+                    meta = key_map.get(itoken) or sym_to_meta.get(str(raw_k).split(":", 1)[-1].strip().upper()) or {}
+                    sym = meta.get("symbol")
+                    if not sym or sym not in quotes:
+                        continue
+                    if item.get("oi") is not None:
+                        quotes[sym]["oi"] = int(item.get("oi") or 0)
+                    depth = item.get("depth") or {}
+                    buys = depth.get("buy") or []
+                    sells = depth.get("sell") or []
+                    if buys and buys[0].get("price"):
+                        quotes[sym]["bid"] = round(float(buys[0]["price"]), 2)
+                    if sells and sells[0].get("price"):
+                        quotes[sym]["ask"] = round(float(sells[0]["price"]), 2)
+        except Exception:
+            pass
+
     return quotes
 
 
