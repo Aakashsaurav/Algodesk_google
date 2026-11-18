@@ -10,12 +10,16 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const PORT = Number(process.env.PORT || 3000);
-const PYTHON_PORT = Number(process.env.PYTHON_HUB_PORT || 8001);
-const PYTHON_ORIGIN = `http://127.0.0.1:${PYTHON_PORT}`;
+const BASE_PYTHON_PORT = Number(process.env.PYTHON_HUB_PORT || 8001);
+let activePythonPort = BASE_PYTHON_PORT;
 const IS_PROD = process.env.NODE_ENV === 'production';
 
 let pythonProc: ChildProcess | null = null;
 let pythonReadyPromise: Promise<boolean> | null = null;
+
+function getPythonOrigin(): string {
+  return `http://127.0.0.1:${activePythonPort}`;
+}
 
 function resolvePythonBin(): string {
   if (process.env.PYTHON_BIN?.trim()) {
@@ -34,12 +38,13 @@ function resolvePythonBin(): string {
   return 'python3';
 }
 
-function startPythonHub(): void {
+function startPythonHub(port = activePythonPort): void {
   if (pythonProc && pythonProc.exitCode === null && !pythonProc.killed) return;
+  activePythonPort = port;
   const pythonBin = resolvePythonBin();
   pythonProc = spawn(
     pythonBin,
-    ['-m', 'web.local_server', '--host', '127.0.0.1', '--port', String(PYTHON_PORT), '--no-browser'],
+    ['-m', 'web.local_server', '--host', '127.0.0.1', '--port', String(activePythonPort), '--no-browser'],
     {
       cwd: __dirname,
       stdio: ['ignore', 'pipe', 'pipe'],
@@ -68,16 +73,32 @@ function startPythonHub(): void {
   });
 }
 
-async function waitForPythonHub(retries = 20): Promise<boolean> {
-  startPythonHub();
+async function waitForPythonHub(retries = 25): Promise<boolean> {
+  startPythonHub(activePythonPort);
   for (let i = 0; i < retries; i++) {
     try {
-      const res = await fetch(`${PYTHON_ORIGIN}/api/health`, {
+      const res = await fetch(`${getPythonOrigin()}/api/health`, {
         signal: AbortSignal.timeout(400),
       });
-      if (res.ok) return true;
+      if (res.ok) {
+        const body = (await res.json().catch(() => null)) as { phase?: number } | null;
+        if (body?.phase === 3) {
+          return true;
+        }
+        // A stale pre-Phase 3 process is bound to this port; move cleanly to the next port.
+        activePythonPort += 1;
+        if (pythonProc) {
+          try {
+            pythonProc.kill('SIGTERM');
+          } catch {
+            // ignore
+          }
+          pythonProc = null;
+        }
+        startPythonHub(activePythonPort);
+      }
     } catch {
-      await new Promise((r) => setTimeout(r, 100));
+      await new Promise((r) => setTimeout(r, 120));
     }
   }
   return false;
@@ -97,7 +118,7 @@ async function ensurePythonReady(): Promise<boolean> {
 
 async function proxyToPython(req: Request, res: Response): Promise<void> {
   await ensurePythonReady();
-  const targetUrl = `${PYTHON_ORIGIN}${req.originalUrl}`;
+  const targetUrl = `${getPythonOrigin()}${req.originalUrl}`;
   try {
     const headers: Record<string, string> = {};
     if (req.headers['content-type']) {

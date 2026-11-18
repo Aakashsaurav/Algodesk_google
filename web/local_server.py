@@ -72,7 +72,7 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/health":
-            self._send_json(200, {"ok": True, "service": "algodesk"})
+            self._send_json(200, {"ok": True, "service": "algodesk", "phase": 3})
             return
 
         if path == "/api/overview":

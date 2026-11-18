@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { RefreshCw, ExternalLink, X, Check, AlertCircle, Download, Search, Database } from 'lucide-react';
 
 type ConnectionState =
@@ -294,15 +294,37 @@ export default function App() {
     }
   }, []);
 
+  const instrSearchSeq = useRef(0);
+
   const searchInstruments = useCallback(async (q: string) => {
+    const seq = ++instrSearchSeq.current;
     try {
       const res = await fetch(`/api/instruments/search?q=${encodeURIComponent(q)}&limit=12`);
-      if (!res.ok) return;
+      if (seq !== instrSearchSeq.current) return;
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        const msg =
+          res.status === 404
+            ? 'Instrument lookup endpoint not found on running Python hub — restart the server to load Phase 3 routes.'
+            : err.detail || `Instrument search failed (HTTP ${res.status}).`;
+        setInstrFeedback({ type: 'err', text: msg });
+        return;
+      }
       const body = await res.json();
-      setInstrResults(body.results || []);
+      if (seq !== instrSearchSeq.current) return;
+      const rows = body.results || [];
+      setInstrResults(rows);
       if (body.stats) setInstrStats(body.stats);
+      if (q.trim() && rows.length === 0) {
+        setInstrFeedback({
+          type: 'err',
+          text: `No symbol matching "${q.trim().toUpperCase()}" in local SQLite yet. Click Sync Upstox Master or Sync Zerodha Master above.`,
+        });
+      } else {
+        setInstrFeedback((prev) => (prev?.type === 'err' ? null : prev));
+      }
     } catch {
-      // ignore transient error
+      // ignore transient startup polling error
     }
   }, []);
 
@@ -409,8 +431,14 @@ export default function App() {
           provider: histProvider === 'auto' ? null : histProvider,
         }),
       });
-      const body = await res.json();
-      if (!res.ok) throw new Error(body.detail || 'Historical download failed.');
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        const msg =
+          res.status === 404
+            ? 'Historical download endpoint not found on running Python hub — restart the server to load Phase 3 routes.'
+            : body.detail || 'Historical download failed.';
+        throw new Error(msg);
+      }
       const payload = body as DownloadResultPayload;
       setDownloadAudit(payload);
       setDataFeedback({ type: 'ok', text: payload.message });

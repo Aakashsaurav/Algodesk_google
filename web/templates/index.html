@@ -1313,13 +1313,28 @@
 
     async function searchInstruments(q) {
       const res = await fetch(`/api/instruments/search?q=${encodeURIComponent(q || '')}&limit=10`);
-      if (!res.ok) return;
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        p3.instrFeedback.className = 'feedback err';
+        p3.instrFeedback.textContent = res.status === 404
+          ? 'Instrument lookup endpoint not found on running Python hub — restart ./run_local.sh to load Phase 3 routes.'
+          : (err.detail || `Instrument search failed (HTTP ${res.status}).`);
+        return;
+      }
       const body = await res.json();
       if (body.stats) {
         p3.instrStats.textContent = `Indexed Symbols: ${Number(body.stats.total_instruments).toLocaleString()} · DB: ${body.stats.db_size_mb} MB`;
       }
+      const rows = body.results || [];
+      if ((q || '').trim() && rows.length === 0) {
+        p3.instrFeedback.className = 'feedback err';
+        p3.instrFeedback.textContent = `No symbol matching "${q.trim().toUpperCase()}" in local SQLite yet. Click Sync Upstox Master or Sync Zerodha Master.`;
+      } else if (p3.instrFeedback.className.includes('err')) {
+        p3.instrFeedback.className = 'feedback';
+        p3.instrFeedback.textContent = '';
+      }
       p3.instrChips.innerHTML = '';
-      (body.results || []).slice(0, 8).forEach((item) => {
+      rows.slice(0, 8).forEach((item) => {
         const b = document.createElement('button');
         b.type = 'button';
         b.className = 'quick-btn' + (p3.sym.value.toUpperCase() === item.trading_symbol ? ' active' : '');
@@ -1439,7 +1454,15 @@
         view: p3.viewMode,
       });
       const res = await fetch(`/api/data/records?${qs.toString()}`);
-      if (res.ok) renderRecordsPayload(await res.json());
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        p3.feedback.className = 'feedback err';
+        p3.feedback.textContent = res.status === 404
+          ? 'Historical records endpoint not found — restart ./run_local.sh to load Phase 3 routes.'
+          : (err.detail || 'Could not load stored records.');
+        return;
+      }
+      renderRecordsPayload(await res.json());
     }
 
     async function downloadMissingDays() {
@@ -1459,8 +1482,14 @@
             provider: p3.prov.value === 'auto' ? null : p3.prov.value,
           }),
         });
-        const body = await res.json();
-        if (!res.ok) throw new Error(body.detail || 'Download failed');
+        const body = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          throw new Error(
+            res.status === 404
+              ? 'Historical download endpoint not found on running Python hub — restart ./run_local.sh to load Phase 3 routes.'
+              : (body.detail || 'Download failed')
+          );
+        }
         p3.feedback.className = 'feedback ok';
         p3.feedback.textContent = body.message;
         p3.audit.textContent = `API Calls Made: ${body.api_calls_made} · Existing Days Skipped: ${body.existing_days_skipped} · Rows Inserted: ${body.rows_inserted}`;

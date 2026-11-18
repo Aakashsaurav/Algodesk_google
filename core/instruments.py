@@ -66,6 +66,14 @@ _SEGMENT_TO_EXCHANGE = {
     "BCD_FO": "BSE",
 }
 
+_ZERODHA_INDEX_ALIASES = {
+    "NIFTY 50": "NIFTY",
+    "NIFTY BANK": "BANKNIFTY",
+    "NIFTY FIN SERVICE": "FINNIFTY",
+    "NIFTY MID SELECT": "MIDCPNIFTY",
+    "INDIA VIX": "INDIAVIX",
+}
+
 
 @dataclass(frozen=True)
 class InstrumentRecord:
@@ -428,13 +436,14 @@ class InstrumentIndex:
                 norm_type = "EQUITY" if raw_type == "EQ" else ("INDEX" if seg == "INDICES" else raw_type)
                 strike_raw = str(row.get("strike", "")).strip()
                 strike_val = float(strike_raw) if strike_raw and float(strike_raw) != 0 else None
+                asset_sym = _ZERODHA_INDEX_ALIASES.get(sym, sym)
                 batch.append(
                     (
                         "zerodha",
                         exch,
                         seg,
                         sym,
-                        sym,
+                        asset_sym,
                         str(row.get("name", "")).strip(),
                         norm_type,
                         f"{exch}:{sym}",

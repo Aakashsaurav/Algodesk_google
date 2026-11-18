@@ -97,7 +97,7 @@ def create_app() -> FastAPI:
 
     @app.get("/api/health")
     def api_health() -> dict:
-        return {"ok": True, "service": "algodesk"}
+        return {"ok": True, "service": "algodesk", "phase": 3}
 
     @app.get("/api/overview")
     def api_overview(refresh: bool = Query(default=True)) -> dict:
