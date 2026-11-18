@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { RefreshCw, ExternalLink, X, Check, AlertCircle, Download, Search, Database, ShieldAlert, ShieldCheck, Activity } from 'lucide-react';
 import { LiveTerminal } from './components/LiveTerminal';
+import { AnalyticsConsole } from './components/AnalyticsConsole';
 
 type ConnectionState =
   | 'CONNECTED'
@@ -285,9 +286,9 @@ const ROADMAP_PHASES = [
   },
   {
     phase: 'Phase 05',
-    title: 'Screener, Backtester & Risk Console',
+    title: 'Screener, Backtester & Risk Console (Active)',
     detail:
-      'Connect existing screener, vectorized backtester, and risk limits to the selected Data Connection as async FastAPI background tasks.',
+      'Pure O(N) asynchronous multi-symbol technical screener, strategy backtester with equity/drawdown curve, and persistent portfolio risk limits integrated with live broker exposure and kill switch.',
   },
 ];
 
@@ -1235,6 +1236,12 @@ export default function App() {
               className="shrink-0 whitespace-nowrap text-sm font-medium text-slate-400 transition-colors hover:text-slate-100 hover:underline hover:underline-offset-8"
             >
               Live &amp; Safety
+            </a>
+            <a
+              href="#analytics-console"
+              className="shrink-0 whitespace-nowrap text-sm font-medium text-slate-400 transition-colors hover:text-slate-100 hover:underline hover:underline-offset-8"
+            >
+              Analytics
             </a>
             <a
               href="/terminal"
@@ -2549,7 +2556,14 @@ export default function App() {
           </div>
         </section>
 
-        {/* Section 5: Modular Expansion Roadmap */}
+        {/* Section 5: Phase 5 — Screener, Backtester & Portfolio Risk Console */}
+        <AnalyticsConsole
+          activeDataConnection={dataSelection}
+          activeTradingBroker={tradingSelection}
+          onRiskStateChange={() => void fetchLiveStatus()}
+        />
+
+        {/* Section 6: Modular Expansion Roadmap */}
         <section id="roadmap" className="space-y-4">
           <div>
             <h2 className="text-lg font-semibold tracking-tight text-slate-100">Modular Expansion Roadmap</h2>

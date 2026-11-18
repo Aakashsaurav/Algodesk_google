@@ -84,6 +84,43 @@ class LiveSubscriptionRequest(BaseModel):
     instrument_key: Optional[str] = None
 
 
+class ScreenerRequest(BaseModel):
+    symbols: Optional[List[str]] = None
+    exchange: str = "NSE"
+    timeframe: str = "1day"
+    lookback_days: int = 120
+    preset: str = "all"
+    provider: Optional[str] = None
+    async_job: bool = False
+
+
+class BacktestRequest(BaseModel):
+    symbol: str
+    exchange: str = "NSE"
+    strategy: str = "ema_crossover"
+    timeframe: str = "1day"
+    from_date: Optional[str] = None
+    to_date: Optional[str] = None
+    initial_capital: float = 500000.0
+    slippage_bps: float = 5.0
+    fee_bps: float = 5.0
+    stop_loss_pct: float = 5.0
+    take_profit_pct: float = 12.0
+    provider: Optional[str] = None
+    instrument_type: Optional[str] = None
+    instrument_key: Optional[str] = None
+    async_job: bool = False
+
+
+class RiskLimitsUpdateRequest(BaseModel):
+    total_capital_inr: Optional[float] = None
+    max_capital_per_trade_pct: Optional[float] = None
+    max_daily_loss_inr: Optional[float] = None
+    max_open_positions: Optional[int] = None
+    max_gross_exposure_inr: Optional[float] = None
+    auto_engage_kill_switch: Optional[bool] = None
+
+
 def _render_callback_page(title: str, detail: str, broker_id: str, success: bool) -> str:
     safe_title = html.escape(title)
     safe_detail = html.escape(detail)
@@ -133,7 +170,7 @@ def create_app() -> FastAPI:
 
     @app.get("/api/health")
     def api_health() -> dict:
-        return {"ok": True, "service": "algodesk", "phase": 5, "live_terminal": True}
+        return {"ok": True, "service": "algodesk", "phase": 5, "live_terminal": True, "analytics": True}
 
     @app.get("/api/overview")
     def api_overview(refresh: bool = Query(default=True)) -> dict:
@@ -521,6 +558,73 @@ def create_app() -> FastAPI:
     @app.get("/api/audit/verify")
     def api_audit_verify(limit: int = Query(default=25)) -> dict:
         return hub_service.verify_audit_chain(limit=limit)
+
+    @app.get("/api/analytics/meta")
+    def api_analytics_meta() -> dict:
+        return hub_service.get_analytics_metadata()
+
+    @app.post("/api/analytics/screener")
+    def api_analytics_screener(payload: Optional[ScreenerRequest] = None, async_job: Optional[bool] = Query(default=None)) -> dict:
+        req = payload or ScreenerRequest()
+        is_async = req.async_job if async_job is None else async_job
+        try:
+            return hub_service.run_screener(
+                symbols=req.symbols,
+                exchange=req.exchange,
+                timeframe=req.timeframe,
+                lookback_days=req.lookback_days,
+                preset=req.preset,
+                provider=req.provider,
+                async_job=is_async,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/analytics/backtest")
+    def api_analytics_backtest(payload: BacktestRequest, async_job: Optional[bool] = Query(default=None)) -> dict:
+        is_async = payload.async_job if async_job is None else async_job
+        try:
+            return hub_service.run_backtest(
+                symbol=payload.symbol,
+                exchange=payload.exchange,
+                strategy=payload.strategy,
+                timeframe=payload.timeframe,
+                from_date=payload.from_date,
+                to_date=payload.to_date,
+                initial_capital=payload.initial_capital,
+                slippage_bps=payload.slippage_bps,
+                fee_bps=payload.fee_bps,
+                stop_loss_pct=payload.stop_loss_pct,
+                take_profit_pct=payload.take_profit_pct,
+                provider=payload.provider,
+                instrument_type=payload.instrument_type,
+                instrument_key=payload.instrument_key,
+                async_job=is_async,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/analytics/jobs")
+    def api_analytics_jobs(limit: int = Query(default=15)) -> dict:
+        return hub_service.list_analytics_jobs(limit=limit)
+
+    @app.get("/api/analytics/jobs/{job_id}")
+    def api_analytics_job(job_id: str) -> dict:
+        try:
+            return hub_service.get_analytics_job(job_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.get("/api/analytics/risk")
+    def api_analytics_risk() -> dict:
+        return hub_service.get_risk_status()
+
+    @app.post("/api/analytics/risk")
+    def api_analytics_risk_update(payload: RiskLimitsUpdateRequest) -> dict:
+        try:
+            return hub_service.update_risk_limits(payload.model_dump(exclude_none=True))
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     return app
 

@@ -93,7 +93,7 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/health":
-            self._send_json(200, {"ok": True, "service": "algodesk", "phase": 5, "live_terminal": True})
+            self._send_json(200, {"ok": True, "service": "algodesk", "phase": 5, "live_terminal": True, "analytics": True})
             return
 
         if path == "/api/overview":
@@ -306,7 +306,27 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
             self._send_json(200, hub_service.verify_audit_chain(limit=limit))
             return
 
+        if path == "/api/analytics/meta":
+            self._send_json(200, hub_service.get_analytics_metadata())
+            return
+
+        if path == "/api/analytics/jobs":
+            limit = int(query.get("limit", ["15"])[0] or 15)
+            self._send_json(200, hub_service.list_analytics_jobs(limit=limit))
+            return
+
+        if path == "/api/analytics/risk":
+            self._send_json(200, hub_service.get_risk_status())
+            return
+
         parts = path.strip("/").split("/")
+        if len(parts) == 4 and parts[0] == "api" and parts[1] == "analytics" and parts[2] == "jobs":
+            try:
+                self._send_json(200, hub_service.get_analytics_job(parts[3]))
+            except ValueError as exc:
+                self._send_json(404, {"detail": str(exc)})
+            return
+
         if len(parts) == 4 and parts[0] == "api" and parts[1] == "brokers" and parts[3] == "reconnect-status":
             self._send_json(200, hub_service.get_reconnect_status(parts[2]))
             return
@@ -490,6 +510,54 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
                 engaged = bool(body.get("engaged", False))
                 reason = str(body.get("reason", ""))
                 self._send_json(200, hub_service.set_kill_switch(engaged=engaged, reason=reason))
+                return
+
+            if path == "/api/analytics/screener":
+                query = parse_qs(parsed.query)
+                async_q = query.get("async_job", [None])[0]
+                is_async = bool(body.get("async_job", False)) if async_q is None else (async_q.lower() == "true")
+                self._send_json(
+                    200,
+                    hub_service.run_screener(
+                        symbols=body.get("symbols") if isinstance(body.get("symbols"), list) else None,
+                        exchange=str(body.get("exchange", "NSE")),
+                        timeframe=str(body.get("timeframe", "1day")),
+                        lookback_days=int(body.get("lookback_days", 120) or 120),
+                        preset=str(body.get("preset", "all")),
+                        provider=body.get("provider"),
+                        async_job=is_async,
+                    ),
+                )
+                return
+
+            if path == "/api/analytics/backtest":
+                query = parse_qs(parsed.query)
+                async_q = query.get("async_job", [None])[0]
+                is_async = bool(body.get("async_job", False)) if async_q is None else (async_q.lower() == "true")
+                self._send_json(
+                    200,
+                    hub_service.run_backtest(
+                        symbol=str(body.get("symbol", "")),
+                        exchange=str(body.get("exchange", "NSE")),
+                        strategy=str(body.get("strategy", "ema_crossover")),
+                        timeframe=str(body.get("timeframe", "1day")),
+                        from_date=body.get("from_date"),
+                        to_date=body.get("to_date"),
+                        initial_capital=float(body.get("initial_capital", 500000.0) or 500000.0),
+                        slippage_bps=float(body.get("slippage_bps", 5.0) or 5.0),
+                        fee_bps=float(body.get("fee_bps", 5.0) or 5.0),
+                        stop_loss_pct=float(body.get("stop_loss_pct", 5.0) or 5.0),
+                        take_profit_pct=float(body.get("take_profit_pct", 12.0) or 12.0),
+                        provider=body.get("provider"),
+                        instrument_type=body.get("instrument_type"),
+                        instrument_key=body.get("instrument_key"),
+                        async_job=is_async,
+                    ),
+                )
+                return
+
+            if path == "/api/analytics/risk":
+                self._send_json(200, hub_service.update_risk_limits(body))
                 return
 
             self._send_json(404, {"detail": "Not Found"})

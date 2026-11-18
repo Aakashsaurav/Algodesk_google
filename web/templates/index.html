@@ -481,6 +481,18 @@
       .p4-split { grid-template-columns: 1fr; }
     }
 
+    /* Phase 5: Analytics & Risk Console */
+    .p5-head { display: flex; flex-wrap: wrap; align-items: flex-end; justify-content: space-between; gap: 14px; margin-bottom: 14px; }
+    .p5-tabs { display: inline-flex; gap: 4px; padding: 4px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); }
+    .p5-tab { border: 0; border-radius: 6px; padding: 7px 14px; font-size: 12px; font-weight: 600; cursor: pointer; background: transparent; color: var(--text-muted); }
+    .p5-tab.active { background: var(--accent); color: #082f49; }
+    .p5-grid-sc { display: grid; grid-template-columns: 1.8fr 1.1fr 0.8fr 0.75fr 1fr auto; gap: 12px; align-items: end; }
+    .p5-grid-bt { display: grid; grid-template-columns: 1fr 0.7fr 1.2fr 0.75fr 0.95fr 0.95fr auto; gap: 12px; align-items: end; }
+    .p5-grid-rk { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; align-items: end; }
+    @media (max-width: 960px) {
+      .p5-grid-sc, .p5-grid-bt, .p5-grid-rk { grid-template-columns: 1fr; }
+    }
+
     /* Modal */
     .modal-backdrop {
       position: fixed;
@@ -568,6 +580,7 @@
         <a href="#connections">Connections</a>
         <a href="#historical-data">Historical Data</a>
         <a href="#live-controls">Live &amp; Safety</a>
+        <a href="#analytics-console">Analytics</a>
         <a href="/terminal" style="color: var(--accent); font-weight: 600;">Live Terminal</a>
       </nav>
       <button id="refreshBtn" class="btn btn-primary" type="button">Refresh Status</button>
@@ -853,6 +866,146 @@
       </div>
     </section>
 
+    <section id="analytics-console">
+      <div class="p5-head">
+        <div>
+          <h2>Phase 05 — Screener, Backtester &amp; Portfolio Risk Console</h2>
+          <p class="section-desc" style="margin:0;">Pure O(N) asynchronous technical screener, strategy backtester, and live exposure risk limits routed through your assigned Data &amp; Trading connections.</p>
+        </div>
+        <div class="p5-tabs">
+          <button id="p5TabScreener" class="p5-tab active" type="button">Market Screener</button>
+          <button id="p5TabBacktest" class="p5-tab" type="button">Strategy Backtester</button>
+          <button id="p5TabRisk" class="p5-tab" type="button">Risk Limits</button>
+        </div>
+      </div>
+
+      <!-- Panel 1: Market Screener -->
+      <div id="p5PanelScreener" class="panel">
+        <div class="p5-grid-sc">
+          <div class="field">
+            <label for="p5ScSymbols">Watchlist Symbols (comma-separated)</label>
+            <input id="p5ScSymbols" class="mono" type="text" value="RELIANCE, TCS, INFY, HDFCBANK, ICICIBANK, SBIN, BHARTIARTL, ITC, LT, AXISBANK" />
+          </div>
+          <div class="field">
+            <label for="p5ScPreset">Rule Preset</label>
+            <select id="p5ScPreset">
+              <option value="all">All Metrics</option>
+              <option value="momentum_breakout">Momentum Breakout</option>
+              <option value="vcp_contraction">VCP Contraction</option>
+              <option value="oversold_rebound">Oversold RSI</option>
+              <option value="trend_following">Trend Following</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="p5ScTf">Timeframe</label>
+            <select id="p5ScTf">
+              <option value="1day">1 Day</option>
+              <option value="30minute">30 Min</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="p5ScLookback">Lookback (D)</label>
+            <input id="p5ScLookback" class="mono" type="number" min="30" max="730" value="120" />
+          </div>
+          <div class="field">
+            <label for="p5ScProvider">Data Source</label>
+            <select id="p5ScProvider">
+              <option value="auto">Assigned Connection</option>
+              <option value="yfinance">Yahoo Finance</option>
+              <option value="upstox">Upstox</option>
+              <option value="zerodha">Zerodha Kite</option>
+            </select>
+          </div>
+          <button id="p5ScRunBtn" class="btn btn-primary" type="button">Run Async Scan</button>
+        </div>
+        <div id="p5ScMeta" class="mono" style="font-size:12px; color:var(--text-muted); margin-top:10px;">Ready for O(N) multi-symbol scan.</div>
+        <div id="p5ScTableWrap" style="margin-top:12px;"></div>
+      </div>
+
+      <!-- Panel 2: Strategy Backtester -->
+      <div id="p5PanelBacktest" class="panel" style="display:none;">
+        <div class="p5-grid-bt">
+          <div class="field">
+            <label for="p5BtSymbol">Symbol</label>
+            <input id="p5BtSymbol" class="mono" type="text" value="RELIANCE" />
+          </div>
+          <div class="field">
+            <label for="p5BtExch">Exch</label>
+            <select id="p5BtExch">
+              <option value="NSE">NSE</option>
+              <option value="BSE">BSE</option>
+              <option value="NFO">NFO</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="p5BtStrategy">Strategy</label>
+            <select id="p5BtStrategy">
+              <option value="ema_crossover">EMA 20 / 50 Crossover</option>
+              <option value="rsi_mean_reversion">Wilder RSI (14) Mean Reversion</option>
+              <option value="vcp_breakout">VCP Range Breakout</option>
+              <option value="supertrend_atr">Supertrend (10, ATR 3.0x)</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="p5BtTf">Timeframe</label>
+            <select id="p5BtTf">
+              <option value="1day">1 Day</option>
+              <option value="30minute">30 Min</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="p5BtFrom">From</label>
+            <input id="p5BtFrom" class="mono" type="date" />
+          </div>
+          <div class="field">
+            <label for="p5BtTo">To</label>
+            <input id="p5BtTo" class="mono" type="date" />
+          </div>
+          <button id="p5BtRunBtn" class="btn btn-primary" type="button">Run Backtest</button>
+        </div>
+        <div style="display:grid; grid-template-columns:repeat(4, minmax(0,1fr)); gap:12px; margin-top:12px;">
+          <div class="field"><label for="p5BtCap">Capital (₹)</label><input id="p5BtCap" class="mono" type="number" value="500000" /></div>
+          <div class="field"><label for="p5BtSl">Stop Loss %</label><input id="p5BtSl" class="mono" type="number" step="0.5" value="5" /></div>
+          <div class="field"><label for="p5BtTp">Take Profit %</label><input id="p5BtTp" class="mono" type="number" step="0.5" value="12" /></div>
+          <div class="field"><label for="p5BtProvider">Source</label><select id="p5BtProvider"><option value="auto">Assigned</option><option value="yfinance">Yahoo Finance</option><option value="upstox">Upstox</option><option value="zerodha">Zerodha Kite</option></select></div>
+        </div>
+        <div id="p5BtMeta" class="mono" style="font-size:12px; color:var(--text-muted); margin-top:10px;">Configure parameters and click Run Backtest.</div>
+        <div id="p5BtSummary" class="summary-strip mono" style="display:none; margin-top:12px;"></div>
+        <div id="p5BtChart" style="margin-top:12px;"></div>
+        <div id="p5BtTrades" style="margin-top:12px;"></div>
+      </div>
+
+      <!-- Panel 3: Portfolio Risk Limits -->
+      <div id="p5PanelRisk" class="panel" style="display:none;">
+        <div class="p4-panel-head">
+          <div>
+            <div style="font-size:15px; font-weight:600;">Live Exposure &amp; Daily Loss Guard</div>
+            <div id="p5RiskNote" style="font-size:12px; color:var(--text-muted);">Evaluates live trading broker margin/positions and enforces kill-switch triggers.</div>
+          </div>
+          <button id="p5RiskEvalBtn" class="btn" type="button" style="min-height:34px; padding:5px 12px; font-size:12px;">Evaluate Live Exposure</button>
+        </div>
+        <div id="p5RiskBreaches" class="feedback" style="min-height:0; margin-bottom:10px;"></div>
+        <div id="p5RiskTelemetry" class="summary-strip mono" style="display:none; margin-bottom:14px;"></div>
+        <div class="p5-grid-rk">
+          <div class="field"><label for="p5RkCap">Total Risk Capital (₹)</label><input id="p5RkCap" class="mono" type="number" value="500000" /></div>
+          <div class="field"><label for="p5RkPct">Max Capital / Trade (%)</label><input id="p5RkPct" class="mono" type="number" step="0.5" value="15" /></div>
+          <div class="field"><label for="p5RkLoss">Max Daily Loss (₹)</label><input id="p5RkLoss" class="mono" type="number" value="15000" /></div>
+          <div class="field"><label for="p5RkPos">Max Open Positions</label><input id="p5RkPos" class="mono" type="number" min="1" value="5" /></div>
+          <div class="field"><label for="p5RkExp">Max Gross Exposure (₹)</label><input id="p5RkExp" class="mono" type="number" value="400000" /></div>
+          <div class="field">
+            <label style="display:flex; align-items:center; gap:8px; cursor:pointer; font-weight:500;">
+              <input id="p5RkAutoKill" type="checkbox" checked />
+              <span>Auto-engage Kill Switch on daily loss breach</span>
+            </label>
+          </div>
+        </div>
+        <div style="display:flex; justify-content:space-between; align-items:center; gap:12px; margin-top:14px;">
+          <span id="p5RiskFeedback" class="feedback" style="margin:0;"></span>
+          <button id="p5RiskSaveBtn" class="btn btn-primary" type="button">Save Risk Limits &amp; Evaluate</button>
+        </div>
+      </div>
+    </section>
+
     <section id="roadmap">
       <h2>Modular Expansion Roadmap</h2>
       <p class="section-desc">Each adapter implements the unified broker capability and health contract, allowing incremental expansion without rewriting UI or strategy code.</p>
@@ -888,8 +1041,8 @@
         <div class="roadmap-item">
           <div class="roadmap-phase mono">Phase 05</div>
           <div>
-            <div class="roadmap-title">Screener, Backtester &amp; Risk Console</div>
-            <div class="roadmap-detail">Connect existing screener, vectorized backtester, and risk limits to the selected Data Connection as async FastAPI endpoints.</div>
+            <div class="roadmap-title">Screener, Backtester &amp; Risk Console (Active)</div>
+            <div class="roadmap-detail">Pure O(N) asynchronous technical screener, strategy backtester with equity/drawdown curve, and persistent portfolio risk limits integrated with live broker exposure and kill switch.</div>
           </div>
         </div>
       </div>
@@ -2187,6 +2340,243 @@
     p4.verifyBtn.addEventListener('click', verifyAudit);
 
     loadLiveStatus();
+
+    // Phase 5: Screener, O(N) Backtester & Risk Limits JS
+    const p5 = {
+      tabSc: document.getElementById('p5TabScreener'),
+      tabBt: document.getElementById('p5TabBacktest'),
+      tabRk: document.getElementById('p5TabRisk'),
+      panSc: document.getElementById('p5PanelScreener'),
+      panBt: document.getElementById('p5PanelBacktest'),
+      panRk: document.getElementById('p5PanelRisk'),
+      scSym: document.getElementById('p5ScSymbols'),
+      scPreset: document.getElementById('p5ScPreset'),
+      scTf: document.getElementById('p5ScTf'),
+      scLookback: document.getElementById('p5ScLookback'),
+      scProv: document.getElementById('p5ScProvider'),
+      scBtn: document.getElementById('p5ScRunBtn'),
+      scMeta: document.getElementById('p5ScMeta'),
+      scTable: document.getElementById('p5ScTableWrap'),
+      btSym: document.getElementById('p5BtSymbol'),
+      btExch: document.getElementById('p5BtExch'),
+      btStrat: document.getElementById('p5BtStrategy'),
+      btTf: document.getElementById('p5BtTf'),
+      btFrom: document.getElementById('p5BtFrom'),
+      btTo: document.getElementById('p5BtTo'),
+      btCap: document.getElementById('p5BtCap'),
+      btSl: document.getElementById('p5BtSl'),
+      btTp: document.getElementById('p5BtTp'),
+      btProv: document.getElementById('p5BtProvider'),
+      btBtn: document.getElementById('p5BtRunBtn'),
+      btMeta: document.getElementById('p5BtMeta'),
+      btSummary: document.getElementById('p5BtSummary'),
+      btChart: document.getElementById('p5BtChart'),
+      btTrades: document.getElementById('p5BtTrades'),
+      rkNote: document.getElementById('p5RiskNote'),
+      rkEvalBtn: document.getElementById('p5RiskEvalBtn'),
+      rkBreaches: document.getElementById('p5RiskBreaches'),
+      rkTel: document.getElementById('p5RiskTelemetry'),
+      rkCap: document.getElementById('p5RkCap'),
+      rkPct: document.getElementById('p5RkPct'),
+      rkLoss: document.getElementById('p5RkLoss'),
+      rkPos: document.getElementById('p5RkPos'),
+      rkExp: document.getElementById('p5RkExp'),
+      rkAuto: document.getElementById('p5RkAutoKill'),
+      rkFeedback: document.getElementById('p5RiskFeedback'),
+      rkSaveBtn: document.getElementById('p5RiskSaveBtn'),
+    };
+    p5.btTo.value = new Date().toISOString().slice(0, 10);
+    p5.btFrom.value = new Date(Date.now() - 365 * 86400000).toISOString().slice(0, 10);
+
+    function switchP5Tab(tab) {
+      p5.tabSc.classList.toggle('active', tab === 'screener');
+      p5.tabBt.classList.toggle('active', tab === 'backtest');
+      p5.tabRk.classList.toggle('active', tab === 'risk');
+      p5.panSc.style.display = tab === 'screener' ? 'block' : 'none';
+      p5.panBt.style.display = tab === 'backtest' ? 'block' : 'none';
+      p5.panRk.style.display = tab === 'risk' ? 'block' : 'none';
+      if (tab === 'risk') loadRiskStatusP5();
+    }
+
+    async function pollJobP5(jobId, onProgress) {
+      for (let i = 0; i < 180; i += 1) {
+        const res = await fetch(`/api/analytics/jobs/${encodeURIComponent(jobId)}`);
+        const body = await res.json();
+        if (!res.ok || !body.job) throw new Error(body.detail || 'Job status error');
+        onProgress(body.job);
+        if (body.job.status === 'COMPLETED' || body.job.status === 'FAILED') return body.job;
+        await new Promise((r) => setTimeout(r, 450));
+      }
+      throw new Error('Job polling timed out');
+    }
+
+    async function runScreenerP5() {
+      p5.scBtn.disabled = true;
+      p5.scMeta.textContent = 'Submitting async screener scan...';
+      try {
+        const syms = p5.scSym.value.split(/[,\s]+/).map((s) => s.trim().toUpperCase()).filter(Boolean);
+        const res = await fetch('/api/analytics/screener', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            symbols: syms.length ? syms : null,
+            exchange: 'NSE',
+            timeframe: p5.scTf.value,
+            lookback_days: Number(p5.scLookback.value) || 120,
+            preset: p5.scPreset.value,
+            provider: p5.scProv.value === 'auto' ? null : p5.scProv.value,
+            async_job: true,
+          }),
+        });
+        const startBody = await res.json();
+        if (!res.ok || !startBody.job) throw new Error(startBody.detail || 'Screener failed');
+        const done = await pollJobP5(startBody.job.job_id, (j) => {
+          p5.scMeta.textContent = `Job ${j.job_id}: ${j.status} (${j.progress_pct}%) — ${j.progress_message}`;
+        });
+        if (done.status === 'FAILED') throw new Error(done.error || done.progress_message);
+        const r = done.result;
+        p5.scMeta.textContent = `Matched ${r.matched_count}/${r.evaluated_count} via ${String(r.provider).toUpperCase()} · API Calls: ${r.api_calls_made} · Cached Days Skipped: ${r.existing_days_skipped}`;
+        const rows = r.results || [];
+        if (!rows.length) {
+          p5.scTable.innerHTML = '<div style="font-size:12px;color:var(--text-muted);padding:10px 0;">No symbols matched this preset.</div>';
+          return;
+        }
+        p5.scTable.innerHTML = `<div class="table-wrap"><table class="ohlcv-table mono"><thead><tr><th>Symbol</th><th class="num">Close</th><th class="num">Chg%</th><th class="num">EMA20</th><th class="num">EMA50</th><th class="num">RSI(14)</th><th class="num">ATR%</th><th class="num">Vol</th><th>Signal</th><th class="num">Action</th></tr></thead><tbody>${rows.map((x) => `<tr><td style="font-weight:600">${x.symbol}</td><td class="num">${Number(x.close).toFixed(2)}</td><td class="num" style="color:${x.change_pct >= 0 ? '#34d399' : '#f87171'}">${x.change_pct >= 0 ? '+' : ''}${Number(x.change_pct).toFixed(2)}%</td><td class="num">${x.ema20 !== null ? Number(x.ema20).toFixed(2) : '—'}</td><td class="num">${x.ema50 !== null ? Number(x.ema50).toFixed(2) : '—'}</td><td class="num">${x.rsi14 !== null ? Number(x.rsi14).toFixed(1) : '—'}</td><td class="num">${x.atr_pct !== null ? Number(x.atr_pct).toFixed(2) + '%' : '—'}</td><td class="num">${Number(x.vol_ratio).toFixed(2)}x</td><td style="color:var(--accent);font-weight:600">${x.signal}</td><td class="num"><button type="button" class="quick-btn" data-bt-sym="${x.symbol}" data-bt-ex="${x.exchange}">Backtest &rarr;</button></td></tr>`).join('')}</tbody></table></div>`;
+        p5.scTable.querySelectorAll('[data-bt-sym]').forEach((btn) => {
+          btn.addEventListener('click', () => {
+            p5.btSym.value = btn.getAttribute('data-bt-sym') || 'RELIANCE';
+            p5.btExch.value = btn.getAttribute('data-bt-ex') || 'NSE';
+            switchP5Tab('backtest');
+            runBacktestP5();
+          });
+        });
+      } catch (err) {
+        p5.scMeta.textContent = err.message;
+      } finally {
+        p5.scBtn.disabled = false;
+      }
+    }
+
+    function renderEquitySvgP5(curve, initialCap) {
+      if (!curve || curve.length < 2) return '';
+      const w = 820, h = 190, px = 10, py = 14, iw = w - px * 2, ih = h - py * 2;
+      const eqs = curve.map((c) => c.equity);
+      const minE = Math.min(initialCap, ...eqs), maxE = Math.max(initialCap, ...eqs);
+      const span = maxE - minE || 1;
+      const xAt = (i) => px + (i / Math.max(1, curve.length - 1)) * iw;
+      const yAt = (e) => py + ih - ((e - minE) / span) * ih;
+      const pts = curve.map((c, i) => `${xAt(i).toFixed(1)},${yAt(c.equity).toFixed(1)}`).join(' ');
+      const stroke = curve[curve.length - 1].equity >= initialCap ? '#34d399' : '#f87171';
+      return `<div style="border:1px solid var(--border);border-radius:8px;background:var(--bg);padding:12px;"><div class="mono" style="font-size:11px;color:var(--text-muted);margin-bottom:6px;">Equity Curve (${curve[0].date} -> ${curve[curve.length - 1].date}) · Baseline: ₹${Number(initialCap).toLocaleString()}</div><svg viewBox="0 0 ${w} ${h}" style="width:100%;height:175px;overflow:visible;"><line x1="${px}" y1="${yAt(initialCap)}" x2="${w - px}" y2="${yAt(initialCap)}" stroke="#334155" stroke-dasharray="4 4"/><polyline fill="none" stroke="${stroke}" stroke-width="2.2" points="${pts}"/></svg></div>`;
+    }
+
+    async function runBacktestP5() {
+      p5.btBtn.disabled = true;
+      p5.btMeta.textContent = 'Submitting async O(N) backtest...';
+      try {
+        const res = await fetch('/api/analytics/backtest', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            symbol: p5.btSym.value.trim().toUpperCase(),
+            exchange: p5.btExch.value,
+            strategy: p5.btStrat.value,
+            timeframe: p5.btTf.value,
+            from_date: p5.btFrom.value,
+            to_date: p5.btTo.value,
+            initial_capital: Number(p5.btCap.value) || 500000,
+            stop_loss_pct: Number(p5.btSl.value) || 0,
+            take_profit_pct: Number(p5.btTp.value) || 0,
+            provider: p5.btProv.value === 'auto' ? null : p5.btProv.value,
+            async_job: true,
+          }),
+        });
+        const startBody = await res.json();
+        if (!res.ok || !startBody.job) throw new Error(startBody.detail || 'Backtest failed');
+        const done = await pollJobP5(startBody.job.job_id, (j) => {
+          p5.btMeta.textContent = `Job ${j.job_id}: ${j.status} (${j.progress_pct}%) — ${j.progress_message}`;
+        });
+        if (done.status === 'FAILED') throw new Error(done.error || done.progress_message);
+        const r = done.result;
+        p5.btMeta.textContent = `${r.symbol} · ${r.strategy_label} · ${r.bars_evaluated} bars via ${String(r.provider).toUpperCase()} (API calls: ${r.api_calls_made})`;
+        p5.btSummary.style.display = 'grid';
+        p5.btSummary.innerHTML = `<div><div style="color:var(--text-muted)">Net P&amp;L</div><div class="summary-val" style="color:${r.net_pnl >= 0 ? '#34d399' : '#f87171'}">₹${Number(r.net_pnl).toLocaleString()}</div></div><div><div style="color:var(--text-muted)">Return</div><div class="summary-val">${r.total_return_pct}%</div></div><div><div style="color:var(--text-muted)">CAGR</div><div class="summary-val">${r.cagr_pct}%</div></div><div><div style="color:var(--text-muted)">Max DD</div><div class="summary-val" style="color:#fbbf24">-${r.max_drawdown_pct}%</div></div><div><div style="color:var(--text-muted)">Sharpe</div><div class="summary-val">${r.sharpe_ratio}</div></div><div><div style="color:var(--text-muted)">Win Rate (${r.total_trades})</div><div class="summary-val">${r.win_rate_pct}%</div></div>`;
+        p5.btChart.innerHTML = renderEquitySvgP5(r.equity_curve, r.initial_capital);
+        p5.btTrades.innerHTML = `<div class="table-wrap" style="max-height:220px;"><table class="ohlcv-table mono"><thead><tr><th>Entry</th><th>Exit</th><th class="num">Qty</th><th class="num">Entry ₹</th><th class="num">Exit ₹</th><th class="num">P&amp;L ₹</th><th>Reason</th></tr></thead><tbody>${(r.trades || []).map((t) => `<tr><td>${t.entry_date}</td><td>${t.exit_date}</td><td class="num">${t.qty}</td><td class="num">${Number(t.entry_price).toFixed(2)}</td><td class="num">${Number(t.exit_price).toFixed(2)}</td><td class="num" style="color:${t.pnl >= 0 ? '#34d399' : '#f87171'}">${Number(t.pnl).toFixed(2)}</td><td>${t.exit_reason}</td></tr>`).join('') || '<tr><td colspan="7">No trades triggered in window.</td></tr>'}</tbody></table></div>`;
+      } catch (err) {
+        p5.btMeta.textContent = err.message;
+      } finally {
+        p5.btBtn.disabled = false;
+      }
+    }
+
+    function renderRiskP5(body) {
+      if (!body) return;
+      p5.rkNote.textContent = body.broker_note || '';
+      if (body.limits) {
+        p5.rkCap.value = body.limits.total_capital_inr;
+        p5.rkPct.value = body.limits.max_capital_per_trade_pct;
+        p5.rkLoss.value = body.limits.max_daily_loss_inr;
+        p5.rkPos.value = body.limits.max_open_positions;
+        p5.rkExp.value = body.limits.max_gross_exposure_inr;
+        p5.rkAuto.checked = Boolean(body.limits.auto_engage_kill_switch);
+      }
+      if (body.breaches && body.breaches.length) {
+        p5.rkBreaches.className = 'feedback err';
+        p5.rkBreaches.textContent = body.breaches.map((b) => `[${b.severity}] ${b.message}`).join(' · ');
+      } else {
+        p5.rkBreaches.className = 'feedback';
+        p5.rkBreaches.textContent = '';
+      }
+      if (body.telemetry) {
+        const t = body.telemetry;
+        p5.rkTel.style.display = 'grid';
+        p5.rkTel.innerHTML = `<div><div style="color:var(--text-muted)">Capital Base</div><div class="summary-val">₹${Number(t.capital_base_inr).toLocaleString()}</div></div><div><div style="color:var(--text-muted)">Gross Exposure</div><div class="summary-val">₹${Number(t.gross_exposure_inr).toLocaleString()} (${t.exposure_utilization_pct}%)</div></div><div><div style="color:var(--text-muted)">Daily P&amp;L</div><div class="summary-val" style="color:${t.daily_pnl_inr >= 0 ? '#34d399' : '#f87171'}">₹${Number(t.daily_pnl_inr).toLocaleString()}</div></div><div><div style="color:var(--text-muted)">Open Positions</div><div class="summary-val">${t.open_positions_count} / ${body.limits.max_open_positions}</div></div>`;
+      }
+    }
+
+    async function loadRiskStatusP5() {
+      const res = await fetch('/api/analytics/risk');
+      if (res.ok) renderRiskP5(await res.json());
+    }
+
+    async function saveRiskLimitsP5() {
+      p5.rkSaveBtn.disabled = true;
+      try {
+        const res = await fetch('/api/analytics/risk', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            total_capital_inr: Number(p5.rkCap.value),
+            max_capital_per_trade_pct: Number(p5.rkPct.value),
+            max_daily_loss_inr: Number(p5.rkLoss.value),
+            max_open_positions: Number(p5.rkPos.value),
+            max_gross_exposure_inr: Number(p5.rkExp.value),
+            auto_engage_kill_switch: p5.rkAuto.checked,
+          }),
+        });
+        const body = await res.json();
+        if (!res.ok) throw new Error(body.detail || 'Could not save limits');
+        renderRiskP5(body);
+        p5.rkFeedback.className = body.breaches && body.breaches.length ? 'feedback err' : 'feedback ok';
+        p5.rkFeedback.textContent = body.breaches && body.breaches.length ? 'Limits saved (breach active).' : 'Risk limits saved & evaluated.';
+        if (body.kill_switch_auto_triggered) loadLiveStatus();
+      } catch (err) {
+        p5.rkFeedback.className = 'feedback err';
+        p5.rkFeedback.textContent = err.message;
+      } finally {
+        p5.rkSaveBtn.disabled = false;
+      }
+    }
+
+    p5.tabSc.addEventListener('click', () => switchP5Tab('screener'));
+    p5.tabBt.addEventListener('click', () => switchP5Tab('backtest'));
+    p5.tabRk.addEventListener('click', () => switchP5Tab('risk'));
+    p5.scBtn.addEventListener('click', runScreenerP5);
+    p5.btBtn.addEventListener('click', runBacktestP5);
+    p5.rkEvalBtn.addEventListener('click', loadRiskStatusP5);
+    p5.rkSaveBtn.addEventListener('click', saveRiskLimitsP5);
+    loadRiskStatusP5();
   </script>
 </body>
 </html>

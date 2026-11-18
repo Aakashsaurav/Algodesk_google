@@ -1314,6 +1314,250 @@ class TestBrokerHubArchitecture(unittest.TestCase):
             self.assertIn("Upstox HTTP 400: Invalid instrument_key", res["message"])
             self.assertNotIn("No valid Zerodha Kite session token", res["message"])
 
+    def test_phase5_screener_and_gap_only_cache(self) -> None:
+        from core.analytics import MarketScreener
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mgr = HistoricalDataManager(Path(tmpdir) / "ohlcv.db")
+            screener = MarketScreener(hist_manager=mgr)
+
+            api_calls = 0
+
+            def fake_fetcher(sym: str, exch: str, tf: str, c_start: date, c_end: date):
+                nonlocal api_calls
+                api_calls += 1
+                rows = []
+                cur = c_start
+                step_idx = 0
+                base = 1000.0 if sym == "TRENDCO" else 500.0
+                while cur <= c_end:
+                    if cur.weekday() < 5:
+                        if sym == "TRENDCO":
+                            close_px = base + step_idx * 4.5
+                            if step_idx > 70:
+                                close_px += (step_idx - 70) * 6.0
+                        else:
+                            close_px = base - step_idx * 2.5
+                        rows.append(
+                            {
+                                "ts_ist": f"{cur.isoformat()}T15:30:00+05:30",
+                                "trade_date": cur.isoformat(),
+                                "open": close_px - 2.0,
+                                "high": close_px + 3.0,
+                                "low": close_px - 4.0,
+                                "close": close_px,
+                                "volume": 250000 if step_idx > 75 else 100000,
+                                "oi": 0,
+                            }
+                        )
+                        step_idx += 1
+                    cur += timedelta(days=1)
+                return rows
+
+            first = screener.scan(
+                symbols=["TRENDCO", "DIPCO"],
+                exchange="NSE",
+                timeframe="1day",
+                lookback_days=140,
+                preset="all",
+                provider="upstox",
+                fetcher=fake_fetcher,
+            )
+            self.assertTrue(first["ok"])
+            self.assertEqual(first["evaluated_count"], 2)
+            self.assertGreater(api_calls, 0)
+            by_sym = {r["symbol"]: r for r in first["results"]}
+            self.assertEqual(by_sym["TRENDCO"]["supertrend"], "BULL")
+            self.assertIsNotNone(by_sym["TRENDCO"]["rsi14"])
+            self.assertLess(by_sym["DIPCO"]["rsi14"], 35.0)
+
+            # Oversold preset catches DIPCO
+            calls_before_second = api_calls
+            oversold = screener.scan(
+                symbols=["TRENDCO", "DIPCO"],
+                exchange="NSE",
+                timeframe="1day",
+                lookback_days=140,
+                preset="oversold_rebound",
+                provider="upstox",
+                fetcher=fake_fetcher,
+            )
+            self.assertEqual(oversold["matched_count"], 1)
+            self.assertEqual(oversold["results"][0]["symbol"], "DIPCO")
+            self.assertEqual(api_calls, calls_before_second)  # Gap-only cache hit!
+
+    def test_phase5_backtest_engine_strategies_and_metrics(self) -> None:
+        from core.analytics import BacktestEngine
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mgr = HistoricalDataManager(Path(tmpdir) / "ohlcv.db")
+            engine = BacktestEngine(hist_manager=mgr)
+
+            def wave_fetcher(sym: str, exch: str, tf: str, c_start: date, c_end: date):
+                rows = []
+                cur = c_start
+                i = 0
+                while cur <= c_end:
+                    if cur.weekday() < 5:
+                        # Down-then-up trend so EMA crossover & RSI & Supertrend fire cleanly
+                        px = 1000.0 - i * 4.0 if i < 35 else (860.0 + (i - 35) * 8.5)
+                        rows.append(
+                            {
+                                "ts_ist": f"{cur.isoformat()}T15:30:00+05:30",
+                                "trade_date": cur.isoformat(),
+                                "open": px - 3.0,
+                                "high": px + 5.0,
+                                "low": px - 5.0,
+                                "close": px,
+                                "volume": 120000,
+                                "oi": 0,
+                            }
+                        )
+                        i += 1
+                    cur += timedelta(days=1)
+                return rows
+
+            today_d = datetime.now(tz=IST_TZ).date()
+            from_d = (today_d - timedelta(days=150)).isoformat()
+            to_d = today_d.isoformat()
+
+            for strat in ("ema_crossover", "rsi_mean_reversion", "supertrend_atr", "vcp_breakout"):
+                res = engine.run(
+                    symbol="RELIANCE",
+                    exchange="NSE",
+                    strategy=strat,
+                    timeframe="1day",
+                    from_date=from_d,
+                    to_date=to_d,
+                    initial_capital=500000.0,
+                    provider="upstox",
+                    fetcher=wave_fetcher,
+                )
+                self.assertTrue(res["ok"])
+                self.assertGreaterEqual(res["bars_evaluated"], 60)
+                self.assertGreaterEqual(len(res["equity_curve"]), 60)
+                self.assertGreaterEqual(res["max_drawdown_pct"], 0.0)
+                if strat in ("ema_crossover", "rsi_mean_reversion", "supertrend_atr"):
+                    self.assertGreaterEqual(res["total_trades"], 1)
+
+    def test_phase5_risk_limits_breach_triggers_kill_switch_and_audit(self) -> None:
+        from core.analytics import RiskLimitManager
+        from core.preflight import KillSwitchController
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            trail = AuditTrail(root / "audit_chain.db")
+            ks = KillSwitchController(state_file=root / "kill_switch.json", audit=trail)
+            risk_mgr = RiskLimitManager(
+                limits_file=root / "risk_limits.json",
+                audit=trail,
+                kill_switch=ks,
+            )
+
+            saved = risk_mgr.save_limits(
+                {
+                    "total_capital_inr": 500000.0,
+                    "max_capital_per_trade_pct": 10.0,
+                    "max_daily_loss_inr": 10000.0,
+                    "max_open_positions": 3,
+                    "max_gross_exposure_inr": 300000.0,
+                    "auto_engage_kill_switch": True,
+                }
+            )
+            self.assertEqual(saved["max_daily_loss_inr"], 10000.0)
+
+            # Evaluate a portfolio breaching daily loss + max positions + gross exposure
+            eval_res = risk_mgr.evaluate(
+                trading_broker="upstox",
+                funds={"available": 200000.0, "used": 300000.0},
+                positions=[
+                    {"symbol": "RELIANCE", "quantity": 50, "average_price": 2900.0, "last_price": 2800.0, "realized_pnl": 0.0, "unrealized_pnl": -5000.0},
+                    {"symbol": "TCS", "quantity": 30, "average_price": 4000.0, "last_price": 3800.0, "realized_pnl": 0.0, "unrealized_pnl": -6000.0},
+                    {"symbol": "INFY", "quantity": 40, "average_price": 1500.0, "last_price": 1480.0, "realized_pnl": 0.0, "unrealized_pnl": -800.0},
+                    {"symbol": "SBIN", "quantity": 60, "average_price": 800.0, "last_price": 790.0, "realized_pnl": 0.0, "unrealized_pnl": -600.0},
+                ],
+                orders=[],
+            )
+            self.assertEqual(eval_res["status"], "BREACHED")
+            self.assertTrue(eval_res["kill_switch_auto_triggered"])
+            self.assertTrue(ks.is_engaged())
+            rules = {b["rule"] for b in eval_res["breaches"]}
+            self.assertIn("max_daily_loss_inr", rules)
+            self.assertIn("max_open_positions", rules)
+            self.assertIn("max_gross_exposure_inr", rules)
+            self.assertTrue(trail.verify_chain()["valid"])
+
+    def test_phase5_http_analytics_routes_and_async_jobs(self) -> None:
+        import json as _json
+        import threading
+        import time as _time
+        from web.local_server import _AlgoDeskHTTPServer, _StdlibBrokerHandler
+
+        srv = _AlgoDeskHTTPServer(("127.0.0.1", 0), _StdlibBrokerHandler)
+        port = srv.server_address[1]
+        thread = threading.Thread(target=srv.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/analytics/meta", timeout=3) as r:
+                meta = _json.loads(r.read().decode("utf-8"))
+                self.assertEqual(r.status, 200)
+                self.assertIn("ema_crossover", meta["strategies"])
+
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/analytics/risk", timeout=3) as r:
+                risk = _json.loads(r.read().decode("utf-8"))
+                self.assertEqual(r.status, 200)
+                self.assertIn("limits", risk)
+                self.assertIn("telemetry", risk)
+
+            # Submit an async backtest job against fake seeded data in hub_service's ohlcv
+            with patch("core.analytics._load_candles_gap_only") as mock_loader:
+                today_d = datetime.now(tz=IST_TZ).date()
+                fake_rows = [
+                    {
+                        "ts_ist": f"{(today_d - timedelta(days=90 - i)).isoformat()}T15:30:00+05:30",
+                        "trade_date": (today_d - timedelta(days=90 - i)).isoformat(),
+                        "open": 100.0 + i,
+                        "high": 102.0 + i,
+                        "low": 99.0 + i,
+                        "close": 101.0 + i,
+                        "volume": 10000,
+                        "oi": 0,
+                        "source": "upstox",
+                    }
+                    for i in range(60)
+                ]
+                mock_loader.return_value = (
+                    fake_rows,
+                    {"symbol": "RELIANCE", "exchange": "NSE", "timeframe": "1day", "api_calls_made": 0, "existing_days_skipped": 60},
+                )
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/analytics/backtest",
+                    data=_json.dumps({"symbol": "RELIANCE", "strategy": "rsi_mean_reversion", "async_job": True}).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=4) as r:
+                    started = _json.loads(r.read().decode("utf-8"))
+                    self.assertTrue(started["async"])
+                    job_id = started["job"]["job_id"]
+
+                # Poll job until completion
+                final_job = None
+                for _ in range(30):
+                    with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/analytics/jobs/{job_id}", timeout=3) as jr:
+                        jb = _json.loads(jr.read().decode("utf-8"))["job"]
+                        if jb["status"] in {"COMPLETED", "FAILED"}:
+                            final_job = jb
+                            break
+                    _time.sleep(0.05)
+
+                self.assertIsNotNone(final_job)
+                self.assertEqual(final_job["status"], "COMPLETED")
+                self.assertEqual(final_job["result"]["symbol"], "RELIANCE")
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()

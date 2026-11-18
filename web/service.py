@@ -29,6 +29,15 @@ from broker.registry import BrokerRegistry, SelectionStore
 from broker.upstox.auth import auth_manager as upstox_auth_manager
 from broker.zerodha.auth import zerodha_auth_manager
 from config import IST_TZ, config
+from core.analytics import (
+    BACKTEST_STRATEGIES,
+    DEFAULT_SCREENER_WATCHLIST,
+    SCREENER_PRESETS,
+    analytics_job_runner,
+    backtest_engine,
+    market_screener,
+    risk_limit_manager,
+)
 from core.audit import audit_trail
 from core.feed_manager import feed_manager
 from core.historical import historical_data_manager
@@ -690,6 +699,130 @@ class BrokerHubService:
             "verification": audit_trail.verify_chain(),
             "events": audit_trail.list_events(limit=limit),
         }
+
+    # ── Phase 5: Screener, O(N) Backtester, Risk Console & Async Jobs ────
+
+    def get_analytics_metadata(self) -> Dict[str, Any]:
+        sel = self._store.load()
+        return {
+            "ok": True,
+            "selections": sel,
+            "presets": SCREENER_PRESETS,
+            "strategies": BACKTEST_STRATEGIES,
+            "default_watchlist": DEFAULT_SCREENER_WATCHLIST,
+        }
+
+    def run_screener(
+        self,
+        *,
+        symbols: Optional[List[str]] = None,
+        exchange: str = "NSE",
+        timeframe: str = "1day",
+        lookback_days: int = 120,
+        preset: str = "all",
+        provider: Optional[str] = None,
+        async_job: bool = False,
+    ) -> Dict[str, Any]:
+        sel = self._store.load()
+        eff_provider = (provider or sel.get("data_connection") or "yfinance").strip().lower()
+        clean_syms = [str(s).strip().upper() for s in (symbols or []) if str(s).strip()] or list(DEFAULT_SCREENER_WATCHLIST)
+        meta = {
+            "preset": preset,
+            "provider": eff_provider,
+            "exchange": exchange,
+            "timeframe": timeframe,
+            "symbols_count": len(clean_syms),
+        }
+
+        def _task(progress_cb):
+            return market_screener.scan(
+                symbols=clean_syms,
+                exchange=exchange,
+                timeframe=timeframe,
+                lookback_days=lookback_days,
+                preset=preset,
+                provider=eff_provider,
+                progress_cb=progress_cb,
+            )
+
+        if async_job:
+            job = analytics_job_runner.submit("screener", meta, _task)
+            return {"ok": True, "async": True, "job": job}
+
+        job = analytics_job_runner.run_sync("screener", meta, _task)
+        return {"ok": True, "async": False, "job": job, **(job["result"] or {})}
+
+    def run_backtest(
+        self,
+        *,
+        symbol: str,
+        exchange: str = "NSE",
+        strategy: str = "ema_crossover",
+        timeframe: str = "1day",
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None,
+        initial_capital: float = 500000.0,
+        slippage_bps: float = 5.0,
+        fee_bps: float = 5.0,
+        stop_loss_pct: float = 5.0,
+        take_profit_pct: float = 12.0,
+        provider: Optional[str] = None,
+        instrument_type: Optional[str] = None,
+        instrument_key: Optional[str] = None,
+        async_job: bool = False,
+    ) -> Dict[str, Any]:
+        sel = self._store.load()
+        eff_provider = (provider or sel.get("data_connection") or "yfinance").strip().lower()
+        meta = {
+            "symbol": (symbol or "").strip().upper(),
+            "exchange": exchange,
+            "strategy": strategy,
+            "timeframe": timeframe,
+            "provider": eff_provider,
+        }
+
+        def _task(progress_cb):
+            return backtest_engine.run(
+                symbol=symbol,
+                exchange=exchange,
+                strategy=strategy,
+                timeframe=timeframe,
+                from_date=from_date,
+                to_date=to_date,
+                initial_capital=initial_capital,
+                slippage_bps=slippage_bps,
+                fee_bps=fee_bps,
+                stop_loss_pct=stop_loss_pct,
+                take_profit_pct=take_profit_pct,
+                provider=eff_provider,
+                instrument_type=instrument_type,
+                instrument_key=instrument_key,
+                progress_cb=progress_cb,
+            )
+
+        if async_job:
+            job = analytics_job_runner.submit("backtest", meta, _task)
+            return {"ok": True, "async": True, "job": job}
+
+        job = analytics_job_runner.run_sync("backtest", meta, _task)
+        return {"ok": True, "async": False, "job": job, **(job["result"] or {})}
+
+    def get_analytics_job(self, job_id: str) -> Dict[str, Any]:
+        job = analytics_job_runner.get_job(job_id)
+        if not job:
+            raise ValueError(f"Job '{job_id}' not found.")
+        return {"ok": True, "job": job}
+
+    def list_analytics_jobs(self, limit: int = 15) -> Dict[str, Any]:
+        return {"ok": True, "jobs": analytics_job_runner.list_jobs(limit=limit)}
+
+    def get_risk_status(self) -> Dict[str, Any]:
+        sel = self._store.load()
+        return risk_limit_manager.evaluate(trading_broker=sel.get("trading_broker", "upstox"))
+
+    def update_risk_limits(self, updates: Dict[str, Any]) -> Dict[str, Any]:
+        risk_limit_manager.save_limits(updates, actor="operator")
+        return self.get_risk_status()
 
 
 hub_service = BrokerHubService()
