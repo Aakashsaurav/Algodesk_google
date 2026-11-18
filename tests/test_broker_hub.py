@@ -1199,6 +1199,79 @@ class TestBrokerHubArchitecture(unittest.TestCase):
         self.assertIn(("PUT", "https://api-hft.upstox.com/v3/order/modify"), order_calls)
         self.assertIn(("DELETE", "https://api-hft.upstox.com/v3/order/cancel?order_id=261118000012345"), order_calls)
 
+    def test_upstox_index_encoding_fallback_and_primary_failover_reason(self) -> None:
+        import io
+        import json as _json
+        from core.feed_manager import _fetch_live_quotes_upstox
+
+        seen_urls: list[str] = []
+
+        class _FakeJsonResp(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        def fake_urlopen(req, timeout=5):
+            url = req.full_url
+            seen_urls.append(url)
+            # Must encode "Nifty 50" with %20 instead of +
+            self.assertNotIn("Nifty+50", url)
+            if "/v3/market-quote/ohlc" in url:
+                # Simulate empty OHLC before market open -> falls back to /v3/market-quote/ltp
+                return _FakeJsonResp(_json.dumps({"status": "success", "data": {}}).encode("utf-8"))
+            if "/v3/market-quote/ltp" in url:
+                return _FakeJsonResp(
+                    _json.dumps(
+                        {
+                            "status": "success",
+                            "data": {
+                                "NSE_INDEX:Nifty 50": {
+                                    "last_price": 24150.25,
+                                    "instrument_token": "NSE_INDEX|Nifty 50",
+                                    "cp": 24100.0,
+                                    "volume": 0,
+                                }
+                            },
+                        }
+                    ).encode("utf-8")
+                )
+            raise AssertionError(f"Unexpected URL: {url}")
+
+        with (
+            patch("core.feed_manager.upstox_auth.get_valid_token", return_value="dummy-tok"),
+            patch("urllib.request.urlopen", side_effect=fake_urlopen),
+        ):
+            quotes = _fetch_live_quotes_upstox(["NIFTY"])
+
+        self.assertTrue(any("NSE_INDEX%7CNifty%2050" in u for u in seen_urls))
+        self.assertIn("NIFTY", quotes)
+        self.assertEqual(quotes["NIFTY"]["ltp"], 24150.25)
+        self.assertEqual(quotes["NIFTY"]["transport"], "v3_ltp")
+
+        # Verify poll_ticks keeps Upstox's actual error when Zerodha standby also fails
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trail = AuditTrail(Path(tmpdir) / "audit_chain.db")
+            mgr = HotStandbyFeedManager(
+                primary_id="upstox",
+                audit=trail,
+                fetchers={
+                    "upstox": lambda _s: (_ for _ in ()).throw(RuntimeError("Upstox HTTP 400: Invalid instrument_key")),
+                    "zerodha": lambda _s: (_ for _ in ()).throw(RuntimeError("No valid Zerodha Kite session token for the current trading day.")),
+                    "yfinance": lambda syms: {
+                        s: {"symbol": s, "ltp": 24100.0, "change_pct": 0.1, "source": "yfinance", "ts_ist": "2026-11-18T10:15:00+05:30"}
+                        for s in syms
+                    },
+                },
+                watchlist_file=Path(tmpdir) / "watchlist.json",
+            )
+            res = mgr.poll_ticks(["NIFTY"])
+            self.assertTrue(res["ok"])
+            self.assertEqual(res["active_feed"], "yfinance")
+            self.assertIn("Upstox HTTP 400: Invalid instrument_key", res["message"])
+            self.assertNotIn("No valid Zerodha Kite session token", res["message"])
+
 
 if __name__ == "__main__":
     unittest.main()

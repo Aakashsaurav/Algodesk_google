@@ -426,6 +426,8 @@ class BrokerHubService:
                 session.message = snap.message
                 session.broker_snapshot = snap_dict
                 self._stop_capture_session_locked(bid)
+        if snap.is_connected:
+            feed_manager.clear_primary_error(bid)
         return {"ok": snap.is_connected, "broker": snap_dict}
 
     def disconnect_broker(self, broker_id: str) -> Dict[str, Any]:

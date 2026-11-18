@@ -24,13 +24,14 @@ import logging
 import queue
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 from broker.registry import BrokerRegistry
 from broker.upstox.auth import auth_manager as upstox_auth
@@ -247,9 +248,31 @@ def _fetch_live_quotes_yfinance(symbols: List[Any], timeout: float = 4.0) -> Dic
     return quotes
 
 
+def _upstox_get_json(url: str, headers: Dict[str, str], timeout: float) -> Dict[str, Any]:
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raw_body = ""
+        try:
+            raw_body = exc.read().decode("utf-8", errors="ignore")
+            err_json = json.loads(raw_body)
+            errors = err_json.get("errors") or []
+            msg = (errors[0].get("message") if errors and isinstance(errors[0], dict) else None) or err_json.get("message")
+            if msg:
+                raise RuntimeError(f"Upstox HTTP {exc.code}: {msg}") from exc
+        except RuntimeError:
+            raise
+        except Exception:
+            pass
+        raise RuntimeError(f"Upstox HTTP {exc.code}: {raw_body[:160] or exc.reason}") from exc
+
+
 def _fetch_live_quotes_upstox(symbols: List[Any], timeout: float = 4.5) -> Dict[str, Dict[str, Any]]:
     token = upstox_auth.get_valid_token()
     key_map: Dict[str, Dict[str, str]] = {}
+    missing_indices: List[Any] = []
     for raw_item in symbols[:40]:
         if isinstance(raw_item, dict):
             sym = str(raw_item.get("symbol") or "").strip().upper()
@@ -267,18 +290,38 @@ def _fetch_live_quotes_upstox(symbols: List[Any], timeout: float = 4.5) -> Dict[
         )
         if resolved:
             key_map[resolved] = {"symbol": sym, "exchange": exch, "instrument_type": itype}
+        else:
+            missing_indices.append(raw_item)
+
+    if not key_map and missing_indices:
+        sync_meta = instrument_index.stats().get("sync_meta", {})
+        if "upstox" not in sync_meta:
+            try:
+                instrument_index.sync_upstox_master()
+                for raw_item in missing_indices:
+                    sym = (raw_item.get("symbol") if isinstance(raw_item, dict) else str(raw_item)).strip().upper()
+                    exch = (raw_item.get("exchange") if isinstance(raw_item, dict) else "NSE").strip().upper()
+                    itype = (raw_item.get("instrument_type") if isinstance(raw_item, dict) else "").strip().upper()
+                    resolved = instrument_index.resolve_key(sym, broker_id="upstox", exchange=exch, instrument_type=itype or None)
+                    if resolved:
+                        key_map[resolved] = {"symbol": sym, "exchange": exch, "instrument_type": itype}
+            except Exception:
+                pass
+
     if not key_map:
         raise ValueError("No Upstox instrument keys resolved for subscribed symbols.")
 
-    qs_ohlc = urllib.parse.urlencode({"instrument_key": ",".join(key_map.keys()), "interval": "1d"})
-    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json", "Content-Type": "application/json"}
-    url = f"{config.UPSTOX_BASE_URL}/v3/market-quote/ohlc?{qs_ohlc}"
-    req = urllib.request.Request(url, headers=headers, method="GET")
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        payload = json.loads(resp.read().decode("utf-8"))
-    data = payload.get("data") or {}
-    now_ist = datetime.now(tz=IST_TZ).isoformat(timespec="seconds")
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "User-Agent": "AlgoDesk/5.0",
+    }
 
+    def _encode_keys(keys: Iterable[str]) -> str:
+        # Use quote (not quote_plus) so spaces like "NSE_INDEX|Nifty 50" become %20, matching Upstox docs
+        return ",".join(urllib.parse.quote(k, safe="") for k in keys)
+
+    upper_key_map = {k.upper(): meta for k, meta in key_map.items()}
     sym_to_meta = {meta["symbol"]: meta for meta in key_map.values()}
     has_fno = any(
         meta.get("exchange") in {"NFO", "BFO", "MCX", "NSE_FO", "BSE_FO", "MCX_FO"}
@@ -286,28 +329,97 @@ def _fetch_live_quotes_upstox(symbols: List[Any], timeout: float = 4.5) -> Dict[
         for meta in key_map.values()
     )
 
+    def _resolve_meta(raw_k: str, item: Dict[str, Any]) -> Dict[str, str]:
+        itoken = str(item.get("instrument_token") or "").strip()
+        if itoken in key_map:
+            return key_map[itoken]
+        if itoken.upper() in upper_key_map:
+            return upper_key_map[itoken.upper()]
+        colon_as_pipe = str(raw_k).replace(":", "|").strip()
+        if colon_as_pipe in key_map:
+            return key_map[colon_as_pipe]
+        if colon_as_pipe.upper() in upper_key_map:
+            return upper_key_map[colon_as_pipe.upper()]
+        key_suffix = str(raw_k).split(":", 1)[-1].strip().upper()
+        return sym_to_meta.get(key_suffix) or {}
+
+    def _query_batch(keys: List[str]) -> tuple[Dict[str, Any], str]:
+        enc = _encode_keys(keys)
+        last_batch_err: Optional[Exception] = None
+        # 1) Primary: Upstox V3 OHLC Quotes
+        try:
+            payload = _upstox_get_json(f"{config.UPSTOX_BASE_URL}/v3/market-quote/ohlc?instrument_key={enc}&interval=1d", headers, timeout)
+            data = payload.get("data") or {}
+            if data:
+                return data, "v3_ohlc"
+        except Exception as exc:
+            last_batch_err = exc
+        # 2) Fallback: Upstox V3 LTP Quotes
+        try:
+            payload = _upstox_get_json(f"{config.UPSTOX_BASE_URL}/v3/market-quote/ltp?instrument_key={enc}", headers, timeout)
+            data = payload.get("data") or {}
+            if data:
+                return data, "v3_ltp"
+        except Exception as exc:
+            last_batch_err = exc
+        # 3) Fallback: Upstox Full Market Quotes
+        try:
+            payload = _upstox_get_json(f"{config.UPSTOX_BASE_URL}/v2/market-quote/quotes?instrument_key={enc}", headers, timeout)
+            data = payload.get("data") or {}
+            if data:
+                return data, "v2_full"
+        except Exception as exc:
+            last_batch_err = exc
+
+        if last_batch_err is not None:
+            raise last_batch_err
+        return {}, "v3_ohlc"
+
+    all_keys = list(key_map.keys())
+    transport_used = "v3_ohlc"
+    data: Dict[str, Any] = {}
+    try:
+        data, transport_used = _query_batch(all_keys)
+    except Exception as batch_exc:
+        if len(all_keys) == 1:
+            raise
+        # One bad/expired instrument key can reject a multi-key batch; probe individually
+        merged_data: Dict[str, Any] = {}
+        first_err: Exception = batch_exc
+        for single_k in all_keys:
+            try:
+                part, part_transport = _query_batch([single_k])
+                if part:
+                    merged_data.update(part)
+                    transport_used = part_transport
+            except Exception as single_exc:
+                first_err = single_exc
+        if not merged_data:
+            raise first_err
+        data = merged_data
+
+    now_ist = datetime.now(tz=IST_TZ).isoformat(timespec="seconds")
     quotes: Dict[str, Dict[str, Any]] = {}
     missing_prev_keys: List[str] = []
 
     for raw_key, item in data.items():
         if not isinstance(item, dict):
             continue
-        itoken = str(item.get("instrument_token") or "")
+        meta = _resolve_meta(raw_key, item)
         key_suffix = str(raw_key).split(":", 1)[-1].strip().upper()
-        meta = key_map.get(itoken) or sym_to_meta.get(key_suffix) or {}
         sym = meta.get("symbol") or key_suffix
         if not sym:
             continue
 
+        itoken = str(item.get("instrument_token") or "")
         ltp = round(float(item.get("last_price") or 0.0), 2)
         live_ohlc = item.get("live_ohlc") or {}
         prev_ohlc = item.get("prev_ohlc") or {}
-        # Support both V3 (live_ohlc/prev_ohlc) and legacy flat ohlc dicts defensively
         legacy_ohlc = item.get("ohlc") or {}
         prev_close = prev_ohlc.get("close") if prev_ohlc.get("close") is not None else legacy_ohlc.get("close")
         if prev_close is None and item.get("cp") is not None:
             prev_close = item.get("cp")
-        if prev_close is None and itoken:
+        if prev_close is None and itoken and transport_used == "v3_ohlc":
             missing_prev_keys.append(itoken)
 
         o_val = live_ohlc.get("open") if live_ohlc.get("open") is not None else legacy_ohlc.get("open")
@@ -330,6 +442,12 @@ def _fetch_live_quotes_upstox(symbols: List[Any], timeout: float = 4.5) -> Dict[
             except Exception:
                 ts_str = now_ist
 
+        depth = item.get("depth") or {}
+        buys = depth.get("buy") or []
+        sells = depth.get("sell") or []
+        bid_val = round(float(buys[0]["price"]), 2) if buys and buys[0].get("price") else None
+        ask_val = round(float(sells[0]["price"]), 2) if sells and sells[0].get("price") else None
+
         quotes[sym] = {
             "symbol": sym,
             "exchange": meta.get("exchange", "NSE"),
@@ -343,10 +461,10 @@ def _fetch_live_quotes_upstox(symbols: List[Any], timeout: float = 4.5) -> Dict[
             "change_pct": chg_pct,
             "volume": int(vol_val or 0),
             "oi": int(item.get("oi") or 0),
-            "bid": None,
-            "ask": None,
+            "bid": bid_val,
+            "ask": ask_val,
             "source": "upstox",
-            "transport": "v3_ohlc",
+            "transport": transport_used,
             "note": "",
             "ts_ist": ts_str,
         }
@@ -354,16 +472,12 @@ def _fetch_live_quotes_upstox(symbols: List[Any], timeout: float = 4.5) -> Dict[
     # If any instrument lacked prev_ohlc, pull cp/ltp via Upstox V3 LTP endpoint
     if missing_prev_keys:
         try:
-            qs_ltp = urllib.parse.urlencode({"instrument_key": ",".join(missing_prev_keys)})
-            ltp_url = f"{config.UPSTOX_BASE_URL}/v3/market-quote/ltp?{qs_ltp}"
-            ltp_req = urllib.request.Request(ltp_url, headers=headers, method="GET")
-            with urllib.request.urlopen(ltp_req, timeout=min(timeout, 3.0)) as resp:
-                ltp_data = (json.loads(resp.read().decode("utf-8"))).get("data") or {}
+            ltp_url = f"{config.UPSTOX_BASE_URL}/v3/market-quote/ltp?instrument_key={_encode_keys(missing_prev_keys)}"
+            ltp_data = _upstox_get_json(ltp_url, headers, min(timeout, 3.0)).get("data") or {}
             for raw_k, item in ltp_data.items():
                 if not isinstance(item, dict):
                     continue
-                itoken = str(item.get("instrument_token") or "")
-                meta = key_map.get(itoken) or sym_to_meta.get(str(raw_k).split(":", 1)[-1].strip().upper()) or {}
+                meta = _resolve_meta(raw_k, item)
                 sym = meta.get("symbol")
                 if not sym or sym not in quotes:
                     continue
@@ -379,7 +493,7 @@ def _fetch_live_quotes_upstox(symbols: List[Any], timeout: float = 4.5) -> Dict[
             pass
 
     # For F&O contracts, optionally enrich OI & top-of-book bid/ask via Full Market Quote (depth/OI)
-    if has_fno and quotes:
+    if has_fno and quotes and transport_used != "v2_full":
         try:
             fno_keys = [
                 k for k, m in key_map.items()
@@ -387,16 +501,12 @@ def _fetch_live_quotes_upstox(symbols: List[Any], timeout: float = 4.5) -> Dict[
                 or m.get("instrument_type") in {"FUT", "CE", "PE"}
             ]
             if fno_keys:
-                qs_full = urllib.parse.urlencode({"instrument_key": ",".join(fno_keys)})
-                full_url = f"{config.UPSTOX_BASE_URL}/v2/market-quote/quotes?{qs_full}"
-                full_req = urllib.request.Request(full_url, headers=headers, method="GET")
-                with urllib.request.urlopen(full_req, timeout=min(timeout, 3.0)) as resp:
-                    full_data = (json.loads(resp.read().decode("utf-8"))).get("data") or {}
+                full_url = f"{config.UPSTOX_BASE_URL}/v2/market-quote/quotes?instrument_key={_encode_keys(fno_keys)}"
+                full_data = _upstox_get_json(full_url, headers, min(timeout, 3.0)).get("data") or {}
                 for raw_k, item in full_data.items():
                     if not isinstance(item, dict):
                         continue
-                    itoken = str(item.get("instrument_token") or "")
-                    meta = key_map.get(itoken) or sym_to_meta.get(str(raw_k).split(":", 1)[-1].strip().upper()) or {}
+                    meta = _resolve_meta(raw_k, item)
                     sym = meta.get("symbol")
                     if not sym or sym not in quotes:
                         continue
@@ -624,6 +734,16 @@ class HotStandbyFeedManager:
                     self._active_feed_id = clean
                 self._rebuild_slots(clean)
 
+    def clear_primary_error(self, broker_id: Optional[str] = None) -> None:
+        """Reset cached primary error after successful broker authentication/reconnect."""
+        clean = (broker_id or self._primary_id).strip().lower()
+        with self._lock:
+            slot = self._slots.get(clean)
+            if slot:
+                slot.last_error = ""
+            if clean == self._primary_id:
+                self._forced_failover = False
+
     def _mark_active(self, feed_id: str) -> None:
         self._active_feed_id = feed_id
         for fid, slot in self._slots.items():
@@ -815,6 +935,7 @@ class HotStandbyFeedManager:
         prev_active = self._active_feed_id
         selected_feed: Optional[str] = None
         last_err = ""
+        primary_err = self._last_failover_reason if self._forced_failover else ""
 
         for fid in candidates:
             fetcher = self._fetchers.get(fid)
@@ -895,9 +1016,11 @@ class HotStandbyFeedManager:
                         del self._tick_events[60:]
 
                     self._mark_active(fid)
-                    if fid != prev_active:
+                    if fid == self._primary_id:
+                        self._last_failover_reason = ""
+                    elif fid != prev_active:
                         self._failover_count += 1
-                        self._last_failover_reason = last_err or f"Switched active feed {prev_active} -> {fid}"
+                        self._last_failover_reason = primary_err or last_err or f"Switched active feed {prev_active} -> {fid}"
                         self._audit.log_failover(
                             from_feed=prev_active,
                             to_feed=fid,
@@ -907,6 +1030,8 @@ class HotStandbyFeedManager:
                 break
             except Exception as exc:
                 last_err = str(exc)
+                if fid == self._primary_id or not primary_err:
+                    primary_err = last_err
                 with self._lock:
                     slot = self._slots[fid]
                     slot.error_count += 1
@@ -916,16 +1041,18 @@ class HotStandbyFeedManager:
         if selected_feed is None:
             res = {
                 "ok": False,
-                "message": f"All configured feeds failed ({last_err}).",
+                "message": f"All configured feeds failed ({primary_err or last_err}).",
                 **self.status(),
             }
             self._broadcast(res)
             return res
 
+        primary_slot = self._slots.get(self._primary_id)
+        failover_detail = primary_err or (primary_slot.last_error if primary_slot else "") or last_err
         res = {
             "ok": True,
             "message": (
-                f"Failover active on {selected_feed.upper()} (primary {self._primary_id.upper()} unavailable: {last_err})."
+                f"Failover active on {selected_feed.upper()} (primary {self._primary_id.upper()} unavailable: {failover_detail})."
                 if selected_feed != self._primary_id
                 else f"Live quotes updated from primary feed ({selected_feed.upper()})."
             ),
