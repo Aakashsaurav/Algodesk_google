@@ -769,6 +769,7 @@
         <div class="p4-panel-head">
           <div style="font-size:14px; font-weight:600;">Hot-Standby Market Data Failover Chain</div>
           <div class="p4-actions">
+            <a href="/terminal" class="btn" style="min-height:36px; padding:6px 14px; font-size:12px; border-color:rgba(56,189,248,0.6); color:var(--accent);">Open Live Terminal</a>
             <button id="p4PollBtn" class="btn btn-primary" type="button" style="min-height:36px; padding:6px 14px; font-size:12px;">Poll Live Quotes</button>
             <button id="p4FailoverBtn" class="btn" type="button" style="min-height:36px; padding:6px 14px; font-size:12px;">Simulate Failover</button>
             <button id="p4RecoverBtn" class="btn" type="button" style="min-height:36px; padding:6px 14px; font-size:12px;">Restore Primary</button>
@@ -1577,20 +1578,44 @@
     }
     syncCsvHref();
 
+    function _ensureSelectValue(selectEl, value) {
+      if (!value) {
+        selectEl.value = '';
+        return;
+      }
+      const strVal = String(value);
+      const exists = Array.from(selectEl.options).some((o) => o.value === strVal);
+      if (!exists) {
+        const opt = document.createElement('option');
+        opt.value = strVal;
+        opt.textContent = strVal;
+        selectEl.appendChild(opt);
+      }
+      selectEl.value = strVal;
+    }
+
     function selectInstrumentItem(item) {
       p3.sym.value = item.trading_symbol;
       p3.exch.value = item.exchange;
       p3.selectedInstrumentKey = item.instrument_key || '';
       p3.selectedInstrumentType = item.instrument_type || '';
+      const uType = (item.instrument_type || '').toUpperCase();
       const isFno = ['NFO', 'BFO', 'MCX', 'NSE_FO', 'BSE_FO', 'MCX_FO'].includes(item.exchange)
-        || ['FUT', 'CE', 'PE'].includes((item.instrument_type || '').toUpperCase());
+        || ['FUT', 'CE', 'PE'].includes(uType)
+        || uType.startsWith('FUT')
+        || uType.startsWith('OPT');
       if (isFno) {
         setFnoOpen(true);
-        p3.fnoExch.value = item.exchange;
-        if (item.asset_symbol) p3.fnoUl.value = item.asset_symbol;
-        if (['FUT', 'CE', 'PE'].includes((item.instrument_type || '').toUpperCase())) {
-          p3.fnoType.value = item.instrument_type.toUpperCase();
+        p3.fnoExch.value = ['NFO', 'BFO', 'MCX'].includes(item.exchange) ? item.exchange : 'NFO';
+        if (item.asset_symbol) p3.fnoUl.value = item.asset_symbol.toUpperCase();
+        p3.fnoType.value = ['FUT', 'CE', 'PE'].includes(uType) ? uType : 'FO';
+        _ensureSelectValue(p3.fnoExp, item.expiry || '');
+        if (p3.fnoType.value === 'FUT') {
+          p3.fnoStrike.value = '';
+        } else {
+          _ensureSelectValue(p3.fnoStrike, item.strike && item.strike > 0 ? String(item.strike) : '');
         }
+        loadFnoContracts(false);
       }
       syncCsvHref();
       loadRecords();
@@ -1602,7 +1627,7 @@
       p3.fnoToggleBtn.textContent = p3.fnoOpen ? 'Hide F&O Finder' : 'Open F&O Contract Finder';
     }
 
-    async function loadFnoContracts() {
+    async function loadFnoContracts(syncDownloadTarget = false) {
       p3.fnoRefreshBtn.disabled = true;
       try {
         const params = new URLSearchParams({
@@ -1645,11 +1670,36 @@
             opt.textContent = String(stk);
             p3.fnoStrike.appendChild(opt);
           });
-          if (prevStrike) p3.fnoStrike.value = prevStrike;
+          if (prevStrike && (body.strikes || []).map(String).includes(prevStrike)) {
+            p3.fnoStrike.value = prevStrike;
+          }
+        }
+
+        const list = body.contracts || [];
+        if (syncDownloadTarget) {
+          const dataConn = (state.overview && state.overview.selections && state.overview.selections.data_connection) || '';
+          const preferredBroker = p3.prov.value === 'auto' ? dataConn : p3.prov.value;
+          const exactType = ['FUT', 'CE', 'PE'].includes(p3.fnoType.value.toUpperCase()) ? p3.fnoType.value.toUpperCase() : '';
+          const match =
+            list.find((c) => c.broker_id === preferredBroker && (!exactType || c.instrument_type.toUpperCase() === exactType) && (!p3.fnoExp.value || c.expiry === p3.fnoExp.value) && (!p3.fnoStrike.value || String(c.strike || '') === p3.fnoStrike.value))
+            || list.find((c) => (!exactType || c.instrument_type.toUpperCase() === exactType) && (!p3.fnoExp.value || c.expiry === p3.fnoExp.value) && (!p3.fnoStrike.value || String(c.strike || '') === p3.fnoStrike.value))
+            || list.find((c) => c.broker_id === preferredBroker)
+            || list[0];
+
+          if (match) {
+            p3.sym.value = match.trading_symbol;
+            p3.exch.value = match.exchange || p3.fnoExch.value || 'NFO';
+            p3.selectedInstrumentType = match.instrument_type || exactType;
+            p3.selectedInstrumentKey = match.instrument_key || '';
+          } else {
+            p3.exch.value = p3.fnoExch.value || 'NFO';
+            p3.selectedInstrumentType = exactType;
+            p3.selectedInstrumentKey = '';
+          }
+          syncCsvHref();
         }
 
         p3.fnoContractsRow.innerHTML = '';
-        const list = body.contracts || [];
         if (list.length === 0) {
           p3.fnoMetaLine.textContent = `No ${p3.fnoExch.value} ${p3.fnoType.value} contracts found in SQLite for this filter — click Sync Upstox Master or Sync Zerodha Master above.`;
           return;
@@ -1775,7 +1825,29 @@
 
     function renderRecordsPayload(payload) {
       syncCsvHref();
-      p3.metaLine.textContent = payload ? `Showing ${payload.returned_rows} of ${payload.total_rows} stored rows` : '';
+      p3.metaLine.innerHTML = '';
+      if (payload) {
+        p3.metaLine.textContent = `Showing ${payload.returned_rows} of ${payload.total_rows} stored rows`;
+        if (payload.is_truncated) {
+          const noteSpan = document.createElement('span');
+          noteSpan.textContent = ' (Snapshot sample — ';
+          const btn = document.createElement('button');
+          btn.type = 'button';
+          btn.textContent = `View all ${payload.total_rows} rows`;
+          btn.style.cssText = 'background:transparent;border:0;padding:0;color:var(--accent);font-weight:600;cursor:pointer;text-decoration:underline;font-family:var(--font-sans);font-size:12px;';
+          btn.addEventListener('click', () => {
+            p3.viewMode = 'full';
+            p3.fullBtn.classList.add('active');
+            p3.snapBtn.classList.remove('active');
+            loadRecords();
+          });
+          const endSpan = document.createElement('span');
+          endSpan.textContent = ')';
+          p3.metaLine.appendChild(noteSpan);
+          p3.metaLine.appendChild(btn);
+          p3.metaLine.appendChild(endSpan);
+        }
+      }
       p3.tableContainer.innerHTML = '';
       if (!payload || !payload.rows || payload.rows.length === 0) {
         p3.summaryStrip.style.display = 'none';
@@ -1882,7 +1954,10 @@
       if (['FO', 'FUT', 'OPT', 'CE', 'PE'].includes(val)) {
         setFnoOpen(true);
         p3.fnoType.value = val === 'OPT' ? 'CE' : val;
-        loadFnoContracts();
+        if (!p3.fnoUl.value.trim() && p3.instrInput.value.trim()) {
+          p3.fnoUl.value = p3.instrInput.value.trim().split(/\s+/)[0].toUpperCase();
+        }
+        loadFnoContracts(true);
       }
     });
     p3.fnoToggleBtn.addEventListener('click', () => {
@@ -1890,7 +1965,7 @@
       setFnoOpen(next);
       if (next) {
         if (['NFO', 'BFO', 'MCX'].includes(p3.exch.value)) p3.fnoExch.value = p3.exch.value;
-        loadFnoContracts();
+        loadFnoContracts(false);
       }
     });
     p3.fnoExch.addEventListener('change', () => {
@@ -1898,23 +1973,23 @@
       p3.fnoExp.value = '';
       p3.fnoStrike.value = '';
       syncContractHint();
-      loadFnoContracts();
+      loadFnoContracts(true);
     });
     p3.fnoUl.addEventListener('input', () => {
       p3.fnoExp.value = '';
       p3.fnoStrike.value = '';
-      loadFnoContracts();
+      loadFnoContracts(true);
     });
     p3.fnoType.addEventListener('change', () => {
       if (p3.fnoType.value === 'FUT') p3.fnoStrike.value = '';
-      loadFnoContracts();
+      loadFnoContracts(true);
     });
     p3.fnoExp.addEventListener('change', () => {
       p3.fnoStrike.value = '';
-      loadFnoContracts();
+      loadFnoContracts(true);
     });
-    p3.fnoStrike.addEventListener('change', () => loadFnoContracts());
-    p3.fnoRefreshBtn.addEventListener('click', () => loadFnoContracts());
+    p3.fnoStrike.addEventListener('change', () => loadFnoContracts(true));
+    p3.fnoRefreshBtn.addEventListener('click', () => loadFnoContracts(true));
     p3.sym.addEventListener('input', () => {
       p3.selectedInstrumentKey = '';
       p3.selectedInstrumentType = '';
@@ -1925,7 +2000,9 @@
       if (['NFO', 'BFO', 'MCX'].includes(p3.exch.value)) {
         setFnoOpen(true);
         p3.fnoExch.value = p3.exch.value;
-        loadFnoContracts();
+        p3.fnoExp.value = '';
+        p3.fnoStrike.value = '';
+        loadFnoContracts(true);
       }
       syncContractHint();
     });

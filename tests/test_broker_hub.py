@@ -846,6 +846,246 @@ class TestBrokerHubArchitecture(unittest.TestCase):
             srv_sock.close()
             cli_sock.close()
 
+    def test_fno_active_expiry_filter_large_strike_chain_and_prune_on_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            idx = InstrumentIndex(Path(tmpdir) / "instruments.db")
+            today_d = datetime.now(tz=IST_TZ).date()
+            expired_str = (today_d - timedelta(days=30)).isoformat()
+            upcoming_str = (today_d + timedelta(days=10)).isoformat()
+
+            # Insert 1 expired contract and 150 active NIFTY CE strikes (including 25000)
+            records = [
+                InstrumentRecord(
+                    broker_id="upstox",
+                    exchange="NFO",
+                    segment="NSE_FO",
+                    trading_symbol="NIFTYOLD21000CE",
+                    asset_symbol="NIFTY",
+                    name="NIFTY OLD CE",
+                    instrument_type="CE",
+                    instrument_key="NSE_FO|OLD_01",
+                    expiry=expired_str,
+                    strike=21000.0,
+                    lot_size=75,
+                )
+            ]
+            for i in range(150):
+                strike_val = 20000.0 + i * 50.0  # spans 20000..27450, includes 25000.0 (index 100)
+                records.append(
+                    InstrumentRecord(
+                        broker_id="upstox",
+                        exchange="NFO",
+                        segment="NSE_FO",
+                        trading_symbol=f"NIFTYNEXT{int(strike_val)}CE",
+                        asset_symbol="NIFTY",
+                        name=f"NIFTY {int(strike_val)} CE",
+                        instrument_type="CE",
+                        instrument_key=f"NSE_FO|NEW_{i}",
+                        expiry=upcoming_str,
+                        strike=strike_val,
+                        lot_size=75,
+                    )
+                )
+            idx.upsert_records("upstox", records)
+
+            bundle = idx.list_fno_contracts(underlying="NIFTY", exchange="NFO", contract_type="OPT")
+            self.assertNotIn(expired_str, bundle["expiries"])
+            self.assertIn(upcoming_str, bundle["expiries"])
+            self.assertGreaterEqual(len(bundle["strikes"]), 150)
+            self.assertIn(25000.0, bundle["strikes"])
+
+            # Explicit strike=25000 finds exact active contract
+            exact_25k = idx.list_fno_contracts(
+                underlying="NIFTY",
+                exchange="NFO",
+                contract_type="CE",
+                expiry=upcoming_str,
+                strike=25000.0,
+            )
+            self.assertEqual(exact_25k["contracts"][0]["trading_symbol"], "NIFTYNEXT25000CE")
+
+            # Master sync prunes stale expired F&O rows before loading fresh contracts
+            import gzip
+            import io
+            import json as _json
+
+            gz_fresh = gzip.compress(
+                _json.dumps(
+                    [
+                        {
+                            "segment": "NSE_FO",
+                            "exchange": "NSE",
+                            "trading_symbol": "NIFTYFRESH25000CE",
+                            "underlying_symbol": "NIFTY",
+                            "name": "NIFTY 25000 CE",
+                            "instrument_type": "CE",
+                            "instrument_key": "NSE_FO|FRESH_25000",
+                            "expiry": upcoming_str,
+                            "strike_price": 25000,
+                            "lot_size": 75,
+                            "tick_size": 0.05,
+                        }
+                    ]
+                ).encode("utf-8")
+            )
+
+            class _FakeResp(io.BytesIO):
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    return False
+
+            with patch("urllib.request.urlopen", return_value=_FakeResp(gz_fresh)):
+                idx.sync_upstox_master()
+
+            after_sync = idx.search("NIFTYOLD21000CE", broker_id="upstox", exchange="NFO")
+            self.assertEqual(after_sync, [])
+
+    def test_historical_today_not_frozen_as_holiday_and_upstox_intraday_merge(self) -> None:
+        import io
+        import json as _json
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mgr = HistoricalDataManager(Path(tmpdir) / "ohlcv.db")
+            today_d = datetime.now(tz=IST_TZ).date()
+            past_d = today_d - timedelta(days=5)
+            while past_d.weekday() >= 5:
+                past_d -= timedelta(days=1)
+
+            calls: list[tuple[date, date]] = []
+
+            def fetcher_empty_today(sym: str, exch: str, tf: str, c_start: date, c_end: date):
+                calls.append((c_start, c_end))
+                return [
+                    {
+                        "ts_ist": f"{past_d.isoformat()}T15:00:00+05:30",
+                        "trade_date": past_d.isoformat(),
+                        "open": 100.0,
+                        "high": 105.0,
+                        "low": 99.0,
+                        "close": 104.0,
+                        "volume": 5000,
+                        "oi": 120000,
+                    }
+                ]
+
+            mgr.download(
+                symbol="NIFTYNEXT25000CE",
+                exchange="NFO",
+                timeframe="1day",
+                from_date=past_d.isoformat(),
+                to_date=today_d.isoformat(),
+                provider="upstox",
+                instrument_type="CE",
+                instrument_key="NSE_FO|NEW_100",
+                fetcher=fetcher_empty_today,
+            )
+
+            # Second download up to today_d must still re-check recent trailing day instead of freezing as holiday
+            calls.clear()
+            mgr.download(
+                symbol="NIFTYNEXT25000CE",
+                exchange="NFO",
+                timeframe="1day",
+                from_date=past_d.isoformat(),
+                to_date=today_d.isoformat(),
+                provider="upstox",
+                instrument_type="CE",
+                instrument_key="NSE_FO|NEW_100",
+                fetcher=fetcher_empty_today,
+            )
+            if today_d.weekday() < 5:
+                self.assertGreaterEqual(len(calls), 1)
+                self.assertEqual(calls[-1][1], today_d)
+
+            # Verify _fetch_upstox_chunk queries & merges /v2/historical-candle/intraday when chunk_end >= today_d
+            requested_urls: list[str] = []
+
+            class _FakeJsonResp(io.BytesIO):
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    return False
+
+            def fake_urlopen(req, timeout=12):
+                url = req.full_url
+                requested_urls.append(url)
+                if "/historical-candle/intraday/" in url:
+                    payload = {
+                        "status": "success",
+                        "data": {
+                            "candles": [
+                                [f"{today_d.isoformat()}T10:00:00+05:30", 110.0, 115.0, 108.0, 114.0, 3000, 150000]
+                            ]
+                        },
+                    }
+                else:
+                    payload = {
+                        "status": "success",
+                        "data": {
+                            "candles": [
+                                [f"{past_d.isoformat()}T15:00:00+05:30", 100.0, 105.0, 99.0, 104.0, 5000, 120000]
+                            ]
+                        },
+                    }
+                return _FakeJsonResp(_json.dumps(payload).encode("utf-8"))
+
+            with patch("urllib.request.urlopen", side_effect=fake_urlopen):
+                merged = mgr._fetch_upstox_chunk(
+                    "NIFTYNEXT25000CE",
+                    "NFO",
+                    "30minute",
+                    past_d,
+                    today_d,
+                    instrument_type="CE",
+                    instrument_key="NSE_FO|NEW_100",
+                )
+
+            self.assertTrue(any("/historical-candle/intraday/" in u for u in requested_urls))
+            dates_returned = [r["trade_date"] for r in merged]
+            self.assertIn(past_d.isoformat(), dates_returned)
+            self.assertIn(today_d.isoformat(), dates_returned)
+            self.assertEqual(merged, sorted(merged, key=lambda r: r["ts_ist"]))
+
+    def test_live_terminal_routes_and_health_phase5(self) -> None:
+        import json as _json
+        import threading
+        from web.local_server import _AlgoDeskHTTPServer, _StdlibBrokerHandler
+
+        srv = _AlgoDeskHTTPServer(("127.0.0.1", 0), _StdlibBrokerHandler)
+        port = srv.server_address[1]
+        thread = threading.Thread(target=srv.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health", timeout=3) as r:
+                health = _json.loads(r.read().decode("utf-8"))
+                self.assertEqual(r.status, 200)
+                self.assertTrue(health["live_terminal"])
+                self.assertGreaterEqual(health["phase"], 5)
+
+            for term_path in ("/terminal", "/terminal/"):
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}{term_path}", timeout=3) as r:
+                    html_body = r.read().decode("utf-8")
+                    self.assertEqual(r.status, 200)
+                    self.assertIn("Live WebSocket Terminal", html_body)
+
+            for poll_path in ("/api/live/feeds/poll", "/api/live/poll"):
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}{poll_path}",
+                    data=b"{}",
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    payload = _json.loads(r.read().decode("utf-8"))
+                    self.assertEqual(r.status, 200)
+                    self.assertIn("active_feed", payload)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -82,11 +82,11 @@ async function waitForPythonHub(retries = 25): Promise<boolean> {
         signal: AbortSignal.timeout(400),
       });
       if (res.ok) {
-        const body = (await res.json().catch(() => null)) as { phase?: number } | null;
-        if (Number(body?.phase ?? 0) >= 4) {
+        const body = (await res.json().catch(() => null)) as { phase?: number; live_terminal?: boolean } | null;
+        if (Number(body?.phase ?? 0) >= 5 && body?.live_terminal === true) {
           return true;
         }
-        // A stale pre-Phase 4 process is bound to this port; move cleanly to the next port.
+        // A stale pre-Live-Terminal process is bound to this port; move cleanly to the next port.
         activePythonPort += 1;
         if (pythonProc) {
           try {

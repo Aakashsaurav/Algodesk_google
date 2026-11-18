@@ -307,18 +307,23 @@ class InstrumentIndex:
                 )
                 params.extend([contains, contains, contains, contains, contains, contains])
 
+        today_str = datetime.now(tz=IST_TZ).date().isoformat()
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
         if clean_q:
             order_sql = (
                 "ORDER BY CASE WHEN UPPER(trading_symbol) = ? THEN 0 "
                 "WHEN UPPER(asset_symbol) = ? THEN 1 "
                 "WHEN UPPER(trading_symbol) LIKE ? THEN 2 ELSE 3 END, "
+                "CASE WHEN expiry IS NULL OR expiry = '' OR expiry >= ? THEN 0 ELSE 1 END, "
                 "COALESCE(expiry, '9999-12-31') ASC, COALESCE(strike, 0) ASC, trading_symbol ASC LIMIT ?"
             )
-            params.extend([clean_q, clean_q, f"{clean_q}%", capped_limit])
+            params.extend([clean_q, clean_q, f"{clean_q}%", today_str, capped_limit])
         else:
-            order_sql = "ORDER BY COALESCE(expiry, '9999-12-31') ASC, COALESCE(strike, 0) ASC, trading_symbol ASC LIMIT ?"
-            params.append(capped_limit)
+            order_sql = (
+                "ORDER BY CASE WHEN expiry IS NULL OR expiry = '' OR expiry >= ? THEN 0 ELSE 1 END, "
+                "COALESCE(expiry, '9999-12-31') ASC, COALESCE(strike, 0) ASC, trading_symbol ASC LIMIT ?"
+            )
+            params.extend([today_str, capped_limit])
 
         with self._connect() as conn:
             rows = conn.execute(
@@ -348,6 +353,7 @@ class InstrumentIndex:
         expiry: Optional[str] = None,
         strike: Optional[float] = None,
         broker_id: Optional[str] = None,
+        include_expired: bool = False,
         limit: int = 40,
     ) -> Dict[str, Any]:
         """Return structured F&O underlyings, expiries, strikes, and matching contracts from SQLite."""
@@ -357,6 +363,8 @@ class InstrumentIndex:
         if eff_type == "ALL":
             eff_type = "FO"
         it_sql, it_params = _instrument_type_sql_filter(eff_type)
+        today_str = datetime.now(tz=IST_TZ).date().isoformat()
+        capped_limit = max(1, min(int(limit), 120))
 
         base_clauses = ["(UPPER(instrument_type) LIKE 'FUT%' OR UPPER(instrument_type) IN ('CE', 'PE') OR UPPER(instrument_type) LIKE 'OPT%')"]
         base_params: List[Any] = []
@@ -366,6 +374,9 @@ class InstrumentIndex:
         if broker_id and broker_id.strip().lower() not in {"all", ""}:
             base_clauses.append("broker_id = ?")
             base_params.append(broker_id.strip().lower())
+        if not include_expired and not (expiry and expiry.strip()):
+            base_clauses.append("(expiry IS NULL OR expiry = '' OR expiry >= ?)")
+            base_params.append(today_str)
 
         with self._connect() as conn:
             ul_clauses = list(base_clauses)
@@ -381,12 +392,24 @@ class InstrumentIndex:
                     FROM instruments
                     WHERE {' AND '.join(ul_clauses)}
                     ORDER BY asset_symbol ASC
-                    LIMIT 40
+                    LIMIT 60
                     """,
                     ul_params,
                 ).fetchall()
                 if r["asset_symbol"]
             ]
+            # Fallback if only historical/expired rows exist in local DB
+            if not underlyings and not include_expired and not (expiry and expiry.strip()):
+                return self.list_fno_contracts(
+                    underlying=underlying,
+                    exchange=exchange,
+                    contract_type=contract_type,
+                    expiry=expiry,
+                    strike=strike,
+                    broker_id=broker_id,
+                    include_expired=True,
+                    limit=limit,
+                )
 
             exp_clauses = list(base_clauses)
             exp_params = list(base_params)
@@ -394,8 +417,12 @@ class InstrumentIndex:
                 exp_clauses.append(it_sql)
                 exp_params.extend(it_params)
             if clean_ul:
-                exp_clauses.append("(UPPER(asset_symbol) = ? OR UPPER(asset_symbol) LIKE ?)")
-                exp_params.extend([clean_ul, f"{clean_ul}%"])
+                if clean_ul in {u.upper() for u in underlyings}:
+                    exp_clauses.append("UPPER(asset_symbol) = ?")
+                    exp_params.append(clean_ul)
+                else:
+                    exp_clauses.append("UPPER(asset_symbol) LIKE ?")
+                    exp_params.append(f"{clean_ul}%")
             expiries = sorted(
                 {
                     norm
@@ -405,7 +432,7 @@ class InstrumentIndex:
                         FROM instruments
                         WHERE {' AND '.join(exp_clauses)} AND expiry IS NOT NULL AND expiry != ''
                         ORDER BY expiry ASC
-                        LIMIT 40
+                        LIMIT 60
                         """,
                         exp_params,
                     ).fetchall()
@@ -426,35 +453,36 @@ class InstrumentIndex:
                     FROM instruments
                     WHERE {' AND '.join(strike_clauses)} AND strike IS NOT NULL AND strike > 0
                     ORDER BY strike ASC
-                    LIMIT 120
+                    LIMIT 500
                     """,
                     strike_params,
                 ).fetchall()
             ]
 
-        contracts = self.search(
-            query="",
-            broker_id=broker_id,
-            exchange=exchange if exchange and exchange.strip().upper() != "ALL" else None,
-            instrument_type=eff_type,
-            expiry=expiry,
-            strike=strike,
-            limit=limit,
-        ) if not clean_ul else self.search(
-            query=clean_ul,
-            broker_id=broker_id,
-            exchange=exchange if exchange and exchange.strip().upper() != "ALL" else None,
-            instrument_type=eff_type,
-            expiry=expiry,
-            strike=strike,
-            limit=limit,
-        )
+            contract_clauses = list(strike_clauses)
+            contract_params = list(strike_params)
+            if strike is not None:
+                contract_clauses.append("strike = ?")
+                contract_params.append(float(strike))
+            contract_rows = conn.execute(
+                f"""
+                SELECT broker_id, exchange, segment, trading_symbol, asset_symbol, name,
+                       instrument_type, instrument_key, instrument_token, expiry, strike,
+                       lot_size, tick_size
+                FROM instruments
+                WHERE {' AND '.join(contract_clauses)}
+                ORDER BY COALESCE(expiry, '9999-12-31') ASC, COALESCE(strike, 0) ASC,
+                         instrument_type ASC, trading_symbol ASC
+                LIMIT ?
+                """,
+                [*contract_params, capped_limit],
+            ).fetchall()
 
-        # Tighten underlying filter so "NIFTY" doesn't get pushed down by longer prefixes when exact exists
-        if clean_ul and contracts:
-            exact_ul = [c for c in contracts if str(c.get("asset_symbol", "")).upper() == clean_ul]
-            if exact_ul:
-                contracts = exact_ul
+        contracts = []
+        for row in contract_rows:
+            item = dict(row)
+            item["expiry"] = _normalize_expiry(item.get("expiry"))
+            contracts.append(item)
 
         return {
             "ok": True,
@@ -464,8 +492,8 @@ class InstrumentIndex:
             "underlyings": underlyings,
             "expiries": expiries,
             "strikes": strikes,
-            "contracts": contracts[:limit],
-            "count": len(contracts[:limit]),
+            "contracts": contracts,
+            "count": len(contracts),
         }
 
     def resolve_key(
@@ -496,6 +524,7 @@ class InstrumentIndex:
             clauses.append("strike = ?")
             params.append(float(strike))
 
+        today_str = datetime.now(tz=IST_TZ).date().isoformat()
         with self._connect() as conn:
             row = conn.execute(
                 f"""
@@ -503,10 +532,11 @@ class InstrumentIndex:
                 FROM instruments
                 WHERE {' AND '.join(clauses)}
                 ORDER BY CASE WHEN UPPER(trading_symbol) = ? THEN 0 ELSE 1 END,
+                         CASE WHEN expiry IS NULL OR expiry = '' OR expiry >= ? THEN 0 ELSE 1 END,
                          COALESCE(expiry, '9999-12-31') ASC
                 LIMIT 1
                 """,
-                [*params, sym],
+                [*params, sym, today_str],
             ).fetchone()
 
             # Cross-broker F&O fallback: e.g. user picked a Zerodha NFO symbol (NIFTY26NOVFUT)
@@ -608,6 +638,11 @@ class InstrumentIndex:
         inserted = 0
 
         with self._connect() as conn:
+            # Prune stale F&O rows for this broker before loading fresh contracts
+            conn.execute(
+                "DELETE FROM instruments WHERE broker_id = ? AND (UPPER(instrument_type) LIKE 'FUT%' OR UPPER(instrument_type) IN ('CE', 'PE') OR UPPER(instrument_type) LIKE 'OPT%')",
+                ("upstox",),
+            )
             for item in items:
                 seg = str(item.get("segment", "")).upper()
                 exch = _SEGMENT_TO_EXCHANGE.get(seg, str(item.get("exchange", "NSE"))).upper()
@@ -689,6 +724,11 @@ class InstrumentIndex:
         inserted = 0
 
         with self._connect() as conn:
+            # Prune stale F&O rows for this broker before loading fresh contracts
+            conn.execute(
+                "DELETE FROM instruments WHERE broker_id = ? AND (UPPER(instrument_type) LIKE 'FUT%' OR UPPER(instrument_type) IN ('CE', 'PE') OR UPPER(instrument_type) LIKE 'OPT%')",
+                ("zerodha",),
+            )
             for row in reader:
                 token = str(row.get("instrument_token", "")).strip()
                 sym = str(row.get("tradingsymbol", "")).strip().upper()

@@ -85,7 +85,7 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
             self._send_html(200, TEMPLATE_PATH.read_text(encoding="utf-8"))
             return
 
-        if path == "/terminal":
+        if path in {"/terminal", "/terminal/"}:
             if not TERMINAL_TEMPLATE_PATH.exists():
                 self._send_json(500, {"detail": "terminal.html template missing"})
                 return
@@ -93,7 +93,7 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/health":
-            self._send_json(200, {"ok": True, "service": "algodesk", "phase": 4})
+            self._send_json(200, {"ok": True, "service": "algodesk", "phase": 5, "live_terminal": True})
             return
 
         if path == "/api/overview":
@@ -446,16 +446,16 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
                 self._send_json(200, res)
                 return
 
-            if path == "/api/live/feeds/poll":
+            if path in {"/api/live/feeds/poll", "/api/live/poll"}:
                 symbols = body.get("symbols") if isinstance(body.get("symbols"), list) else None
                 self._send_json(200, hub_service.poll_live_feeds(symbols=symbols))
                 return
 
-            if path == "/api/live/feeds/failover":
+            if path in {"/api/live/feeds/failover", "/api/live/failover"}:
                 self._send_json(200, hub_service.trigger_feed_failover(reason=body.get("reason")))
                 return
 
-            if path == "/api/live/feeds/recover":
+            if path in {"/api/live/feeds/recover", "/api/live/recover-primary"}:
                 self._send_json(200, hub_service.recover_primary_feed())
                 return
 

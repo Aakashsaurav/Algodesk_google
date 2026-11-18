@@ -458,7 +458,11 @@ export function LiveTerminal({ onNavigateHome }: LiveTerminalProps) {
   const handleManualPoll = async () => {
     setPolling(true);
     try {
-      const res = await fetch('/api/live/poll', { method: 'POST' });
+      const res = await fetch('/api/live/feeds/poll', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || 'Tick poll failed.');
       applyFeedPayload(data);
@@ -471,7 +475,7 @@ export function LiveTerminal({ onNavigateHome }: LiveTerminalProps) {
   };
 
   const handleFailoverToggle = async () => {
-    const endpoint = feedState?.in_failover ? '/api/live/recover-primary' : '/api/live/failover';
+    const endpoint = feedState?.in_failover ? '/api/live/feeds/recover' : '/api/live/feeds/failover';
     try {
       const res = await fetch(endpoint, { method: 'POST' });
       const data = await res.json();

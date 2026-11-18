@@ -325,7 +325,7 @@ function getLedColorClass(state: ConnectionState, isProbing: boolean): string {
 
 export default function App() {
   const [routePath, setRoutePath] = useState<string>(() =>
-    typeof window !== 'undefined' ? window.location.pathname : '/'
+    typeof window !== 'undefined' ? window.location.pathname.replace(/\/+$/, '') || '/' : '/'
   );
   const [overview, setOverview] = useState<OverviewPayload | null>(null);
   const [loading, setLoading] = useState(true);
@@ -333,7 +333,7 @@ export default function App() {
   const [loadError, setLoadError] = useState<string | null>(null);
 
   useEffect(() => {
-    const onPop = () => setRoutePath(window.location.pathname);
+    const onPop = () => setRoutePath(window.location.pathname.replace(/\/+$/, '') || '/');
     window.addEventListener('popstate', onPop);
     return () => window.removeEventListener('popstate', onPop);
   }, []);
@@ -484,13 +484,16 @@ export default function App() {
   const fnoFetchSeq = useRef(0);
 
   const fetchFnoContracts = useCallback(
-    async (opts?: {
-      underlying?: string;
-      exchange?: string;
-      contractType?: string;
-      expiry?: string;
-      strike?: string;
-    }) => {
+    async (
+      opts?: {
+        underlying?: string;
+        exchange?: string;
+        contractType?: string;
+        expiry?: string;
+        strike?: string;
+      },
+      syncDownloadTarget = false
+    ) => {
       const seq = ++fnoFetchSeq.current;
       const ul = opts?.underlying ?? fnoUnderlying;
       const exch = opts?.exchange ?? fnoExchange;
@@ -512,13 +515,46 @@ export default function App() {
         const payload: FnoContractsPayload = await res.json();
         if (seq !== fnoFetchSeq.current) return;
         setFnoData(payload);
+
+        if (syncDownloadTarget) {
+          const contracts = payload.contracts || [];
+          const preferredBroker = histProvider === 'auto' ? dataSelection : histProvider;
+          const exactType = ctype && ['FUT', 'CE', 'PE'].includes(ctype.toUpperCase()) ? ctype.toUpperCase() : '';
+          const match =
+            contracts.find(
+              (c) =>
+                c.broker_id === preferredBroker &&
+                (!exactType || c.instrument_type.toUpperCase() === exactType) &&
+                (!exp || c.expiry === exp) &&
+                (!stk || String(c.strike ?? '') === stk)
+            ) ||
+            contracts.find(
+              (c) =>
+                (!exactType || c.instrument_type.toUpperCase() === exactType) &&
+                (!exp || c.expiry === exp) &&
+                (!stk || String(c.strike ?? '') === stk)
+            ) ||
+            contracts.find((c) => c.broker_id === preferredBroker) ||
+            contracts[0];
+
+          if (match) {
+            setHistSymbol(match.trading_symbol);
+            setHistExchange(match.exchange || exch || 'NFO');
+            setHistContractType(match.instrument_type || exactType);
+            setHistInstrumentKey(match.instrument_key || '');
+          } else {
+            setHistExchange(exch || 'NFO');
+            setHistContractType(exactType);
+            setHistInstrumentKey('');
+          }
+        }
       } catch {
         // ignore transient error
       } finally {
         if (seq === fnoFetchSeq.current) setLoadingFno(false);
       }
     },
-    [fnoContractType, fnoExchange, fnoExpiry, fnoStrike, fnoUnderlying]
+    [dataSelection, fnoContractType, fnoExchange, fnoExpiry, fnoStrike, fnoUnderlying, histProvider]
   );
 
   const fetchCatalog = useCallback(async () => {
@@ -773,16 +809,34 @@ export default function App() {
     setHistExchange(item.exchange);
     setHistContractType(item.instrument_type || '');
     setHistInstrumentKey(item.instrument_key || '');
+    const uType = (item.instrument_type || '').toUpperCase();
     const isFnoItem =
       ['NFO', 'BFO', 'MCX', 'NSE_FO', 'BSE_FO', 'MCX_FO'].includes(item.exchange) ||
-      ['FUT', 'CE', 'PE'].includes((item.instrument_type || '').toUpperCase());
+      ['FUT', 'CE', 'PE'].includes(uType) ||
+      uType.startsWith('FUT') ||
+      uType.startsWith('OPT');
     if (isFnoItem) {
+      const nextEx = ['NFO', 'BFO', 'MCX'].includes(item.exchange) ? item.exchange : 'NFO';
+      const nextUl = (item.asset_symbol || '').toUpperCase();
+      const nextType = ['FUT', 'CE', 'PE'].includes(uType) ? uType : 'FO';
+      const nextExp = item.expiry || '';
+      const nextStrike = item.strike && item.strike > 0 ? String(item.strike) : '';
       setFnoOpen(true);
-      setFnoExchange(item.exchange);
-      if (item.asset_symbol) setFnoUnderlying(item.asset_symbol);
-      if (['FUT', 'CE', 'PE'].includes((item.instrument_type || '').toUpperCase())) {
-        setFnoContractType(item.instrument_type.toUpperCase());
-      }
+      setFnoExchange(nextEx);
+      if (nextUl) setFnoUnderlying(nextUl);
+      setFnoContractType(nextType);
+      setFnoExpiry(nextExp);
+      setFnoStrike(nextStrike);
+      void fetchFnoContracts(
+        {
+          exchange: nextEx,
+          underlying: nextUl,
+          contractType: nextType,
+          expiry: nextExp,
+          strike: nextStrike,
+        },
+        false
+      );
     }
     void fetchDataRecords(
       item.trading_symbol,
@@ -1497,22 +1551,32 @@ export default function App() {
                   <label htmlFor="instr-type-filter" className="mb-1.5 block text-[13px] font-semibold text-slate-200">
                     Segment / Contract
                   </label>
-                  <select
-                    id="instr-type-filter"
-                    value={instrTypeFilter}
-                    onChange={(e) => {
-                      const nextType = e.target.value;
-                      setInstrTypeFilter(nextType);
-                      void searchInstruments(instrQuery, nextType);
-                      if (['FO', 'FUT', 'OPT', 'CE', 'PE'].includes(nextType)) {
-                        setFnoOpen(true);
-                        if (nextType !== 'OPT') setFnoContractType(nextType);
-                        else setFnoContractType('CE');
-                        void fetchFnoContracts({
-                          contractType: nextType === 'OPT' ? 'CE' : nextType,
-                        });
-                      }
-                    }}
+                    <select
+                      id="instr-type-filter"
+                      value={instrTypeFilter}
+                      onChange={(e) => {
+                        const nextType = e.target.value;
+                        setInstrTypeFilter(nextType);
+                        void searchInstruments(instrQuery, nextType);
+                        if (['FO', 'FUT', 'OPT', 'CE', 'PE'].includes(nextType)) {
+                          const mappedType = nextType === 'OPT' ? 'CE' : nextType;
+                          const guessedUl =
+                            fnoUnderlying.trim() ||
+                            (instrQuery.trim().split(/\s+/)[0] || '').toUpperCase();
+                          setFnoOpen(true);
+                          setFnoContractType(mappedType);
+                          if (guessedUl && !fnoUnderlying) setFnoUnderlying(guessedUl);
+                          void fetchFnoContracts(
+                            {
+                              underlying: guessedUl,
+                              contractType: mappedType,
+                              expiry: '',
+                              strike: '',
+                            },
+                            true
+                          );
+                        }
+                      }}
                     className="min-h-[42px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 text-sm text-slate-100 focus:border-sky-400 focus:outline-none"
                   >
                     <option value="ALL">All Instruments</option>
@@ -1629,7 +1693,7 @@ export default function App() {
                           setHistExchange(ex);
                           setFnoExpiry('');
                           setFnoStrike('');
-                          void fetchFnoContracts({ exchange: ex, expiry: '', strike: '' });
+                          void fetchFnoContracts({ exchange: ex, expiry: '', strike: '' }, true);
                         }}
                         className="min-h-[40px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 text-sm text-slate-100 focus:border-sky-400 focus:outline-none"
                       >
@@ -1653,7 +1717,7 @@ export default function App() {
                           setFnoUnderlying(ul);
                           setFnoExpiry('');
                           setFnoStrike('');
-                          void fetchFnoContracts({ underlying: ul, expiry: '', strike: '' });
+                          void fetchFnoContracts({ underlying: ul, expiry: '', strike: '' }, true);
                         }}
                         placeholder="NIFTY, BANKNIFTY, RELIANCE..."
                         className="min-h-[40px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 font-mono text-sm text-slate-100 focus:border-sky-400 focus:outline-none"
@@ -1677,7 +1741,7 @@ export default function App() {
                           setFnoContractType(ct);
                           const nextStrike = ct === 'FUT' ? '' : fnoStrike;
                           if (ct === 'FUT') setFnoStrike('');
-                          void fetchFnoContracts({ contractType: ct, strike: nextStrike });
+                          void fetchFnoContracts({ contractType: ct, strike: nextStrike }, true);
                         }}
                         className="min-h-[40px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 text-sm text-slate-100 focus:border-sky-400 focus:outline-none"
                       >
@@ -1699,7 +1763,7 @@ export default function App() {
                           const exp = e.target.value;
                           setFnoExpiry(exp);
                           setFnoStrike('');
-                          void fetchFnoContracts({ expiry: exp, strike: '' });
+                          void fetchFnoContracts({ expiry: exp, strike: '' }, true);
                         }}
                         className="min-h-[40px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 font-mono text-sm text-slate-100 focus:border-sky-400 focus:outline-none"
                       >
@@ -1723,7 +1787,7 @@ export default function App() {
                         onChange={(e) => {
                           const stk = e.target.value;
                           setFnoStrike(stk);
-                          void fetchFnoContracts({ strike: stk });
+                          void fetchFnoContracts({ strike: stk }, true);
                         }}
                         className="min-h-[40px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 font-mono text-sm text-slate-100 focus:border-sky-400 focus:outline-none disabled:opacity-50"
                       >
@@ -1742,7 +1806,7 @@ export default function App() {
 
                     <button
                       type="button"
-                      onClick={() => void fetchFnoContracts()}
+                      onClick={() => void fetchFnoContracts(undefined, true)}
                       disabled={loadingFno}
                       className="min-h-[40px] shrink-0 whitespace-nowrap rounded-lg border border-slate-700 bg-[#0b1120] px-3.5 py-2 text-xs font-semibold text-slate-200 hover:border-slate-500 hover:bg-slate-800 disabled:opacity-50"
                     >
@@ -1846,7 +1910,7 @@ export default function App() {
                       if (['NFO', 'BFO', 'MCX'].includes(ex)) {
                         setFnoOpen(true);
                         setFnoExchange(ex);
-                        void fetchFnoContracts({ exchange: ex });
+                        void fetchFnoContracts({ exchange: ex, expiry: '', strike: '' }, true);
                       }
                     }}
                     className="min-h-[42px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 text-sm text-slate-100 focus:border-sky-400 focus:outline-none"
@@ -2025,6 +2089,20 @@ export default function App() {
                   {dataRecords && (
                     <span className="font-mono text-xs tabular-nums text-slate-400">
                       Showing {dataRecords.returned_rows} of {dataRecords.total_rows} stored rows
+                      {dataRecords.is_truncated && (
+                        <>
+                          {' '}
+                          (Snapshot sample —{' '}
+                          <button
+                            type="button"
+                            onClick={() => void handleSwitchViewMode('full')}
+                            className="font-sans font-semibold text-sky-400 underline underline-offset-2 hover:text-sky-300"
+                          >
+                            View all {dataRecords.total_rows} rows
+                          </button>
+                          )
+                        </>
+                      )}
                     </span>
                   )}
                   <a

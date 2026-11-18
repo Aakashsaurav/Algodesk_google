@@ -227,10 +227,11 @@ class HistoricalDataManager:
         start_d: date,
         end_d: date,
     ) -> Set[date]:
+        today_ist = datetime.now(tz=IST_TZ).date()
         with self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT covered_date FROM download_coverage
+                SELECT covered_date, status FROM download_coverage
                 WHERE symbol = ? AND exchange = ? AND timeframe = ?
                   AND covered_date >= ? AND covered_date <= ?
                 """,
@@ -239,7 +240,11 @@ class HistoricalDataManager:
         covered: Set[date] = set()
         for r in rows:
             try:
-                covered.add(date.fromisoformat(r["covered_date"]))
+                d_val = date.fromisoformat(r["covered_date"])
+                # Never treat today (or yesterday marked 'holiday' without data) as permanently frozen
+                if r["status"] == "holiday" and d_val >= (today_ist - timedelta(days=1)):
+                    continue
+                covered.add(d_val)
             except ValueError:
                 pass
         return covered
@@ -351,15 +356,19 @@ class HistoricalDataManager:
             raise RuntimeError(f"Upstox historical API HTTP {exc.code}: {err_body[:180]}") from exc
 
         candles = ((payload.get("data") or {}).get("candles")) or []
-        out: List[Dict[str, Any]] = []
-        for row in candles:
-            if not row or len(row) < 6:
-                continue
-            ts_raw = str(row[0])
-            dt_ist = datetime.fromisoformat(ts_raw.replace("Z", "+00:00")).astimezone(IST_TZ)
-            out.append(
-                {
-                    "ts_ist": dt_ist.isoformat(timespec="seconds"),
+        by_ts: Dict[str, Dict[str, Any]] = {}
+
+        def _ingest_candles(raw_list: List[Any]) -> None:
+            for row in raw_list:
+                if not row or len(row) < 6:
+                    continue
+                ts_raw = str(row[0])
+                dt_ist = datetime.fromisoformat(ts_raw.replace("Z", "+00:00")).astimezone(IST_TZ)
+                if not (chunk_start <= dt_ist.date() <= chunk_end):
+                    continue
+                ts_iso = dt_ist.isoformat(timespec="seconds")
+                by_ts[ts_iso] = {
+                    "ts_ist": ts_iso,
                     "trade_date": dt_ist.date().isoformat(),
                     "open": float(row[1]),
                     "high": float(row[2]),
@@ -368,8 +377,24 @@ class HistoricalDataManager:
                     "volume": int(row[5] or 0),
                     "oi": int(row[6] or 0) if len(row) > 6 else 0,
                 }
-            )
-        return out
+
+        _ingest_candles(candles)
+
+        # Upstox /v2/historical-candle excludes the ongoing/unsettled current day;
+        # merge /v2/historical-candle/intraday when the requested window reaches today.
+        today_ist = datetime.now(tz=IST_TZ).date()
+        if chunk_end >= today_ist:
+            intra_url = f"{config.UPSTOX_BASE_URL}/v2/historical-candle/intraday/{encoded_key}/{interval}"
+            intra_req = urllib.request.Request(intra_url, headers=headers, method="GET")
+            try:
+                with urllib.request.urlopen(intra_req, timeout=8) as resp:
+                    intra_payload = json.loads(resp.read().decode("utf-8"))
+                intra_candles = ((intra_payload.get("data") or {}).get("candles")) or []
+                _ingest_candles(intra_candles)
+            except Exception:
+                pass
+
+        return [by_ts[k] for k in sorted(by_ts.keys())]
 
     def _fetch_zerodha_chunk(
         self,
@@ -681,24 +706,24 @@ class HistoricalDataManager:
                     )
                     rows_inserted = len(all_candles)
 
-                conn.executemany(
-                    """
-                    INSERT OR REPLACE INTO download_coverage
-                    (symbol, exchange, timeframe, covered_date, status, updated_at)
-                    VALUES (?, ?, ?, ?, ?, ?)
-                    """,
-                    [
-                        (
-                            clean_sym,
-                            clean_exch,
-                            tf,
-                            d_item.isoformat(),
-                            "data" if d_item.isoformat() in dates_with_data else "holiday",
-                            now_ist_str,
-                        )
-                        for d_item in checked_weekdays
-                    ],
-                )
+                coverage_rows = []
+                for d_item in checked_weekdays:
+                    d_iso = d_item.isoformat()
+                    if d_iso in dates_with_data:
+                        coverage_rows.append((clean_sym, clean_exch, tf, d_iso, "data", now_ist_str))
+                    elif d_item < (today_ist - timedelta(days=1)):
+                        # Only mark past non-recent weekdays as holiday (never freeze today or yesterday if broker hasn't published EOD yet)
+                        coverage_rows.append((clean_sym, clean_exch, tf, d_iso, "holiday", now_ist_str))
+
+                if coverage_rows:
+                    conn.executemany(
+                        """
+                        INSERT OR REPLACE INTO download_coverage
+                        (symbol, exchange, timeframe, covered_date, status, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        """,
+                        coverage_rows,
+                    )
                 conn.commit()
 
         snapshot = self.get_records(

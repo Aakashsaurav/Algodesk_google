@@ -704,12 +704,16 @@
       };
 
       el('pollBtn').onclick = async () => {
-        const res = await fetch('/api/live/poll', { method: 'POST' });
+        const res = await fetch('/api/live/feeds/poll', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({})
+        });
         applyPayload(await res.json());
       };
 
       el('failoverBtn').onclick = async () => {
-        const ep = (feedState && feedState.in_failover) ? '/api/live/recover-primary' : '/api/live/failover';
+        const ep = (feedState && feedState.in_failover) ? '/api/live/feeds/recover' : '/api/live/feeds/failover';
         const res = await fetch(ep, { method: 'POST' });
         applyPayload(await res.json());
       };

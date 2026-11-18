@@ -125,6 +125,7 @@ def create_app() -> FastAPI:
         return HTMLResponse(TEMPLATE_PATH.read_text(encoding="utf-8"))
 
     @app.get("/terminal", response_class=HTMLResponse)
+    @app.get("/terminal/", response_class=HTMLResponse)
     def terminal_page() -> HTMLResponse:
         if not TERMINAL_TEMPLATE_PATH.exists():
             raise HTTPException(status_code=500, detail="terminal.html template missing")
@@ -132,7 +133,7 @@ def create_app() -> FastAPI:
 
     @app.get("/api/health")
     def api_health() -> dict:
-        return {"ok": True, "service": "algodesk", "phase": 4}
+        return {"ok": True, "service": "algodesk", "phase": 5, "live_terminal": True}
 
     @app.get("/api/overview")
     def api_overview(refresh: bool = Query(default=True)) -> dict:
@@ -380,10 +381,12 @@ def create_app() -> FastAPI:
         return hub_service.get_live_status()
 
     @app.post("/api/live/feeds/poll")
+    @app.post("/api/live/poll")
     def api_live_feeds_poll(payload: Optional[FeedPollRequest] = None) -> dict:
         return hub_service.poll_live_feeds(symbols=payload.symbols if payload else None)
 
     @app.post("/api/live/feeds/failover")
+    @app.post("/api/live/failover")
     def api_live_feeds_failover(payload: Optional[FeedFailoverRequest] = None) -> dict:
         try:
             return hub_service.trigger_feed_failover(reason=payload.reason if payload else None)
@@ -391,6 +394,7 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/api/live/feeds/recover")
+    @app.post("/api/live/recover-primary")
     def api_live_feeds_recover() -> dict:
         return hub_service.recover_primary_feed()
 
