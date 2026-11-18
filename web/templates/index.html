@@ -2066,7 +2066,10 @@
         const quotes = feeds.quotes || [];
         if (quotes.length > 0) {
           p4.quotesStrip.style.display = 'grid';
-          p4.quotesStrip.innerHTML = quotes.map((q) => `<div><div style="color:var(--text-muted)">${q.symbol} · ${q.source}</div><div class="summary-val">₹${Number(q.ltp).toFixed(2)}</div></div>`).join('');
+          p4.quotesStrip.innerHTML = quotes.map((q) => {
+            const hasLtp = q.ltp !== null && q.ltp !== undefined && Number.isFinite(Number(q.ltp));
+            return `<div title="${String(q.note || '').replace(/"/g, '&quot;')}"><div style="color:var(--text-muted)">${q.symbol} · ${q.source}</div><div class="summary-val">${hasLtp ? `₹${Number(q.ltp).toFixed(2)}` : '—'}</div></div>`;
+          }).join('');
         } else {
           p4.quotesStrip.style.display = 'none';
         }

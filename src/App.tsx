@@ -183,9 +183,11 @@ interface FeedSlotHealth {
 
 interface LiveQuote {
   symbol: string;
-  ltp: number;
-  change_pct: number;
+  exchange?: string;
+  ltp: number | null;
+  change_pct: number | null;
   source: string;
+  note?: string;
   ts_ist: string;
 }
 
@@ -2204,10 +2206,10 @@ export default function App() {
                       {dataRecords.rows.map((row) => (
                         <tr key={row.ts_ist} className="hover:bg-slate-900/60">
                           <td className="px-3.5 py-2 whitespace-nowrap text-slate-300">{row.ts_ist}</td>
-                          <td className="px-3.5 py-2 text-right">{row.open.toFixed(2)}</td>
-                          <td className="px-3.5 py-2 text-right">{row.high.toFixed(2)}</td>
-                          <td className="px-3.5 py-2 text-right">{row.low.toFixed(2)}</td>
-                          <td className="px-3.5 py-2 text-right font-semibold text-slate-100">{row.close.toFixed(2)}</td>
+                          <td className="px-3.5 py-2 text-right">{row.open != null ? Number(row.open).toFixed(2) : '—'}</td>
+                          <td className="px-3.5 py-2 text-right">{row.high != null ? Number(row.high).toFixed(2) : '—'}</td>
+                          <td className="px-3.5 py-2 text-right">{row.low != null ? Number(row.low).toFixed(2) : '—'}</td>
+                          <td className="px-3.5 py-2 text-right font-semibold text-slate-100">{row.close != null ? Number(row.close).toFixed(2) : '—'}</td>
                           <td className="px-3.5 py-2 text-right text-slate-300">{row.volume.toLocaleString()}</td>
                           <td className="px-3.5 py-2 text-right text-slate-300">{(row.oi ?? 0).toLocaleString()}</td>
                           <td className="px-3.5 py-2 text-right text-slate-400">{row.source}</td>
@@ -2344,12 +2346,16 @@ export default function App() {
 
             {liveStatus?.feeds?.quotes && liveStatus.feeds.quotes.length > 0 && (
               <div className="grid grid-cols-2 gap-4 border-t border-slate-800 pt-4 font-mono text-xs tabular-nums sm:grid-cols-5">
-                {liveStatus.feeds.quotes.map((q) => (
-                  <div key={q.symbol}>
+                {liveStatus.feeds.quotes.map((q, idx) => (
+                  <div key={`${q.exchange || 'NSE'}-${q.symbol}-${idx}`} title={q.note || undefined}>
                     <div className="text-slate-400">
                       {q.symbol} · {q.source}
                     </div>
-                    <div className="mt-0.5 text-sm font-semibold text-slate-100">₹{q.ltp.toFixed(2)}</div>
+                    <div className="mt-0.5 text-sm font-semibold text-slate-100">
+                      {q.ltp !== null && q.ltp !== undefined && Number.isFinite(Number(q.ltp))
+                        ? `₹${Number(q.ltp).toFixed(2)}`
+                        : '—'}
+                    </div>
                   </div>
                 ))}
               </div>
