@@ -1,9 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Activity,
+  AlertCircle,
   ArrowDownRight,
   ArrowLeft,
   ArrowUpRight,
+  Check,
+  Database,
   Pause,
   Play,
   Plus,
@@ -105,6 +108,25 @@ interface LookupHit {
   instrument_key: string;
   expiry?: string | null;
   strike?: number | null;
+  lot_size?: number;
+}
+
+interface InstrumentStats {
+  total_instruments: number;
+  fno_instruments?: number;
+  db_size_mb: number;
+}
+
+interface FnoContractsPayload {
+  ok: boolean;
+  exchange: string;
+  contract_type: string;
+  underlying: string;
+  underlyings: string[];
+  expiries: string[];
+  strikes: number[];
+  contracts: LookupHit[];
+  count: number;
 }
 
 interface LiveTerminalProps {
@@ -147,13 +169,27 @@ export function LiveTerminal({ onNavigateHome }: LiveTerminalProps) {
   const [paused, setPaused] = useState(false);
   const [polling, setPolling] = useState(false);
 
-  // Subscribe form + SQLite lookup state
+  // Subscribe form + SQLite lookup & F&O Finder state (mirrors Historical Download section)
   const [symbolInput, setSymbolInput] = useState('');
   const [exchangeInput, setExchangeInput] = useState('NSE');
   const [selectedInstrumentType, setSelectedInstrumentType] = useState('');
   const [selectedInstrumentKey, setSelectedInstrumentKey] = useState('');
-  const [lookupHits, setLookupHits] = useState<LookupHit[]>([]);
-  const [lookupOpen, setLookupOpen] = useState(false);
+  const [instrQuery, setInstrQuery] = useState('');
+  const [instrTypeFilter, setInstrTypeFilter] = useState('ALL');
+  const [instrResults, setInstrResults] = useState<LookupHit[]>([]);
+  const [instrStats, setInstrStats] = useState<InstrumentStats | null>(null);
+  const [syncingMaster, setSyncingMaster] = useState<'upstox' | 'zerodha' | null>(null);
+  const [instrFeedback, setInstrFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+
+  const [fnoOpen, setFnoOpen] = useState(false);
+  const [fnoExchange, setFnoExchange] = useState('NFO');
+  const [fnoUnderlying, setFnoUnderlying] = useState('NIFTY');
+  const [fnoContractType, setFnoContractType] = useState('FUT');
+  const [fnoExpiry, setFnoExpiry] = useState('');
+  const [fnoStrike, setFnoStrike] = useState('');
+  const [fnoData, setFnoData] = useState<FnoContractsPayload | null>(null);
+  const [loadingFno, setLoadingFno] = useState(false);
+
   const [subscribing, setSubscribing] = useState(false);
   const [feedback, setFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
 
@@ -163,7 +199,8 @@ export function LiveTerminal({ onNavigateHome }: LiveTerminalProps) {
   const wsRef = useRef<WebSocket | null>(null);
   const sseRef = useRef<EventSource | null>(null);
   const reconnectTimerRef = useRef<number | null>(null);
-  const lookupDebounceRef = useRef<number | null>(null);
+  const instrSearchSeqRef = useRef(0);
+  const fnoFetchSeqRef = useRef(0);
   const unmountedRef = useRef(false);
 
   const applyFeedPayload = useCallback((payload: unknown) => {
@@ -313,34 +350,163 @@ export function LiveTerminal({ onNavigateHome }: LiveTerminalProps) {
     };
   }, [paused, connectStream, closeTransports, fetchInitialSnapshot]);
 
-  // SQLite Instrument Lookup autocomplete
-  useEffect(() => {
-    if (lookupDebounceRef.current !== null) {
-      window.clearTimeout(lookupDebounceRef.current);
+  const searchInstruments = useCallback(async (q: string, instType = 'ALL') => {
+    const seq = ++instrSearchSeqRef.current;
+    try {
+      const params = new URLSearchParams({ q, limit: '16' });
+      if (instType && instType !== 'ALL') {
+        params.set('instrument_type', instType);
+      }
+      const res = await fetch(`/api/instruments/search?${params.toString()}`);
+      if (seq !== instrSearchSeqRef.current) return;
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({}));
+        setInstrFeedback({
+          type: 'err',
+          text: err.detail || `Instrument search failed (HTTP ${res.status}).`,
+        });
+        return;
+      }
+      const body = await res.json();
+      if (seq !== instrSearchSeqRef.current) return;
+      const rows: LookupHit[] = body.results ?? body.items ?? [];
+      setInstrResults(rows);
+      if (body.stats) setInstrStats(body.stats);
+      if (q.trim() && rows.length === 0) {
+        setInstrFeedback({
+          type: 'err',
+          text: `No matching ${instType === 'ALL' ? '' : `${instType} `}symbol for "${q.trim().toUpperCase()}" in local SQLite yet. Click Sync Upstox Master or Sync Zerodha Master.`,
+        });
+      } else {
+        setInstrFeedback((prev) => (prev?.type === 'err' ? null : prev));
+      }
+    } catch {
+      // Ignore transient startup error
     }
-    const q = symbolInput.trim();
-    if (q.length < 2) {
-      setLookupHits([]);
-      return;
-    }
-    lookupDebounceRef.current = window.setTimeout(async () => {
+  }, []);
+
+  const fetchFnoContracts = useCallback(
+    async (
+      opts?: {
+        underlying?: string;
+        exchange?: string;
+        contractType?: string;
+        expiry?: string;
+        strike?: string;
+      },
+      syncSubscribeTarget = false
+    ) => {
+      const seq = ++fnoFetchSeqRef.current;
+      const ul = opts?.underlying ?? fnoUnderlying;
+      const exch = opts?.exchange ?? fnoExchange;
+      const ctype = opts?.contractType ?? fnoContractType;
+      const exp = opts?.expiry ?? fnoExpiry;
+      const stk = opts?.strike ?? fnoStrike;
+      setLoadingFno(true);
       try {
-        const res = await fetch(`/api/instruments/search?q=${encodeURIComponent(q)}&limit=10`);
-        const data = await res.json();
-        if (res.ok && Array.isArray(data.items)) {
-          setLookupHits(data.items);
+        const params = new URLSearchParams({
+          underlying: ul.trim().toUpperCase(),
+          exchange: exch || 'NFO',
+          contract_type: ctype || 'FO',
+          limit: '40',
+        });
+        if (exp) params.set('expiry', exp);
+        if (stk && !Number.isNaN(Number(stk))) params.set('strike', stk);
+        const res = await fetch(`/api/instruments/fno?${params.toString()}`);
+        if (seq !== fnoFetchSeqRef.current || !res.ok) return;
+        const payload: FnoContractsPayload = await res.json();
+        if (seq !== fnoFetchSeqRef.current) return;
+        setFnoData(payload);
+        if (syncSubscribeTarget) {
+          const contracts = payload.contracts || [];
+          const preferredBroker = feedState?.primary_feed || 'upstox';
+          const exactType = ctype && ['FUT', 'CE', 'PE'].includes(ctype.toUpperCase()) ? ctype.toUpperCase() : '';
+          const match =
+            contracts.find(
+              (c) =>
+                c.broker_id === preferredBroker &&
+                (!exactType || c.instrument_type.toUpperCase() === exactType) &&
+                (!exp || c.expiry === exp) &&
+                (!stk || String(c.strike ?? '') === stk)
+            ) ||
+            contracts.find(
+              (c) =>
+                (!exactType || c.instrument_type.toUpperCase() === exactType) &&
+                (!exp || c.expiry === exp) &&
+                (!stk || String(c.strike ?? '') === stk)
+            ) ||
+            contracts.find((c) => c.broker_id === preferredBroker) ||
+            contracts[0];
+
+          if (match) {
+            setSymbolInput(match.trading_symbol);
+            setExchangeInput(match.exchange || exch || 'NFO');
+            setSelectedInstrumentType(match.instrument_type || exactType);
+            setSelectedInstrumentKey(match.instrument_key || '');
+          } else {
+            setExchangeInput(exch || 'NFO');
+            setSelectedInstrumentType(exactType);
+            setSelectedInstrumentKey('');
+          }
         }
       } catch {
-        setLookupHits([]);
+        // ignore transient error
+      } finally {
+        if (seq === fnoFetchSeqRef.current) setLoadingFno(false);
       }
-    }, 180);
+    },
+    [feedState?.primary_feed, fnoContractType, fnoExchange, fnoExpiry, fnoStrike, fnoUnderlying]
+  );
 
-    return () => {
-      if (lookupDebounceRef.current !== null) {
-        window.clearTimeout(lookupDebounceRef.current);
+  const handleSelectInstrument = (item: LookupHit) => {
+    setSymbolInput(item.trading_symbol);
+    setExchangeInput(item.exchange || 'NSE');
+    setSelectedInstrumentType(item.instrument_type || '');
+    setSelectedInstrumentKey(item.instrument_key || '');
+    setFeedback(null);
+    if (['NFO', 'BFO', 'MCX', 'NSE_FO', 'BSE_FO', 'MCX_FO'].includes(item.exchange)) {
+      setFnoOpen(true);
+      setFnoExchange(item.exchange);
+      if (item.asset_symbol) setFnoUnderlying(item.asset_symbol);
+      if (['FUT', 'CE', 'PE'].includes(item.instrument_type)) {
+        setFnoContractType(item.instrument_type);
       }
-    };
-  }, [symbolInput]);
+      setFnoExpiry(item.expiry || '');
+      setFnoStrike(item.strike && item.strike > 0 ? String(item.strike) : '');
+    }
+  };
+
+  const handleSyncInstruments = async (brokerId: 'upstox' | 'zerodha') => {
+    setSyncingMaster(brokerId);
+    setInstrFeedback(null);
+    try {
+      const res = await fetch('/api/instruments/sync', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ broker_id: brokerId }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.detail || `Failed to sync ${brokerId} instruments.`);
+      if (body.stats) setInstrStats(body.stats);
+      setInstrFeedback({
+        type: 'ok',
+        text: `Synced ${Number(body.indexed_count || 0).toLocaleString()} ${brokerId.toUpperCase()} instruments into local SQLite.`,
+      });
+      await searchInstruments(instrQuery, instrTypeFilter);
+      if (fnoOpen) await fetchFnoContracts();
+    } catch (err) {
+      setInstrFeedback({
+        type: 'err',
+        text: err instanceof Error ? err.message : 'Instrument sync failed.',
+      });
+    } finally {
+      setSyncingMaster(null);
+    }
+  };
+
+  useEffect(() => {
+    void searchInstruments('', 'ALL');
+  }, [searchInstruments]);
 
   const quotes = useMemo(() => feedState?.quotes ?? [], [feedState]);
   const subscribedSet = useMemo(() => {
@@ -382,27 +548,13 @@ export function LiveTerminal({ onNavigateHome }: LiveTerminalProps) {
     const cleanSym = symRaw.trim().toUpperCase();
     const cleanExch = (exchRaw || 'NSE').trim().toUpperCase();
     if (!cleanSym) {
-      setFeedback({ type: 'err', text: 'Enter a symbol or select a contract from lookup first.' });
+      setFeedback({ type: 'err', text: 'Select an instrument from SQLite Lookup / F&O Finder or enter a valid symbol first.' });
       return;
     }
     setSubscribing(true);
     setFeedback(null);
-    setLookupOpen(false);
-    setSelectedKey(assetKey(cleanSym, cleanExch));
 
     try {
-      const ws = wsRef.current;
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(
-          JSON.stringify({
-            action: 'subscribe',
-            symbol: cleanSym,
-            exchange: cleanExch,
-            instrument_type: itypeRaw,
-            instrument_key: ikeyRaw,
-          })
-        );
-      }
       const res = await fetch('/api/live/subscribe', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -413,14 +565,16 @@ export function LiveTerminal({ onNavigateHome }: LiveTerminalProps) {
           instrument_key: ikeyRaw,
         }),
       });
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.detail || 'Could not subscribe asset.');
+      const subSym = data.subscribed_asset?.symbol || cleanSym;
+      const subExch = data.subscribed_asset?.exchange || cleanExch;
+      setSelectedKey(assetKey(subSym, subExch));
       applyFeedPayload(data);
-      setFeedback({ type: 'ok', text: data.message || `Subscribed to ${cleanExch}:${cleanSym}.` });
+      setFeedback({ type: 'ok', text: data.message || `Subscribed to ${subExch}:${subSym}.` });
       setSymbolInput('');
       setSelectedInstrumentType('');
       setSelectedInstrumentKey('');
-      setLookupHits([]);
     } catch (err) {
       setFeedback({
         type: 'err',
@@ -434,16 +588,12 @@ export function LiveTerminal({ onNavigateHome }: LiveTerminalProps) {
   const unsubscribeAsset = async (symbol: string, exchange: string) => {
     setFeedback(null);
     try {
-      const ws = wsRef.current;
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ action: 'unsubscribe', symbol, exchange }));
-      }
       const res = await fetch('/api/live/unsubscribe', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ symbol, exchange }),
       });
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(data.detail || 'Could not unsubscribe asset.');
       applyFeedPayload(data);
       setFeedback({ type: 'ok', text: data.message || `Unsubscribed ${exchange}:${symbol}.` });
@@ -658,122 +808,467 @@ export function LiveTerminal({ onNavigateHome }: LiveTerminalProps) {
           </div>
         </section>
 
-        {/* Subscribe / Unsubscribe Asset Toolbar */}
-        <section id="terminal-subscribe" className="rounded-xl border border-slate-800 bg-[#111827] px-5 py-4">
-          <div className="mb-3 flex flex-col justify-between gap-2 sm:flex-row sm:items-center">
+        {/* Subscribe / Unsubscribe Asset via SQLite Instrument Index (mirrors Download section) */}
+        <section id="terminal-subscribe" className="space-y-6 rounded-xl border border-slate-800 bg-[#111827] p-6">
+          <div className="flex flex-wrap items-end justify-between gap-4 border-b border-slate-800 pb-4">
             <div>
-              <h2 className="text-sm font-semibold text-slate-100">Subscribe Any Asset to Live WebSocket Stream</h2>
+              <h2 className="text-base font-semibold tracking-tight text-slate-100">
+                Subscribe Asset to Live WebSocket Stream
+              </h2>
               <p className="text-xs text-slate-400">
-                Type an Equity (e.g. RELIANCE, AAPL), Index (NIFTY, SENSEX), or search F&amp;O contracts from your synced SQLite master.
+                Supports Equity, Index, Futures &amp; Options (NFO/BFO/MCX). Look up or bind a verified contract from SQLite before subscribing.
               </p>
             </div>
-            {feedback && (
-              <p
-                className={`text-xs font-medium ${feedback.type === 'ok' ? 'text-emerald-400' : 'text-red-400'}`}
-                role="status"
-                aria-live="polite"
-              >
-                {feedback.text}
-              </p>
+            {instrStats && (
+              <div className="font-mono text-xs tabular-nums text-slate-400">
+                Indexed Symbols: {instrStats.total_instruments.toLocaleString()}
+                {typeof instrStats.fno_instruments === 'number'
+                  ? ` · F&O Contracts: ${instrStats.fno_instruments.toLocaleString()}`
+                  : ''}{' '}
+                · DB: {instrStats.db_size_mb} MB
+              </div>
             )}
           </div>
 
+          {/* 1. SQLite Instrument Lookup & Master Sync */}
+          <div className="space-y-3 border-b border-slate-800 pb-6">
+            <div className="grid grid-cols-1 items-end gap-3 md:grid-cols-[1fr_200px_auto_auto]">
+              <div>
+                <label htmlFor="live-instr-search" className="mb-1.5 block text-[13px] font-semibold text-slate-200">
+                  SQLite Instrument Lookup (Under 5 MB RAM)
+                </label>
+                <div className="relative">
+                  <Search className="pointer-events-none absolute top-1/2 left-3 h-4 w-4 -translate-y-1/2 text-slate-500" />
+                  <input
+                    id="live-instr-search"
+                    type="text"
+                    value={instrQuery}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      setInstrQuery(val);
+                      void searchInstruments(val, instrTypeFilter);
+                    }}
+                    placeholder="Search Equity or F&O (e.g. RELIANCE, NIFTY FUT, NIFTY 24500 CE)..."
+                    className="min-h-[42px] w-full rounded-lg border border-slate-700 bg-[#0b1120] py-2 pr-3 pl-9 text-sm text-slate-100 focus:border-sky-400 focus:outline-none"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label htmlFor="live-instr-type-filter" className="mb-1.5 block text-[13px] font-semibold text-slate-200">
+                  Segment / Contract
+                </label>
+                <select
+                  id="live-instr-type-filter"
+                  value={instrTypeFilter}
+                  onChange={(e) => {
+                    const nextType = e.target.value;
+                    setInstrTypeFilter(nextType);
+                    void searchInstruments(instrQuery, nextType);
+                    if (['FO', 'FUT', 'OPT', 'CE', 'PE'].includes(nextType)) {
+                      const mappedType = nextType === 'OPT' ? 'CE' : nextType;
+                      const guessedUl =
+                        fnoUnderlying.trim() ||
+                        (instrQuery.trim().split(/\s+/)[0] || '').toUpperCase();
+                      setFnoOpen(true);
+                      setFnoContractType(mappedType);
+                      if (guessedUl && !fnoUnderlying) setFnoUnderlying(guessedUl);
+                      void fetchFnoContracts(
+                        {
+                          underlying: guessedUl,
+                          contractType: mappedType,
+                          expiry: '',
+                          strike: '',
+                        },
+                        true
+                      );
+                    }
+                  }}
+                  className="min-h-[42px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 text-sm text-slate-100 focus:border-sky-400 focus:outline-none"
+                >
+                  <option value="ALL">All Instruments</option>
+                  <option value="EQUITY">Equity &amp; Index</option>
+                  <option value="FO">Futures &amp; Options (F&amp;O)</option>
+                  <option value="FUT">Futures (FUT)</option>
+                  <option value="OPT">Options (CE / PE)</option>
+                  <option value="CE">Call Options (CE)</option>
+                  <option value="PE">Put Options (PE)</option>
+                </select>
+              </div>
+
+              <button
+                type="button"
+                onClick={() => void handleSyncInstruments('upstox')}
+                disabled={syncingMaster !== null}
+                className="inline-flex min-h-[42px] shrink-0 items-center gap-2 whitespace-nowrap rounded-lg border border-slate-700 bg-[#0b1120] px-4 py-2 text-[13px] font-semibold text-slate-200 transition-colors hover:border-slate-500 hover:bg-slate-800 disabled:opacity-50"
+              >
+                <Database className="h-3.5 w-3.5" />
+                <span>{syncingMaster === 'upstox' ? 'Syncing Upstox...' : 'Sync Upstox Master'}</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => void handleSyncInstruments('zerodha')}
+                disabled={syncingMaster !== null}
+                className="inline-flex min-h-[42px] shrink-0 items-center gap-2 whitespace-nowrap rounded-lg border border-slate-700 bg-[#0b1120] px-4 py-2 text-[13px] font-semibold text-slate-200 transition-colors hover:border-slate-500 hover:bg-slate-800 disabled:opacity-50"
+              >
+                <Database className="h-3.5 w-3.5" />
+                <span>{syncingMaster === 'zerodha' ? 'Syncing Zerodha...' : 'Sync Zerodha Master'}</span>
+              </button>
+            </div>
+
+            {instrFeedback && (
+              <div
+                className={`flex items-center gap-2 text-[13px] ${
+                  instrFeedback.type === 'ok' ? 'text-emerald-400' : 'text-red-400'
+                }`}
+              >
+                {instrFeedback.type === 'ok' ? <Check className="h-4 w-4" /> : <AlertCircle className="h-4 w-4" />}
+                <span>{instrFeedback.text}</span>
+              </div>
+            )}
+
+            {instrResults.length > 0 && (
+              <div className="flex flex-wrap items-center gap-1.5 pt-1">
+                {instrResults.slice(0, 10).map((item) => {
+                  const metaBits = [item.exchange];
+                  if (item.instrument_type && item.instrument_type !== 'EQUITY') {
+                    metaBits.push(item.instrument_type);
+                  }
+                  if (item.expiry) metaBits.push(`Exp ${item.expiry}`);
+                  if (item.strike && item.strike > 0) metaBits.push(`@${item.strike}`);
+                  return (
+                    <button
+                      key={`${item.broker_id}-${item.instrument_key}`}
+                      type="button"
+                      onClick={() => handleSelectInstrument(item)}
+                      className={`min-h-[32px] shrink-0 whitespace-nowrap rounded-md border px-2.5 py-1 font-mono text-xs tabular-nums transition-colors ${
+                        symbolInput === item.trading_symbol && exchangeInput === item.exchange
+                          ? 'border-sky-400 bg-sky-400/15 text-sky-300'
+                          : 'border-slate-700 bg-[#0b1120] text-slate-300 hover:border-slate-500'
+                      }`}
+                    >
+                      {item.trading_symbol} · {metaBits.join(' · ')} ({item.broker_id})
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+          {/* 2. Futures & Options (F&O) Contract Finder */}
+          <div className="space-y-4 border-b border-slate-800 pb-6">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <div className="text-sm font-semibold text-slate-100">
+                  Futures &amp; Options Contract Finder (NFO / BFO / MCX)
+                </div>
+                <p className="text-xs text-slate-400">
+                  Pick an underlying, contract type (FUT / CE / PE), expiry, and strike from local SQLite before subscribing to the live stream.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  const next = !fnoOpen;
+                  setFnoOpen(next);
+                  if (next) {
+                    const targetEx = ['NFO', 'BFO', 'MCX'].includes(exchangeInput) ? exchangeInput : fnoExchange;
+                    setFnoExchange(targetEx);
+                    void fetchFnoContracts({ exchange: targetEx });
+                  }
+                }}
+                className="min-h-[36px] shrink-0 whitespace-nowrap rounded-lg border border-slate-700 bg-[#0b1120] px-3.5 py-1.5 text-xs font-semibold text-slate-200 transition-colors hover:border-sky-400 hover:bg-slate-800"
+              >
+                {fnoOpen ? 'Hide F&O Finder' : 'Open F&O Contract Finder'}
+              </button>
+            </div>
+
+            {fnoOpen && (
+              <div className="space-y-4 pt-1">
+                <div className="grid grid-cols-1 items-end gap-3 sm:grid-cols-2 lg:grid-cols-[0.8fr_1.1fr_0.9fr_1fr_1fr_auto]">
+                  <div>
+                    <label htmlFor="live-fno-exchange" className="mb-1.5 block text-xs font-semibold text-slate-300">
+                      F&amp;O Exchange
+                    </label>
+                    <select
+                      id="live-fno-exchange"
+                      value={fnoExchange}
+                      onChange={(e) => {
+                        const ex = e.target.value;
+                        setFnoExchange(ex);
+                        setExchangeInput(ex);
+                        setFnoExpiry('');
+                        setFnoStrike('');
+                        void fetchFnoContracts({ exchange: ex, expiry: '', strike: '' }, true);
+                      }}
+                      className="min-h-[40px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 text-sm text-slate-100 focus:border-sky-400 focus:outline-none"
+                    >
+                      <option value="NFO">NFO (NSE F&amp;O)</option>
+                      <option value="BFO">BFO (BSE F&amp;O)</option>
+                      <option value="MCX">MCX (Commodities)</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label htmlFor="live-fno-underlying" className="mb-1.5 block text-xs font-semibold text-slate-300">
+                      Underlying
+                    </label>
+                    <input
+                      id="live-fno-underlying"
+                      type="text"
+                      list="live-fno-underlying-list"
+                      value={fnoUnderlying}
+                      onChange={(e) => {
+                        const ul = e.target.value.toUpperCase();
+                        setFnoUnderlying(ul);
+                        setFnoExpiry('');
+                        setFnoStrike('');
+                        void fetchFnoContracts({ underlying: ul, expiry: '', strike: '' }, true);
+                      }}
+                      placeholder="NIFTY, BANKNIFTY, RELIANCE..."
+                      className="min-h-[40px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 font-mono text-sm text-slate-100 focus:border-sky-400 focus:outline-none"
+                    />
+                    <datalist id="live-fno-underlying-list">
+                      {(fnoData?.underlyings ?? []).map((ul) => (
+                        <option key={ul} value={ul} />
+                      ))}
+                    </datalist>
+                  </div>
+
+                  <div>
+                    <label htmlFor="live-fno-type" className="mb-1.5 block text-xs font-semibold text-slate-300">
+                      Contract Type
+                    </label>
+                    <select
+                      id="live-fno-type"
+                      value={fnoContractType}
+                      onChange={(e) => {
+                        const ct = e.target.value;
+                        setFnoContractType(ct);
+                        const nextStrike = ct === 'FUT' ? '' : fnoStrike;
+                        if (ct === 'FUT') setFnoStrike('');
+                        void fetchFnoContracts({ contractType: ct, strike: nextStrike }, true);
+                      }}
+                      className="min-h-[40px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 text-sm text-slate-100 focus:border-sky-400 focus:outline-none"
+                    >
+                      <option value="FUT">Futures (FUT)</option>
+                      <option value="CE">Call Options (CE)</option>
+                      <option value="PE">Put Options (PE)</option>
+                      <option value="FO">All F&amp;O</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label htmlFor="live-fno-expiry" className="mb-1.5 block text-xs font-semibold text-slate-300">
+                      Expiry Date
+                    </label>
+                    <select
+                      id="live-fno-expiry"
+                      value={fnoExpiry}
+                      onChange={(e) => {
+                        const exp = e.target.value;
+                        setFnoExpiry(exp);
+                        setFnoStrike('');
+                        void fetchFnoContracts({ expiry: exp, strike: '' }, true);
+                      }}
+                      className="min-h-[40px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 font-mono text-sm text-slate-100 focus:border-sky-400 focus:outline-none"
+                    >
+                      <option value="">All Expiries ({fnoData?.expiries.length ?? 0})</option>
+                      {(fnoData?.expiries ?? []).map((exp) => (
+                        <option key={exp} value={exp}>
+                          {exp}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div>
+                    <label htmlFor="live-fno-strike" className="mb-1.5 block text-xs font-semibold text-slate-300">
+                      Strike Price
+                    </label>
+                    <select
+                      id="live-fno-strike"
+                      value={fnoStrike}
+                      disabled={fnoContractType === 'FUT'}
+                      onChange={(e) => {
+                        const stk = e.target.value;
+                        setFnoStrike(stk);
+                        void fetchFnoContracts({ strike: stk }, true);
+                      }}
+                      className="min-h-[40px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 font-mono text-sm text-slate-100 focus:border-sky-400 focus:outline-none disabled:opacity-50"
+                    >
+                      <option value="">
+                        {fnoContractType === 'FUT'
+                          ? 'N/A (Futures)'
+                          : `All Strikes (${fnoData?.strikes.length ?? 0})`}
+                      </option>
+                      {(fnoData?.strikes ?? []).map((stk) => (
+                        <option key={stk} value={String(stk)}>
+                          {stk}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => void fetchFnoContracts(undefined, true)}
+                    disabled={loadingFno}
+                    className="min-h-[40px] shrink-0 whitespace-nowrap rounded-lg border border-slate-700 bg-[#0b1120] px-3.5 py-2 text-xs font-semibold text-slate-200 hover:border-slate-500 hover:bg-slate-800 disabled:opacity-50"
+                  >
+                    {loadingFno ? 'Loading...' : 'Refresh Contracts'}
+                  </button>
+                </div>
+
+                {fnoData && fnoData.contracts.length > 0 ? (
+                  <div className="space-y-2">
+                    <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-400">
+                      <span>
+                        Matching F&amp;O Contracts ({fnoData.count}) — click one to bind exact contract symbol &amp; instrument key:
+                      </span>
+                      {fnoData.underlyings.length > 0 && !fnoUnderlying && (
+                        <span className="font-mono text-slate-500">
+                          Underlyings: {fnoData.underlyings.slice(0, 6).join(', ')}
+                        </span>
+                      )}
+                    </div>
+                    <div className="flex max-h-[168px] flex-wrap gap-1.5 overflow-y-auto pt-0.5">
+                      {fnoData.contracts.map((item) => (
+                        <button
+                          key={`live-fno-${item.broker_id}-${item.instrument_key}`}
+                          type="button"
+                          onClick={() => handleSelectInstrument(item)}
+                          className={`min-h-[32px] shrink-0 whitespace-nowrap rounded-md border px-2.5 py-1 font-mono text-xs tabular-nums transition-colors ${
+                            symbolInput === item.trading_symbol && selectedInstrumentKey === item.instrument_key
+                              ? 'border-sky-400 bg-sky-400/15 text-sky-300'
+                              : 'border-slate-700 bg-[#0b1120] text-slate-300 hover:border-slate-500'
+                          }`}
+                        >
+                          {item.trading_symbol}
+                          {item.expiry ? ` · Exp ${item.expiry}` : ''}
+                          {item.strike && item.strike > 0 ? ` · ${item.strike}` : ''}
+                          {item.lot_size && item.lot_size > 1 ? ` · Lot ${item.lot_size}` : ''} · {item.broker_id}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                ) : (
+                  <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-800/80 pt-3 text-xs text-slate-400">
+                    <span>
+                      No {fnoExchange} {fnoContractType} contracts found in SQLite for the current filter. Sync Upstox or Zerodha instrument master to load live Futures &amp; Options contracts.
+                    </span>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => void handleSyncInstruments('upstox')}
+                        disabled={syncingMaster !== null}
+                        className="shrink-0 whitespace-nowrap rounded-md border border-slate-700 bg-[#0b1120] px-3 py-1.5 text-xs font-semibold text-slate-200 hover:border-sky-400 disabled:opacity-50"
+                      >
+                        Sync Upstox Master
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => void handleSyncInstruments('zerodha')}
+                        disabled={syncingMaster !== null}
+                        className="shrink-0 whitespace-nowrap rounded-md border border-slate-700 bg-[#0b1120] px-3 py-1.5 text-xs font-semibold text-slate-200 hover:border-sky-400 disabled:opacity-50"
+                      >
+                        Sync Zerodha Master
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* 3. Bound Target Subscribe Form & Feedback */}
           <form
             onSubmit={(e) => {
               e.preventDefault();
               void subscribeAsset(symbolInput, exchangeInput, selectedInstrumentType, selectedInstrumentKey);
             }}
-            className="grid grid-cols-1 gap-3 md:grid-cols-[1fr_140px_auto]"
+            className="space-y-3"
           >
-            <div className="relative">
-              <label htmlFor="ws-symbol-input" className="sr-only">
-                Asset Symbol or F&amp;O Contract
-              </label>
-              <div className="relative flex items-center">
-                <Search className="pointer-events-none absolute left-3 h-4 w-4 text-slate-500" />
+            <div className="grid grid-cols-1 items-end gap-4 sm:grid-cols-2 lg:grid-cols-[1.4fr_0.9fr_auto]">
+              <div>
+                <div className="mb-1.5 flex items-center justify-between gap-2">
+                  <label htmlFor="ws-symbol-input" className="block text-[13px] font-semibold text-slate-200">
+                    Symbol / Contract
+                  </label>
+                  {selectedInstrumentKey && (
+                    <span className="font-mono text-[11px] text-sky-400">{selectedInstrumentKey}</span>
+                  )}
+                </div>
                 <input
                   id="ws-symbol-input"
                   type="text"
                   value={symbolInput}
-                  onFocus={() => setLookupOpen(true)}
                   onChange={(e) => {
-                    setSymbolInput(e.target.value);
+                    setSymbolInput(e.target.value.toUpperCase());
                     setSelectedInstrumentType('');
                     setSelectedInstrumentKey('');
-                    setLookupOpen(true);
                   }}
-                  placeholder="Type symbol or F&O contract (e.g. TATAMOTORS, NIFTY26NOVFUT, MSFT)"
+                  placeholder="RELIANCE or NIFTY26NOVFUT"
                   autoComplete="off"
-                  className="min-h-[42px] w-full rounded-lg border border-slate-700 bg-[#0b1120] pl-9 pr-3 text-[13px] text-slate-100 placeholder:text-slate-500 focus:border-sky-400 focus:outline-none"
+                  className="min-h-[42px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 font-mono text-sm text-slate-100 placeholder:text-slate-500 focus:border-sky-400 focus:outline-none"
                 />
               </div>
 
-              {lookupOpen && lookupHits.length > 0 && (
-                <div className="absolute z-30 mt-1.5 max-h-64 w-full overflow-y-auto rounded-lg border border-slate-700 bg-[#0b1120] shadow-xl">
-                  {lookupHits.map((hit) => (
-                    <button
-                      key={`${hit.broker_id}-${hit.exchange}-${hit.trading_symbol}-${hit.instrument_key}`}
-                      type="button"
-                      onClick={() => {
-                        setSymbolInput(hit.trading_symbol);
-                        setExchangeInput(hit.exchange || 'NSE');
-                        setSelectedInstrumentType(hit.instrument_type || '');
-                        setSelectedInstrumentKey(hit.instrument_key || '');
-                        setLookupOpen(false);
-                        void subscribeAsset(
-                          hit.trading_symbol,
-                          hit.exchange || 'NSE',
-                          hit.instrument_type || '',
-                          hit.instrument_key || ''
-                        );
-                      }}
-                      className="flex w-full items-center justify-between border-b border-slate-800/80 px-3.5 py-2.5 text-left text-xs hover:bg-slate-800/70 last:border-b-0"
-                    >
-                      <div>
-                        <span className="font-mono font-semibold text-slate-100">{hit.trading_symbol}</span>
-                        <span className="ml-2 text-slate-400">{hit.name || hit.asset_symbol || ''}</span>
-                      </div>
-                      <span className="font-mono text-[11px] text-slate-400">
-                        {hit.exchange} · {hit.instrument_type}
-                        {hit.expiry ? ` · ${hit.expiry}` : ''}
-                      </span>
-                    </button>
-                  ))}
-                </div>
-              )}
-            </div>
+              <div>
+                <label htmlFor="ws-exchange-select" className="mb-1.5 block text-[13px] font-semibold text-slate-200">
+                  Exchange
+                </label>
+                <select
+                  id="ws-exchange-select"
+                  value={exchangeInput}
+                  onChange={(e) => {
+                    const ex = e.target.value;
+                    setExchangeInput(ex);
+                    setSelectedInstrumentKey('');
+                    if (['NFO', 'BFO', 'MCX'].includes(ex)) {
+                      setFnoOpen(true);
+                      setFnoExchange(ex);
+                      void fetchFnoContracts({ exchange: ex, expiry: '', strike: '' }, true);
+                    }
+                  }}
+                  className="min-h-[42px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 text-sm text-slate-100 focus:border-sky-400 focus:outline-none"
+                >
+                  <option value="NSE">NSE (Equity / Index)</option>
+                  <option value="BSE">BSE (Equity / Index)</option>
+                  <option value="NFO">NFO (NSE F&amp;O)</option>
+                  <option value="BFO">BFO (BSE F&amp;O)</option>
+                  <option value="MCX">MCX (Commodity F&amp;O)</option>
+                  <option value="US">US (Global Equity)</option>
+                </select>
+              </div>
 
-            <div>
-              <label htmlFor="ws-exchange-select" className="sr-only">
-                Exchange
-              </label>
-              <select
-                id="ws-exchange-select"
-                value={exchangeInput}
-                onChange={(e) => setExchangeInput(e.target.value)}
-                className="min-h-[42px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 text-[13px] text-slate-100 focus:border-sky-400 focus:outline-none"
+              <button
+                type="submit"
+                disabled={subscribing}
+                className="inline-flex min-h-[42px] shrink-0 items-center justify-center gap-1.5 whitespace-nowrap rounded-lg bg-sky-400 px-5 py-2 text-[13px] font-semibold text-sky-950 transition-colors hover:bg-sky-300 disabled:opacity-50"
               >
-                <option value="NSE">NSE (Eq/Idx)</option>
-                <option value="BSE">BSE (Eq/Idx)</option>
-                <option value="NFO">NFO (NSE F&amp;O)</option>
-                <option value="BFO">BFO (BSE F&amp;O)</option>
-                <option value="MCX">MCX (Commodity)</option>
-                <option value="US">US (Global Eq)</option>
-              </select>
+                <Plus className="h-4 w-4" />
+                <span>{subscribing ? 'Validating & Subscribing...' : 'Subscribe Asset'}</span>
+              </button>
             </div>
 
-            <button
-              type="submit"
-              disabled={subscribing}
-              className="inline-flex min-h-[42px] items-center justify-center gap-1.5 whitespace-nowrap rounded-lg bg-sky-400 px-4 py-2 text-[13px] font-semibold text-sky-950 hover:bg-sky-300 disabled:opacity-50"
-            >
-              <Plus className="h-4 w-4" />
-              <span>{subscribing ? 'Subscribing...' : 'Subscribe Asset'}</span>
-            </button>
+            {feedback && (
+              <div
+                className={`flex items-center gap-2 text-[13px] ${
+                  feedback.type === 'ok' ? 'text-emerald-400' : 'text-red-400'
+                }`}
+                role="status"
+                aria-live="polite"
+              >
+                {feedback.type === 'ok' ? <Check className="h-4 w-4 shrink-0" /> : <AlertCircle className="h-4 w-4 shrink-0" />}
+                <span>{feedback.text}</span>
+              </div>
+            )}
           </form>
 
           {/* Quick Asset Presets */}
-          <div className="mt-3 flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-slate-800/80 pt-3 text-xs">
+          <div className="flex flex-wrap items-center gap-x-4 gap-y-2 border-t border-slate-800/80 pt-3 text-xs">
             <span className="font-medium text-slate-500">Quick Toggle:</span>
             {PRESET_ASSETS.map((preset) => {
               const isSubscribed = subscribedSet.has(assetKey(preset.symbol, preset.exchange));

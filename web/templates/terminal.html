@@ -114,12 +114,30 @@
     .dot { width: 8px; height: 8px; border-radius: 999px; display: inline-block; background: var(--amber); }
     .dot.open { background: var(--green); box-shadow: 0 0 8px rgba(22,163,74,0.75); }
     .dot.paused { background: var(--text-dim); }
+    .lookup-grid {
+      display: grid;
+      grid-template-columns: 1fr 190px auto auto;
+      gap: 10px;
+      align-items: end;
+    }
+    .fno-grid {
+      display: grid;
+      grid-template-columns: 0.8fr 1.1fr 0.9fr 1fr 1fr auto;
+      gap: 10px;
+      align-items: end;
+    }
     .sub-form {
       display: grid;
-      grid-template-columns: 1fr 150px auto;
+      grid-template-columns: 1.4fr 0.9fr auto;
       gap: 12px;
-      margin-top: 12px;
-      position: relative;
+      align-items: end;
+    }
+    .field-label {
+      display: block;
+      font-size: 12px;
+      font-weight: 600;
+      color: #cbd5e1;
+      margin-bottom: 6px;
     }
     input, select {
       min-height: 40px;
@@ -133,34 +151,29 @@
       font-family: var(--font-sans);
     }
     input:focus, select:focus { outline: none; border-color: var(--accent); }
-    .lookup-menu {
-      position: absolute;
-      top: 44px;
-      left: 0;
-      right: 0;
-      max-height: 240px;
-      overflow-y: auto;
-      background: var(--bg);
-      border: 1px solid var(--border-strong);
-      border-radius: 8px;
-      z-index: 40;
-      display: none;
-    }
-    .lookup-menu.open { display: block; }
-    .lookup-item {
-      width: 100%;
-      text-align: left;
-      background: transparent;
-      border: 0;
-      border-bottom: 1px solid var(--border);
-      padding: 9px 12px;
-      color: var(--text);
-      font-size: 12px;
+    .chip-wrap {
       display: flex;
-      justify-content: space-between;
-      cursor: pointer;
+      flex-wrap: wrap;
+      gap: 6px;
+      margin-top: 10px;
+      max-height: 150px;
+      overflow-y: auto;
     }
-    .lookup-item:hover { background: var(--surface-hover); }
+    .chip-btn {
+      min-height: 30px;
+      padding: 4px 10px;
+      border-radius: 6px;
+      border: 1px solid var(--border-strong);
+      background: var(--bg);
+      color: #cbd5e1;
+      font-family: var(--font-mono);
+      font-size: 11px;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .chip-btn:hover { border-color: var(--text-muted); }
+    .chip-btn.active { border-color: var(--accent); background: rgba(56,189,248,0.14); color: #7dd3fc; }
+    .block-sep { border-bottom: 1px solid var(--border); padding-bottom: 16px; margin-bottom: 16px; }
     .presets {
       margin-top: 12px;
       padding-top: 10px;
@@ -216,7 +229,7 @@
     @media (max-width: 960px) {
       .workspace { grid-template-columns: 1fr; }
       .telemetry-grid { grid-template-columns: repeat(2, 1fr); }
-      .sub-form { grid-template-columns: 1fr; }
+      .lookup-grid, .fno-grid, .sub-form { grid-template-columns: 1fr; }
       nav { display: none; }
     }
   </style>
@@ -277,29 +290,111 @@
     </section>
 
     <section id="subscribeSection" class="panel">
-      <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
+      <div class="block-sep" style="display:flex;justify-content:space-between;align-items:flex-end;gap:12px;flex-wrap:wrap;">
         <div>
-          <h2 style="margin:0;font-size:15px;">Subscribe Any Asset to Live WebSocket Stream</h2>
-          <p class="muted" style="margin:2px 0 0;font-size:12px;">Enter an Equity, Index, or search F&amp;O contracts from SQLite Instrument Lookup.</p>
+          <h2 style="margin:0;font-size:15px;">Subscribe Asset to Live WebSocket Stream</h2>
+          <p class="muted" style="margin:2px 0 0;font-size:12px;">Supports Equity, Index, Futures &amp; Options (NFO/BFO/MCX). Look up or bind a verified contract from SQLite before subscribing.</p>
         </div>
-        <div id="feedbackMsg" style="font-size:12px;font-weight:500;"></div>
+        <div id="instrStatsText" class="mono muted" style="font-size:12px;"></div>
       </div>
 
-      <form id="subForm" class="sub-form" autocomplete="off">
-        <div style="position:relative;">
-          <input id="symbolInput" type="text" placeholder="Type symbol or F&O contract (e.g. RELIANCE, NIFTY26NOVFUT, AAPL)" />
-          <div id="lookupMenu" class="lookup-menu"></div>
+      <!-- 1. SQLite Instrument Lookup & Master Sync -->
+      <div class="block-sep">
+        <div class="lookup-grid">
+          <div>
+            <label for="instrSearchInput" class="field-label">SQLite Instrument Lookup (Under 5 MB RAM)</label>
+            <input id="instrSearchInput" type="text" placeholder="Search Equity or F&O (e.g. RELIANCE, NIFTY FUT, NIFTY 24500 CE)..." autocomplete="off" />
+          </div>
+          <div>
+            <label for="instrTypeFilter" class="field-label">Segment / Contract</label>
+            <select id="instrTypeFilter">
+              <option value="ALL">All Instruments</option>
+              <option value="EQUITY">Equity &amp; Index</option>
+              <option value="FO">Futures &amp; Options (F&amp;O)</option>
+              <option value="FUT">Futures (FUT)</option>
+              <option value="OPT">Options (CE / PE)</option>
+              <option value="CE">Call Options (CE)</option>
+              <option value="PE">Put Options (PE)</option>
+            </select>
+          </div>
+          <button id="syncUpstoxBtn" class="btn" type="button">Sync Upstox Master</button>
+          <button id="syncZerodhaBtn" class="btn" type="button">Sync Zerodha Master</button>
         </div>
-        <select id="exchangeSelect">
-          <option value="NSE">NSE (Eq/Idx)</option>
-          <option value="BSE">BSE (Eq/Idx)</option>
-          <option value="NFO">NFO (NSE F&amp;O)</option>
-          <option value="BFO">BFO (BSE F&amp;O)</option>
-          <option value="MCX">MCX (Commodity)</option>
-          <option value="US">US (Global Eq)</option>
-        </select>
-        <button class="btn btn-primary" type="submit">Subscribe Asset</button>
+        <div id="instrFeedbackMsg" style="font-size:12px;margin-top:8px;"></div>
+        <div id="instrResultsWrap" class="chip-wrap"></div>
+      </div>
+
+      <!-- 2. Futures & Options Contract Finder -->
+      <div class="block-sep">
+        <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
+          <div>
+            <div style="font-size:13px;font-weight:600;">Futures &amp; Options Contract Finder (NFO / BFO / MCX)</div>
+            <div class="muted" style="font-size:12px;">Pick an underlying, contract type (FUT / CE / PE), expiry, and strike from local SQLite before subscribing to the live stream.</div>
+          </div>
+          <button id="toggleFnoBtn" class="btn btn-sm" type="button">Open F&amp;O Contract Finder</button>
+        </div>
+
+        <div id="fnoPanel" style="display:none;margin-top:12px;">
+          <div class="fno-grid">
+            <div>
+              <label for="fnoExchSelect" class="field-label">F&amp;O Exchange</label>
+              <select id="fnoExchSelect">
+                <option value="NFO">NFO (NSE F&amp;O)</option>
+                <option value="BFO">BFO (BSE F&amp;O)</option>
+                <option value="MCX">MCX (Commodities)</option>
+              </select>
+            </div>
+            <div>
+              <label for="fnoUlInput" class="field-label">Underlying</label>
+              <input id="fnoUlInput" type="text" list="fnoUlList" value="NIFTY" placeholder="NIFTY, BANKNIFTY..." autocomplete="off" />
+              <datalist id="fnoUlList"></datalist>
+            </div>
+            <div>
+              <label for="fnoTypeSelect" class="field-label">Contract Type</label>
+              <select id="fnoTypeSelect">
+                <option value="FUT">Futures (FUT)</option>
+                <option value="CE">Call Options (CE)</option>
+                <option value="PE">Put Options (PE)</option>
+                <option value="FO">All F&amp;O</option>
+              </select>
+            </div>
+            <div>
+              <label for="fnoExpSelect" class="field-label">Expiry Date</label>
+              <select id="fnoExpSelect"><option value="">All Expiries (0)</option></select>
+            </div>
+            <div>
+              <label for="fnoStrikeSelect" class="field-label">Strike Price</label>
+              <select id="fnoStrikeSelect" disabled><option value="">N/A (Futures)</option></select>
+            </div>
+            <button id="refreshFnoBtn" class="btn" type="button">Refresh Contracts</button>
+          </div>
+          <div id="fnoContractsWrap" class="chip-wrap"></div>
+        </div>
+      </div>
+
+      <!-- 3. Target Subscribe Form -->
+      <form id="subForm" class="sub-form" autocomplete="off">
+        <div>
+          <div style="display:flex;justify-content:space-between;align-items:center;gap:8px;">
+            <label for="symbolInput" class="field-label">Symbol / Contract</label>
+            <span id="boundKeyBadge" class="mono" style="font-size:11px;color:var(--accent);"></span>
+          </div>
+          <input id="symbolInput" class="mono" type="text" placeholder="RELIANCE or NIFTY26NOVFUT" />
+        </div>
+        <div>
+          <label for="exchangeSelect" class="field-label">Exchange</label>
+          <select id="exchangeSelect">
+            <option value="NSE">NSE (Equity / Index)</option>
+            <option value="BSE">BSE (Equity / Index)</option>
+            <option value="NFO">NFO (NSE F&amp;O)</option>
+            <option value="BFO">BFO (BSE F&amp;O)</option>
+            <option value="MCX">MCX (Commodity F&amp;O)</option>
+            <option value="US">US (Global Equity)</option>
+          </select>
+        </div>
+        <button id="subSubmitBtn" class="btn btn-primary" type="submit">+ Subscribe Asset</button>
       </form>
+      <div id="feedbackMsg" style="font-size:12px;font-weight:500;margin-top:8px;"></div>
 
       <div id="presetBar" class="presets"></div>
     </section>
@@ -565,43 +660,187 @@
 
       async function subscribeAsset(sym, exch, itype, ikey) {
         const cleanSym = String(sym || '').trim().toUpperCase();
-        if (!cleanSym) return;
-        selectedKey = keyOf(cleanSym, exch || 'NSE');
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ action: 'subscribe', symbol: cleanSym, exchange: exch || 'NSE', instrument_type: itype || '', instrument_key: ikey || '' }));
-        }
-        const res = await fetch('/api/live/subscribe', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ symbol: cleanSym, exchange: exch || 'NSE', instrument_type: itype || '', instrument_key: ikey || '' })
-        });
-        const data = await res.json();
-        if (!res.ok) {
-          setFeedback(data.detail || 'Subscribe failed', true);
+        const cleanExch = String(exch || 'NSE').trim().toUpperCase();
+        if (!cleanSym) {
+          setFeedback('Select an instrument from SQLite Lookup / F&O Finder or enter a valid symbol first.', true);
           return;
         }
-        applyPayload(data);
-        setFeedback(data.message || `Subscribed ${exch}:${cleanSym}`, false);
-        el('symbolInput').value = '';
-        el('lookupMenu').classList.remove('open');
+        el('subSubmitBtn').disabled = true;
+        setFeedback('', false);
+        try {
+          const res = await fetch('/api/live/subscribe', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ symbol: cleanSym, exchange: cleanExch, instrument_type: itype || '', instrument_key: ikey || '' })
+          });
+          const data = await res.json().catch(() => ({}));
+          if (!res.ok) {
+            setFeedback(data.detail || 'Subscribe failed', true);
+            return;
+          }
+          const subSym = (data.subscribed_asset && data.subscribed_asset.symbol) || cleanSym;
+          const subExch = (data.subscribed_asset && data.subscribed_asset.exchange) || cleanExch;
+          selectedKey = keyOf(subSym, subExch);
+          applyPayload(data);
+          setFeedback(data.message || `Subscribed ${subExch}:${subSym}`, false);
+          el('symbolInput').value = '';
+          selectedMeta = { instrument_type: '', instrument_key: '' };
+          el('boundKeyBadge').textContent = '';
+        } finally {
+          el('subSubmitBtn').disabled = false;
+        }
       }
 
       async function unsubscribeAsset(sym, exch) {
-        if (ws && ws.readyState === WebSocket.OPEN) {
-          ws.send(JSON.stringify({ action: 'unsubscribe', symbol: sym, exchange: exch }));
-        }
         const res = await fetch('/api/live/unsubscribe', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ symbol: sym, exchange: exch })
         });
-        const data = await res.json();
+        const data = await res.json().catch(() => ({}));
         if (!res.ok) {
           setFeedback(data.detail || 'Unsubscribe failed', true);
           return;
         }
         applyPayload(data);
         setFeedback(data.message || `Unsubscribed ${exch}:${sym}`, false);
+      }
+
+      function selectInstrument(item) {
+        el('symbolInput').value = item.trading_symbol;
+        el('exchangeSelect').value = item.exchange || 'NSE';
+        selectedMeta = { instrument_type: item.instrument_type || '', instrument_key: item.instrument_key || '' };
+        el('boundKeyBadge').textContent = item.instrument_key || '';
+        setFeedback('', false);
+        if (['NFO', 'BFO', 'MCX', 'NSE_FO', 'BSE_FO', 'MCX_FO'].includes(item.exchange)) {
+          el('fnoPanel').style.display = 'block';
+          el('toggleFnoBtn').textContent = 'Hide F&O Finder';
+          el('fnoExchSelect').value = item.exchange;
+          if (item.asset_symbol) el('fnoUlInput').value = item.asset_symbol;
+          if (['FUT', 'CE', 'PE'].includes(item.instrument_type)) el('fnoTypeSelect').value = item.instrument_type;
+          el('fnoExpSelect').value = item.expiry || '';
+          el('fnoStrikeSelect').value = item.strike && item.strike > 0 ? String(item.strike) : '';
+        }
+      }
+
+      function renderChips(wrapEl, items, isFno) {
+        wrapEl.innerHTML = '';
+        items.forEach((item) => {
+          const btn = document.createElement('button');
+          btn.type = 'button';
+          const active = el('symbolInput').value.toUpperCase() === item.trading_symbol && el('exchangeSelect').value === item.exchange;
+          btn.className = 'chip-btn' + (active ? ' active' : '');
+          const parts = [item.trading_symbol];
+          if (!isFno) parts.push(item.exchange);
+          if (item.instrument_type && item.instrument_type !== 'EQUITY') parts.push(item.instrument_type);
+          if (item.expiry) parts.push(`Exp ${item.expiry}`);
+          if (item.strike && item.strike > 0) parts.push(isFno ? String(item.strike) : `@${item.strike}`);
+          if (isFno && item.lot_size && item.lot_size > 1) parts.push(`Lot ${item.lot_size}`);
+          btn.textContent = `${parts.join(' · ')} (${item.broker_id})`;
+          btn.onclick = () => {
+            selectInstrument(item);
+            renderChips(wrapEl, items, isFno);
+          };
+          wrapEl.appendChild(btn);
+        });
+      }
+
+      async function searchInstruments(q, itype) {
+        try {
+          const params = new URLSearchParams({ q: q || '', limit: '16' });
+          if (itype && itype !== 'ALL') params.set('instrument_type', itype);
+          const res = await fetch(`/api/instruments/search?${params.toString()}`);
+          const data = await res.json();
+          const rows = data.results || data.items || [];
+          if (data.stats) {
+            el('instrStatsText').textContent = `Indexed Symbols: ${Number(data.stats.total_instruments || 0).toLocaleString()} · F&O: ${Number(data.stats.fno_instruments || 0).toLocaleString()} · DB: ${data.stats.db_size_mb} MB`;
+          }
+          renderChips(el('instrResultsWrap'), rows.slice(0, 10), false);
+          const msgEl = el('instrFeedbackMsg');
+          if ((q || '').trim() && rows.length === 0) {
+            msgEl.style.color = '#f87171';
+            msgEl.textContent = `No matching ${itype === 'ALL' ? '' : itype + ' '}symbol for "${q.trim().toUpperCase()}" in local SQLite yet. Click Sync Upstox Master or Sync Zerodha Master.`;
+          } else {
+            msgEl.textContent = '';
+          }
+        } catch {}
+      }
+
+      async function fetchFnoContracts(syncTarget) {
+        const exch = el('fnoExchSelect').value || 'NFO';
+        const ul = el('fnoUlInput').value.trim().toUpperCase();
+        const ctype = el('fnoTypeSelect').value || 'FO';
+        const prevExp = el('fnoExpSelect').value;
+        const prevStrike = ctype === 'FUT' ? '' : el('fnoStrikeSelect').value;
+        const params = new URLSearchParams({ underlying: ul, exchange: exch, contract_type: ctype, limit: '40' });
+        if (prevExp) params.set('expiry', prevExp);
+        if (prevStrike) params.set('strike', prevStrike);
+        try {
+          const res = await fetch(`/api/instruments/fno?${params.toString()}`);
+          const body = await res.json();
+          if (!res.ok) return;
+          const ulList = el('fnoUlList');
+          ulList.innerHTML = '';
+          (body.underlyings || []).forEach((u) => {
+            const opt = document.createElement('option');
+            opt.value = u;
+            ulList.appendChild(opt);
+          });
+          const expSel = el('fnoExpSelect');
+          expSel.innerHTML = `<option value="">All Expiries (${(body.expiries || []).length})</option>`;
+          (body.expiries || []).forEach((exp) => {
+            const opt = document.createElement('option');
+            opt.value = exp;
+            opt.textContent = exp;
+            expSel.appendChild(opt);
+          });
+          if (prevExp && (body.expiries || []).includes(prevExp)) expSel.value = prevExp;
+
+          const stkSel = el('fnoStrikeSelect');
+          const isFut = ctype === 'FUT';
+          stkSel.disabled = isFut;
+          stkSel.innerHTML = `<option value="">${isFut ? 'N/A (Futures)' : `All Strikes (${(body.strikes || []).length})`}</option>`;
+          if (!isFut) {
+            (body.strikes || []).forEach((stk) => {
+              const opt = document.createElement('option');
+              opt.value = String(stk);
+              opt.textContent = String(stk);
+              stkSel.appendChild(opt);
+            });
+            if (prevStrike && (body.strikes || []).map(String).includes(prevStrike)) stkSel.value = prevStrike;
+          }
+          const contracts = body.contracts || [];
+          renderChips(el('fnoContractsWrap'), contracts, true);
+          if (syncTarget && contracts.length > 0) {
+            const match = contracts[0];
+            el('symbolInput').value = match.trading_symbol;
+            el('exchangeSelect').value = match.exchange || exch;
+            selectedMeta = { instrument_type: match.instrument_type || '', instrument_key: match.instrument_key || '' };
+            el('boundKeyBadge').textContent = match.instrument_key || '';
+          }
+        } catch {}
+      }
+
+      async function syncMaster(brokerId) {
+        const msgEl = el('instrFeedbackMsg');
+        msgEl.style.color = '#94a3b8';
+        msgEl.textContent = `Syncing ${brokerId.toUpperCase()} instrument master...`;
+        try {
+          const res = await fetch('/api/instruments/sync', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ broker_id: brokerId })
+          });
+          const body = await res.json();
+          if (!res.ok) throw new Error(body.detail || 'Sync failed');
+          msgEl.style.color = '#4ade80';
+          msgEl.textContent = `Synced ${Number(body.indexed_count || 0).toLocaleString()} ${brokerId.toUpperCase()} instruments into local SQLite.`;
+          await searchInstruments(el('instrSearchInput').value, el('instrTypeFilter').value);
+          if (el('fnoPanel').style.display !== 'none') await fetchFnoContracts(false);
+        } catch (err) {
+          msgEl.style.color = '#f87171';
+          msgEl.textContent = err.message || 'Sync failed';
+        }
       }
 
       function closeStream() {
@@ -661,35 +900,58 @@
       };
 
       el('symbolInput').oninput = () => {
+        el('symbolInput').value = el('symbolInput').value.toUpperCase();
         selectedMeta = { instrument_type: '', instrument_key: '' };
-        clearTimeout(lookupTimer);
-        const q = el('symbolInput').value.trim();
-        const menu = el('lookupMenu');
-        if (q.length < 2) { menu.classList.remove('open'); return; }
-        lookupTimer = setTimeout(async () => {
-          try {
-            const res = await fetch(`/api/instruments/search?q=${encodeURIComponent(q)}&limit=10`);
-            const data = await res.json();
-            const items = data.items || [];
-            if (!items.length) { menu.classList.remove('open'); return; }
-            menu.innerHTML = '';
-            items.forEach((hit) => {
-              const btn = document.createElement('button');
-              btn.type = 'button';
-              btn.className = 'lookup-item';
-              btn.innerHTML = `<span><strong class="mono">${hit.trading_symbol}</strong> <span class="muted">${hit.name || ''}</span></span><span class="mono muted">${hit.exchange} · ${hit.instrument_type}</span>`;
-              btn.onclick = () => {
-                el('symbolInput').value = hit.trading_symbol;
-                el('exchangeSelect').value = hit.exchange || 'NSE';
-                selectedMeta = { instrument_type: hit.instrument_type || '', instrument_key: hit.instrument_key || '' };
-                subscribeAsset(hit.trading_symbol, hit.exchange || 'NSE', hit.instrument_type || '', hit.instrument_key || '');
-              };
-              menu.appendChild(btn);
-            });
-            menu.classList.add('open');
-          } catch {}
-        }, 180);
+        el('boundKeyBadge').textContent = '';
       };
+
+      el('exchangeSelect').onchange = () => {
+        const ex = el('exchangeSelect').value;
+        selectedMeta.instrument_key = '';
+        el('boundKeyBadge').textContent = '';
+        if (['NFO', 'BFO', 'MCX'].includes(ex)) {
+          el('fnoPanel').style.display = 'block';
+          el('toggleFnoBtn').textContent = 'Hide F&O Finder';
+          el('fnoExchSelect').value = ex;
+          el('fnoExpSelect').value = '';
+          el('fnoStrikeSelect').value = '';
+          fetchFnoContracts(true);
+        }
+      };
+
+      el('instrSearchInput').oninput = () => {
+        clearTimeout(lookupTimer);
+        lookupTimer = setTimeout(() => searchInstruments(el('instrSearchInput').value, el('instrTypeFilter').value), 160);
+      };
+
+      el('instrTypeFilter').onchange = () => {
+        const t = el('instrTypeFilter').value;
+        searchInstruments(el('instrSearchInput').value, t);
+        if (['FO', 'FUT', 'OPT', 'CE', 'PE'].includes(t)) {
+          el('fnoPanel').style.display = 'block';
+          el('toggleFnoBtn').textContent = 'Hide F&O Finder';
+          el('fnoTypeSelect').value = t === 'OPT' ? 'CE' : t;
+          el('fnoExpSelect').value = '';
+          el('fnoStrikeSelect').value = '';
+          fetchFnoContracts(true);
+        }
+      };
+
+      el('syncUpstoxBtn').onclick = () => syncMaster('upstox');
+      el('syncZerodhaBtn').onclick = () => syncMaster('zerodha');
+      el('toggleFnoBtn').onclick = () => {
+        const p = el('fnoPanel');
+        const open = p.style.display === 'none';
+        p.style.display = open ? 'block' : 'none';
+        el('toggleFnoBtn').textContent = open ? 'Hide F&O Finder' : 'Open F&O Contract Finder';
+        if (open) fetchFnoContracts(false);
+      };
+      el('fnoExchSelect').onchange = () => { el('fnoExpSelect').value = ''; el('fnoStrikeSelect').value = ''; fetchFnoContracts(true); };
+      el('fnoUlInput').oninput = () => { el('fnoExpSelect').value = ''; el('fnoStrikeSelect').value = ''; fetchFnoContracts(true); };
+      el('fnoTypeSelect').onchange = () => { if (el('fnoTypeSelect').value === 'FUT') el('fnoStrikeSelect').value = ''; fetchFnoContracts(true); };
+      el('fnoExpSelect').onchange = () => { el('fnoStrikeSelect').value = ''; fetchFnoContracts(true); };
+      el('fnoStrikeSelect').onchange = () => fetchFnoContracts(true);
+      el('refreshFnoBtn').onclick = () => fetchFnoContracts(true);
 
       el('pauseBtn').onclick = () => {
         paused = !paused;
@@ -719,6 +981,7 @@
       };
 
       fetch('/api/live/status').then((r) => r.json()).then(applyPayload).catch(() => {});
+      searchInstruments('', 'ALL');
       connectStream();
     })();
   </script>

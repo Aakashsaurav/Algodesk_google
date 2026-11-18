@@ -742,13 +742,43 @@ class TestBrokerHubArchitecture(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             watchlist_path = Path(tmpdir) / "watchlist.json"
             trail = AuditTrail(Path(tmpdir) / "audit_chain.db")
-            tick_prices = {"RELIANCE": 2950.0, "TCS": 3910.0}
+            idx = InstrumentIndex(Path(tmpdir) / "instruments.db")
+            idx.upsert_records(
+                "upstox",
+                [
+                    InstrumentRecord(
+                        broker_id="upstox",
+                        exchange="NSE",
+                        segment="NSE_EQ",
+                        trading_symbol="TATAMOTORS",
+                        asset_symbol="TATAMOTORS",
+                        name="Tata Motors Ltd",
+                        instrument_type="EQUITY",
+                        instrument_key="NSE_EQ|INE155A01022",
+                    ),
+                    InstrumentRecord(
+                        broker_id="upstox",
+                        exchange="NFO",
+                        segment="NSE_FO",
+                        trading_symbol="NIFTY26NOVFUT",
+                        asset_symbol="NIFTY",
+                        name="NIFTY NOV FUT",
+                        instrument_type="FUT",
+                        instrument_key="NSE_FO|50001",
+                        expiry="2026-11-26",
+                        lot_size=75,
+                    ),
+                ],
+            )
+            tick_prices = {"RELIANCE": 2950.0, "TCS": 3910.0, "TATAMOTORS": 910.0}
 
             def fake_yfinance_fetcher(subs: list):
                 out = {}
                 for raw_item in subs:
                     item = raw_item if isinstance(raw_item, dict) else {"symbol": raw_item, "exchange": "NSE", "instrument_type": ""}
                     sym = item["symbol"]
+                    if sym == "RANDOMXYZ123":
+                        continue
                     if sym == "NIFTY26NOVFUT":
                         out[sym] = _fetch_one_yahoo_quote(item)
                     else:
@@ -780,14 +810,25 @@ class TestBrokerHubArchitecture(unittest.TestCase):
                 audit=trail,
                 fetchers={"yfinance": fake_yfinance_fetcher},
                 watchlist_file=watchlist_path,
+                instruments=idx,
             )
+
+            # Random/unknown symbol or unknown F&O contract must fail cleanly and NOT enter watchlist
+            with self.assertRaises(ValueError):
+                mgr.subscribe("RANDOMXYZ123", exchange="NSE", instrument_type="EQUITY")
+            with self.assertRaises(ValueError):
+                mgr.subscribe("FAKE999999CE", exchange="NFO", instrument_type="CE")
+            subscribed_syms = [s["symbol"] for s in mgr.list_subscriptions()]
+            self.assertNotIn("RANDOMXYZ123", subscribed_syms)
+            self.assertNotIn("FAKE999999CE", subscribed_syms)
 
             sub_res = mgr.subscribe("TATAMOTORS", exchange="NSE", instrument_type="EQUITY")
             self.assertTrue(sub_res["ok"])
             self.assertEqual(sub_res["subscriptions"][0]["symbol"], "TATAMOTORS")
+            self.assertEqual(sub_res["subscriptions"][0]["instrument_key"], "NSE_EQ|INE155A01022")
             self.assertGreaterEqual(len(sub_res["quotes"][0]["history"]), 1)
 
-            # Subscribe an F&O contract -> non-blocking note when on Yahoo fallback
+            # Subscribe a valid F&O contract -> non-blocking note when on Yahoo fallback
             fno_res = mgr.subscribe("NIFTY26NOVFUT", exchange="NFO", instrument_type="FUT")
             fno_quote = next(q for q in fno_res["quotes"] if q["symbol"] == "NIFTY26NOVFUT")
             self.assertIsNone(fno_quote["ltp"])
@@ -799,6 +840,7 @@ class TestBrokerHubArchitecture(unittest.TestCase):
                 audit=trail,
                 fetchers={"yfinance": fake_yfinance_fetcher},
                 watchlist_file=watchlist_path,
+                instruments=idx,
             )
             self.assertIn("TATAMOTORS", [s["symbol"] for s in mgr2.list_subscriptions()])
 

@@ -38,7 +38,7 @@ from broker.upstox.auth import auth_manager as upstox_auth
 from broker.zerodha.auth import zerodha_auth_manager as zerodha_auth
 from config import IST_TZ, config
 from core.audit import AuditTrail, audit_trail
-from core.instruments import instrument_index
+from core.instruments import InstrumentIndex, instrument_index
 
 logger = logging.getLogger(__name__)
 
@@ -634,11 +634,13 @@ class HotStandbyFeedManager:
         audit: Optional[AuditTrail] = None,
         fetchers: Optional[Dict[str, Callable[[List[Any]], Dict[str, Dict[str, Any]]]]] = None,
         watchlist_file: Optional[Path] = None,
+        instruments: Optional[InstrumentIndex] = None,
     ) -> None:
         self._lock = threading.RLock()
         self._audit = audit or audit_trail
         self._fetchers = fetchers or dict(_DEFAULT_FETCHERS)
         self._watchlist_file = watchlist_file or (config.DATA_DIR / "watchlist.json")
+        self._instruments = instruments or instrument_index
         self._primary_id = (primary_id or "upstox").strip().lower()
         self._active_feed_id = self._primary_id
         self._forced_failover = False
@@ -768,25 +770,84 @@ class HotStandbyFeedManager:
         fetch_immediately: bool = True,
     ) -> Dict[str, Any]:
         clean_sym = (symbol or "").strip().upper()
+        for prefix in ("NSE:", "BSE:", "NFO:", "BFO:", "MCX:", "US:"):
+            if clean_sym.startswith(prefix):
+                clean_sym = clean_sym[len(prefix):].strip()
         if not clean_sym:
             raise ValueError("Asset symbol is required to subscribe.")
         clean_exch = (exchange or "NSE").strip().upper()
         clean_itype = (instrument_type or "").strip().upper()
         clean_ikey = (instrument_key or "").strip()
 
-        # Enrich metadata from SQLite index if user only typed symbol
-        if not clean_ikey or not clean_itype:
-            hits = instrument_index.search(clean_sym, exchange=clean_exch, limit=5)
-            exact = next(
-                (h for h in hits if h["trading_symbol"].upper() == clean_sym),
-                hits[0] if hits else None,
-            )
-            if exact:
-                clean_exch = exact.get("exchange") or clean_exch
-                if not clean_itype:
-                    clean_itype = str(exact.get("instrument_type") or "").upper()
-                if not clean_ikey:
-                    clean_ikey = str(exact.get("instrument_key") or "")
+        # Validate strictly against SQLite Instrument Index (exact symbol or bound instrument_key)
+        exact = self._instruments.find_exact(
+            clean_sym,
+            exchange=clean_exch,
+            instrument_type=clean_itype or None,
+            instrument_key=clean_ikey or None,
+        )
+
+        # If not yet in SQLite and neither broker master is synced, sync Upstox master once before failing
+        if exact is None and clean_exch not in {"US", "NASDAQ", "NYSE"}:
+            sync_meta = self._instruments.stats().get("sync_meta", {})
+            if not sync_meta and self._fetchers.get("upstox") is _fetch_live_quotes_upstox:
+                try:
+                    self._instruments.sync_upstox_master()
+                    exact = self._instruments.find_exact(
+                        clean_sym,
+                        exchange=clean_exch,
+                        instrument_type=clean_itype or None,
+                        instrument_key=clean_ikey or None,
+                    )
+                except Exception:
+                    pass
+
+        if exact is not None:
+            matched_asset = str(exact.get("asset_symbol") or "").upper()
+            if not (str(exact.get("instrument_type") or "").upper() == "INDEX" and matched_asset == clean_sym):
+                clean_sym = str(exact.get("trading_symbol") or clean_sym).upper()
+            clean_exch = str(exact.get("exchange") or clean_exch).upper()
+            if not clean_itype:
+                clean_itype = str(exact.get("instrument_type") or "").upper()
+            if not clean_ikey:
+                clean_ikey = str(exact.get("instrument_key") or "")
+        else:
+            is_fno = _is_fno_subscription(clean_sym, clean_exch, clean_itype)
+            if is_fno:
+                raise ValueError(
+                    f"Unknown F&O contract '{clean_sym}' ({clean_exch}). Select a valid contract from SQLite Instrument Lookup or F&O Contract Finder (sync master if empty)."
+                )
+            sync_meta = self._instruments.stats().get("sync_meta", {})
+            if clean_exch not in {"US", "NASDAQ", "NYSE"} and ("upstox" in sync_meta or "zerodha" in sync_meta):
+                raise ValueError(
+                    f"Symbol '{clean_sym}' ({clean_exch}) not found in SQLite Instrument Index. Select a valid asset from SQLite Instrument Lookup."
+                )
+            # For US equities or pre-sync setups, probe candidate fetchers for a real numeric quote before admitting
+            probe_entry = {
+                "symbol": clean_sym,
+                "exchange": clean_exch,
+                "instrument_type": clean_itype or "EQUITY",
+                "instrument_key": clean_ikey,
+            }
+            probe_ok = False
+            for fid in self._ordered_chain(self._primary_id):
+                fn = self._fetchers.get(fid)
+                if not fn:
+                    continue
+                if clean_exch in {"US", "NASDAQ", "NYSE"} and fid != "yfinance":
+                    continue
+                try:
+                    probed = fn([probe_entry]) or {}
+                    q = probed.get(clean_sym)
+                    if q and q.get("ltp") is not None and float(q["ltp"]) > 0:
+                        probe_ok = True
+                        break
+                except Exception:
+                    continue
+            if not probe_ok:
+                raise ValueError(
+                    f"Symbol '{clean_sym}' ({clean_exch}) not found in SQLite Instrument Index or live market feed. Use SQLite Instrument Lookup to pick a valid asset."
+                )
 
         entry = {
             "symbol": clean_sym,

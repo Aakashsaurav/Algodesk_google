@@ -496,6 +496,88 @@ class InstrumentIndex:
             "count": len(contracts),
         }
 
+    def find_exact(
+        self,
+        trading_symbol: str,
+        exchange: Optional[str] = None,
+        instrument_type: Optional[str] = None,
+        instrument_key: Optional[str] = None,
+        broker_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Return exact matching instrument record from SQLite (never partial substring fallback)."""
+        sym = (trading_symbol or "").strip().upper()
+        for prefix in ("NSE:", "BSE:", "NFO:", "BFO:", "MCX:", "US:"):
+            if sym.startswith(prefix):
+                sym = sym[len(prefix):].strip()
+        ikey = (instrument_key or "").strip()
+
+        with self._connect() as conn:
+            if ikey:
+                ikey_clauses = ["instrument_key = ?"]
+                ikey_params: List[Any] = [ikey]
+                if sym:
+                    ikey_clauses.append("(UPPER(trading_symbol) = ? OR UPPER(asset_symbol) = ?)")
+                    ikey_params.extend([sym, sym])
+                row = conn.execute(
+                    f"""
+                    SELECT broker_id, exchange, segment, trading_symbol, asset_symbol, name,
+                           instrument_type, instrument_key, instrument_token, expiry, strike,
+                           lot_size, tick_size
+                    FROM instruments
+                    WHERE {' AND '.join(ikey_clauses)}
+                    LIMIT 1
+                    """,
+                    ikey_params,
+                ).fetchone()
+                if row:
+                    item = dict(row)
+                    item["expiry"] = _normalize_expiry(item.get("expiry"))
+                    return item
+                return None
+
+            if not sym:
+                return None
+
+            clauses = [
+                "(UPPER(trading_symbol) = ? "
+                "OR (UPPER(asset_symbol) = ? AND UPPER(instrument_type) IN ('INDEX', 'EQUITY', 'EQ')) "
+                "OR (UPPER(instrument_type) = 'INDEX' AND UPPER(name) = ?))"
+            ]
+            params: List[Any] = [sym, sym, sym]
+            if broker_id and broker_id.strip().lower() not in {"all", ""}:
+                clauses.append("broker_id = ?")
+                params.append(broker_id.strip().lower())
+            if exchange and exchange.strip().upper() not in {"ALL", ""}:
+                ex_sql, ex_params = _exchange_sql_filter(exchange)
+                clauses.append(ex_sql)
+                params.extend(ex_params)
+            it_sql, it_params = _instrument_type_sql_filter(instrument_type)
+            if it_sql:
+                clauses.append(it_sql)
+                params.extend(it_params)
+
+            today_str = datetime.now(tz=IST_TZ).date().isoformat()
+            row = conn.execute(
+                f"""
+                SELECT broker_id, exchange, segment, trading_symbol, asset_symbol, name,
+                       instrument_type, instrument_key, instrument_token, expiry, strike,
+                       lot_size, tick_size
+                FROM instruments
+                WHERE {' AND '.join(clauses)}
+                ORDER BY CASE WHEN UPPER(trading_symbol) = ? THEN 0 ELSE 1 END,
+                         CASE WHEN broker_id = 'upstox' THEN 0 ELSE 1 END,
+                         CASE WHEN expiry IS NULL OR expiry = '' OR expiry >= ? THEN 0 ELSE 1 END,
+                         COALESCE(expiry, '9999-12-31') ASC
+                LIMIT 1
+                """,
+                [*params, sym, today_str],
+            ).fetchone()
+        if not row:
+            return None
+        item = dict(row)
+        item["expiry"] = _normalize_expiry(item.get("expiry"))
+        return item
+
     def resolve_key(
         self,
         trading_symbol: str,
