@@ -30,7 +30,7 @@ from broker.upstox.auth import auth_manager as upstox_auth_manager
 from broker.zerodha.auth import zerodha_auth_manager
 from config import IST_TZ, config
 from core.instruments import instrument_index
-from data.historical import historical_data_manager
+from core.historical import historical_data_manager
 
 logger = logging.getLogger(__name__)
 

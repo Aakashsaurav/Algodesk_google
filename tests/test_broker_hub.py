@@ -21,7 +21,7 @@ from broker.zerodha.feed import KiteTickerAdapter
 from config import IST_TZ, AppConfig
 from core.instruments import InstrumentIndex, InstrumentRecord
 from core.runtime import LiveBotEngine, OrderRequest
-from data.historical import HistoricalDataManager, compute_missing_date_ranges
+from core.historical import HistoricalDataManager, compute_missing_date_ranges
 from web.service import BrokerHubService
 
 
