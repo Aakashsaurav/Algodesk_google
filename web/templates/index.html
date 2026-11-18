@@ -709,6 +709,7 @@
         </div>
 
         <button id="openLoginBtn" class="btn btn-primary" type="button" style="width:100%;">Login &amp; Auto-Capture</button>
+        <p id="zerodhaLoginTip" class="hint" style="display:none;">If Kite shows &ldquo;The user is not enabled for the app&rdquo;, sign in with the exact Zerodha Client ID linked to this API key (or open in Incognito) and verify the app subscription is Active on <span class="mono">developers.kite.trade</span>.</p>
 
         <div id="captureStatusBox" class="capture-box">
           <div class="led-row" style="font-size:13px;">
@@ -1028,6 +1029,8 @@
     function syncDetectedCredsUI(brokerId) {
       const label = brokerDisplayName(brokerId);
       const creds = (state.overview && state.overview.credentials && state.overview.credentials[brokerId]) || {};
+      const tipEl = document.getElementById('zerodhaLoginTip');
+      if (tipEl) tipEl.style.display = brokerId === 'zerodha' ? 'block' : 'none';
       els.modalTitle.textContent = `Reconnect ${label} Session`;
       els.credApiKeyLabel.textContent = `${label} API Key`;
       els.credApiSecretLabel.textContent = `${label} API Secret`;

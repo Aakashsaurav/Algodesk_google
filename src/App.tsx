@@ -1601,6 +1601,12 @@ export default function App() {
                 <span>Login with {modalBrokerLabel} (Auto-Capture)</span>
               </button>
 
+              {modalBrokerId === 'zerodha' && (
+                <p className="text-xs leading-relaxed text-slate-400">
+                  If Kite shows <span className="font-mono text-slate-300">&quot;The user is not enabled for the app&quot;</span>, sign in with the exact Zerodha Client ID linked to this API key (or use an Incognito window) and confirm the app status/subscription is Active on <span className="font-mono text-slate-300">developers.kite.trade</span>.
+                </p>
+              )}
+
               {captureStatus && (
                 <div className="space-y-1.5 rounded-lg border border-slate-700 bg-[#0b1120] p-3.5">
                   <div className="flex items-center gap-2.5 text-[13px] font-semibold text-slate-100">

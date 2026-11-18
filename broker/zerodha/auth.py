@@ -150,6 +150,12 @@ class ZerodhaAuthManager:
                     err_msg = err_body.get("message") or err_msg
                 except Exception:
                     pass
+                if "not enabled for the app" in err_msg.lower():
+                    key_hint = f"{self.api_key[:4]}...{self.api_key[-3:]}" if len(self.api_key) > 7 else self.api_key
+                    err_msg = (
+                        f"{err_msg} (using API key {key_hint}). Check developers.kite.trade: confirm App status is Active "
+                        "(not expired/unpaid), Zerodha Client ID matches your login ID, and you are signed into the right Kite account."
+                    )
                 raise ValueError(f"Kite session exchange failed: {err_msg}") from exc
             parsed = resp.json()
             return parsed.get("data", parsed) if isinstance(parsed, dict) else {}
@@ -168,6 +174,12 @@ class ZerodhaAuthManager:
                 err_msg = err_body.get("message") or err_msg
             except Exception:
                 pass
+            if "not enabled for the app" in err_msg.lower():
+                key_hint = f"{self.api_key[:4]}...{self.api_key[-3:]}" if len(self.api_key) > 7 else self.api_key
+                err_msg = (
+                    f"{err_msg} (using API key {key_hint}). Check developers.kite.trade: confirm App status is Active "
+                    "(not expired/unpaid), Zerodha Client ID matches your login ID, and you are signed into the right Kite account."
+                )
             raise ValueError(f"Kite session exchange failed: {err_msg}") from exc
 
     def generate_token(self, request_token: str, redirect_uri: Optional[str] = None) -> dict:
