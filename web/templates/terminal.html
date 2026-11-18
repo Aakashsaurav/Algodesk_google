@@ -1,0 +1,722 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AlgoDesk — Live WebSocket Terminal</title>
+  <style>
+    :root {
+      --bg: #0b1120;
+      --surface: #111827;
+      --surface-hover: #172033;
+      --border: #1e293b;
+      --border-strong: #334155;
+      --text: #f8fafc;
+      --text-muted: #94a3b8;
+      --text-dim: #64748b;
+      --accent: #38bdf8;
+      --accent-dark: #0284c7;
+      --green: #16a34a;
+      --red: #dc2626;
+      --amber: #d97706;
+      --font-sans: "Plus Jakarta Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+    }
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font-sans);
+      font-size: 14px;
+      line-height: 1.5;
+      -webkit-font-smoothing: antialiased;
+    }
+    a { color: inherit; text-decoration: none; }
+    .container { max-width: 1280px; margin: 0 auto; padding: 0 24px; }
+    header {
+      border-bottom: 1px solid var(--border);
+      background: var(--bg);
+    }
+    .topbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 64px;
+      gap: 24px;
+    }
+    .brand {
+      font-weight: 700;
+      font-size: 17px;
+      letter-spacing: -0.02em;
+      white-space: nowrap;
+    }
+    nav { display: flex; align-items: center; gap: 26px; }
+    nav a {
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--text-muted);
+      white-space: nowrap;
+    }
+    nav a:hover { color: var(--text); }
+    main { padding: 28px 24px 64px; display: flex; flex-direction: column; gap: 22px; }
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 18px 20px;
+    }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      min-height: 38px;
+      padding: 0 14px;
+      border-radius: 8px;
+      border: 1px solid var(--border-strong);
+      background: var(--bg);
+      color: var(--text);
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+      font-family: var(--font-sans);
+    }
+    .btn:hover { background: var(--surface-hover); }
+    .btn-primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #082f49;
+    }
+    .btn-primary:hover { background: #7dd3fc; border-color: #7dd3fc; }
+    .btn-sm { min-height: 30px; padding: 0 10px; font-size: 12px; }
+    .btn-danger-hover:hover { border-color: rgba(220,38,38,0.7); color: #f87171; }
+    .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+    .header-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+      flex-wrap: wrap;
+      border-bottom: 1px solid var(--border);
+      padding-bottom: 14px;
+    }
+    .telemetry-grid {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 16px;
+      padding-top: 14px;
+    }
+    .metric-label { font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--text-dim); font-weight: 600; }
+    .metric-val { font-size: 13px; color: var(--text); margin-top: 4px; font-weight: 500; }
+    .dot { width: 8px; height: 8px; border-radius: 999px; display: inline-block; background: var(--amber); }
+    .dot.open { background: var(--green); box-shadow: 0 0 8px rgba(22,163,74,0.75); }
+    .dot.paused { background: var(--text-dim); }
+    .sub-form {
+      display: grid;
+      grid-template-columns: 1fr 150px auto;
+      gap: 12px;
+      margin-top: 12px;
+      position: relative;
+    }
+    input, select {
+      min-height: 40px;
+      width: 100%;
+      border-radius: 8px;
+      border: 1px solid var(--border-strong);
+      background: var(--bg);
+      color: var(--text);
+      padding: 0 12px;
+      font-size: 13px;
+      font-family: var(--font-sans);
+    }
+    input:focus, select:focus { outline: none; border-color: var(--accent); }
+    .lookup-menu {
+      position: absolute;
+      top: 44px;
+      left: 0;
+      right: 0;
+      max-height: 240px;
+      overflow-y: auto;
+      background: var(--bg);
+      border: 1px solid var(--border-strong);
+      border-radius: 8px;
+      z-index: 40;
+      display: none;
+    }
+    .lookup-menu.open { display: block; }
+    .lookup-item {
+      width: 100%;
+      text-align: left;
+      background: transparent;
+      border: 0;
+      border-bottom: 1px solid var(--border);
+      padding: 9px 12px;
+      color: var(--text);
+      font-size: 12px;
+      display: flex;
+      justify-content: space-between;
+      cursor: pointer;
+    }
+    .lookup-item:hover { background: var(--surface-hover); }
+    .presets {
+      margin-top: 12px;
+      padding-top: 10px;
+      border-top: 1px solid var(--border);
+      display: flex;
+      flex-wrap: wrap;
+      gap: 14px;
+      font-size: 12px;
+      align-items: center;
+    }
+    .preset-btn {
+      background: transparent;
+      border: 0;
+      color: var(--text-muted);
+      font-family: var(--font-mono);
+      cursor: pointer;
+      padding: 0;
+      font-size: 12px;
+    }
+    .preset-btn.active { color: #4ade80; }
+    .workspace {
+      display: grid;
+      grid-template-columns: 1.65fr 1fr;
+      gap: 20px;
+      align-items: stretch;
+    }
+    table { width: 100%; border-collapse: collapse; text-align: left; font-size: 13px; }
+    th {
+      background: var(--bg);
+      color: var(--text-muted);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--border);
+    }
+    td { padding: 11px 12px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+    tr.quote-row { cursor: pointer; }
+    tr.quote-row:hover { background: rgba(30,41,59,0.45); }
+    tr.quote-row.selected { background: rgba(30,41,59,0.8); }
+    .up { color: #4ade80; }
+    .down { color: #f87171; }
+    .muted { color: var(--text-muted); }
+    .dim { color: var(--text-dim); }
+    .tape { max-height: 290px; overflow-y: auto; }
+    .tape-row {
+      display: flex;
+      justify-content: space-between;
+      padding: 7px 14px;
+      border-bottom: 1px solid var(--border);
+      font-size: 12px;
+    }
+    @media (max-width: 960px) {
+      .workspace { grid-template-columns: 1fr; }
+      .telemetry-grid { grid-template-columns: repeat(2, 1fr); }
+      .sub-form { grid-template-columns: 1fr; }
+      nav { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <div class="container topbar">
+      <a href="/" class="brand">AlgoDesk <span class="dim" style="font-size:12px;font-weight:500;">/ Live Terminal</span></a>
+      <nav aria-label="Terminal Navigation">
+        <a href="/">Market Hub</a>
+        <a href="#subscribeSection">Subscribe</a>
+        <a href="#watchSection">Market Watch</a>
+        <a href="#inspectorSection">Inspector</a>
+        <a href="#tapeSection">Tick Tape</a>
+      </nav>
+      <button id="pauseBtn" class="btn btn-primary" type="button">Pause Stream</button>
+    </div>
+  </header>
+
+  <main class="container">
+    <section class="panel">
+      <div class="header-row">
+        <div>
+          <div style="display:flex;align-items:center;gap:10px;">
+            <span id="statusDot" class="dot"></span>
+            <h1 style="margin:0;font-size:19px;">Live WebSocket Market Terminal</h1>
+          </div>
+          <p class="muted" style="margin:4px 0 0;font-size:13px;">Real-time quote stream over <span class="mono">/ws/live</span> across subscribed Equities, Indices &amp; F&amp;O contracts.</p>
+        </div>
+        <div style="display:flex;gap:10px;flex-wrap:wrap;">
+          <button id="pollBtn" class="btn" type="button">Poll Snapshot</button>
+          <button id="failoverBtn" class="btn" type="button">Switch Standby Feed</button>
+        </div>
+      </div>
+
+      <div class="telemetry-grid">
+        <div>
+          <div class="metric-label">Socket Link</div>
+          <div id="mSocket" class="metric-val mono">Connecting...</div>
+        </div>
+        <div>
+          <div class="metric-label">Active Provider</div>
+          <div id="mProvider" class="metric-val mono">—</div>
+        </div>
+        <div>
+          <div class="metric-label">Feed Latency</div>
+          <div id="mLatency" class="metric-val mono">—</div>
+        </div>
+        <div>
+          <div class="metric-label">WS Frame Seq</div>
+          <div id="mSeq" class="metric-val mono">#0</div>
+        </div>
+        <div>
+          <div class="metric-label">Watchlist Assets</div>
+          <div id="mCount" class="metric-val mono">0 subscribed</div>
+        </div>
+      </div>
+    </section>
+
+    <section id="subscribeSection" class="panel">
+      <div style="display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap;">
+        <div>
+          <h2 style="margin:0;font-size:15px;">Subscribe Any Asset to Live WebSocket Stream</h2>
+          <p class="muted" style="margin:2px 0 0;font-size:12px;">Enter an Equity, Index, or search F&amp;O contracts from SQLite Instrument Lookup.</p>
+        </div>
+        <div id="feedbackMsg" style="font-size:12px;font-weight:500;"></div>
+      </div>
+
+      <form id="subForm" class="sub-form" autocomplete="off">
+        <div style="position:relative;">
+          <input id="symbolInput" type="text" placeholder="Type symbol or F&O contract (e.g. RELIANCE, NIFTY26NOVFUT, AAPL)" />
+          <div id="lookupMenu" class="lookup-menu"></div>
+        </div>
+        <select id="exchangeSelect">
+          <option value="NSE">NSE (Eq/Idx)</option>
+          <option value="BSE">BSE (Eq/Idx)</option>
+          <option value="NFO">NFO (NSE F&amp;O)</option>
+          <option value="BFO">BFO (BSE F&amp;O)</option>
+          <option value="MCX">MCX (Commodity)</option>
+          <option value="US">US (Global Eq)</option>
+        </select>
+        <button class="btn btn-primary" type="submit">Subscribe Asset</button>
+      </form>
+
+      <div id="presetBar" class="presets"></div>
+    </section>
+
+    <section class="workspace">
+      <div id="watchSection" class="panel" style="padding:0;overflow:hidden;">
+        <div style="padding:14px 18px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;">
+          <div>
+            <h2 style="margin:0;font-size:14px;">Market Watch · Live WebSocket Quotes</h2>
+            <div class="muted" style="font-size:12px;">Click any row to inspect OHLCV depth &amp; sparkline trajectory.</div>
+          </div>
+          <span id="watchCount" class="mono muted" style="font-size:12px;">0 assets</span>
+        </div>
+        <div style="overflow-x:auto;">
+          <table>
+            <thead>
+              <tr>
+                <th>Asset</th>
+                <th style="text-align:right;">LTP</th>
+                <th style="text-align:right;">Chg / %</th>
+                <th style="text-align:right;">Bid / Ask</th>
+                <th style="text-align:right;">High / Low</th>
+                <th style="text-align:right;">Vol / OI</th>
+                <th style="text-align:right;">Subscription</th>
+              </tr>
+            </thead>
+            <tbody id="quoteBody"></tbody>
+          </table>
+        </div>
+      </div>
+
+      <div style="display:flex;flex-direction:column;gap:20px;">
+        <div id="inspectorSection" class="panel">
+          <div style="display:flex;justify-content:space-between;align-items:flex-start;border-bottom:1px solid var(--border);padding-bottom:12px;">
+            <div>
+              <div class="metric-label">Selected Quote Inspector</div>
+              <div id="inspTitle" class="mono" style="font-size:18px;font-weight:700;margin-top:4px;">—</div>
+              <div id="inspSub" class="muted" style="font-size:12px;">—</div>
+            </div>
+            <div style="text-align:right;" class="mono">
+              <div id="inspLtp" style="font-size:20px;font-weight:700;">—</div>
+              <div id="inspChg" style="font-size:12px;">—</div>
+            </div>
+          </div>
+          <div id="inspNote" style="font-size:12px;color:#fbbf24;margin-top:8px;"></div>
+          <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:10px;border-bottom:1px solid var(--border);padding:12px 0;" class="mono">
+            <div><div class="dim" style="font-size:11px;">Open</div><div id="inspOpen">—</div></div>
+            <div><div class="dim" style="font-size:11px;">High</div><div id="inspHigh">—</div></div>
+            <div><div class="dim" style="font-size:11px;">Low</div><div id="inspLow">—</div></div>
+            <div><div class="dim" style="font-size:11px;">Prev</div><div id="inspPrev">—</div></div>
+          </div>
+          <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;padding:12px 0;" class="mono">
+            <div><div class="dim" style="font-size:11px;">Volume</div><div id="inspVol">—</div></div>
+            <div><div class="dim" style="font-size:11px;">OI</div><div id="inspOi">—</div></div>
+            <div><div class="dim" style="font-size:11px;">Bid / Ask</div><div id="inspDepth">—</div></div>
+          </div>
+          <div style="background:var(--bg);border:1px solid var(--border);border-radius:8px;padding:10px;">
+            <div style="display:flex;justify-content:space-between;font-size:11px;margin-bottom:6px;" class="muted">
+              <span id="sparkLabel">Session Tick Trajectory</span>
+              <span id="sparkRange" class="mono"></span>
+            </div>
+            <svg id="sparkSvg" viewBox="0 0 360 88" style="width:100%;height:78px;overflow:visible;"></svg>
+          </div>
+        </div>
+
+        <div id="tapeSection" class="panel" style="padding:0;overflow:hidden;flex:1;">
+          <div style="padding:12px 16px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;">
+            <h3 style="margin:0;font-size:14px;">Incoming WebSocket Tick Tape</h3>
+            <span class="mono dim" style="font-size:11px;">Latest 30 ticks</span>
+          </div>
+          <div id="tapeList" class="tape mono"></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script>
+    (function () {
+      const PRESETS = [
+        { symbol: 'NIFTY', exchange: 'NSE', instrument_type: 'INDEX' },
+        { symbol: 'BANKNIFTY', exchange: 'NSE', instrument_type: 'INDEX' },
+        { symbol: 'SENSEX', exchange: 'BSE', instrument_type: 'INDEX' },
+        { symbol: 'RELIANCE', exchange: 'NSE', instrument_type: 'EQUITY' },
+        { symbol: 'TCS', exchange: 'NSE', instrument_type: 'EQUITY' },
+        { symbol: 'INFY', exchange: 'NSE', instrument_type: 'EQUITY' },
+        { symbol: 'HDFCBANK', exchange: 'NSE', instrument_type: 'EQUITY' }
+      ];
+
+      let feedState = null;
+      let selectedKey = '';
+      let selectedMeta = { instrument_type: '', instrument_key: '' };
+      let paused = false;
+      let ws = null;
+      let sse = null;
+      let lookupTimer = null;
+
+      const el = (id) => document.getElementById(id);
+      const fmtPrice = (v) => (v === null || v === undefined || Number.isNaN(v)) ? '—' : Number(v).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+      const fmtInt = (v) => (v === null || v === undefined || Number.isNaN(v)) ? '0' : Math.round(Number(v)).toLocaleString('en-IN');
+      const shortTime = (ts) => {
+        if (!ts) return '—';
+        const m = String(ts).match(/T(\d{2}:\d{2}:\d{2})/);
+        return m ? m[1] : String(ts).slice(0, 19);
+      };
+      const keyOf = (sym, exch) => `${(exch || 'NSE').toUpperCase()}:${String(sym || '').toUpperCase()}`;
+
+      function setFeedback(text, isErr) {
+        const node = el('feedbackMsg');
+        node.textContent = text || '';
+        node.style.color = isErr ? '#f87171' : '#4ade80';
+      }
+
+      function applyPayload(raw) {
+        if (!raw || typeof raw !== 'object') return;
+        const data = raw.feeds ? raw.feeds : raw;
+        if (!Array.isArray(data.quotes) && !Array.isArray(data.slots)) return;
+        feedState = data;
+        render();
+      }
+
+      function render() {
+        const quotes = (feedState && feedState.quotes) ? feedState.quotes : [];
+        const slots = (feedState && feedState.slots) ? feedState.slots : [];
+        const activeSlot = slots.find((s) => s.active) || slots[0];
+
+        el('mProvider').textContent = `${(feedState.active_feed || 'upstox').toUpperCase()} ${feedState.in_failover ? '(Standby)' : '(Primary)'}`;
+        el('mLatency').textContent = activeSlot && activeSlot.latency_ms != null ? `${activeSlot.latency_ms} ms` : '—';
+        el('mSeq').textContent = `#${feedState.tick_seq || 0} · ${shortTime(activeSlot ? activeSlot.last_tick_ist : null)} IST`;
+        el('mCount').textContent = `${quotes.length} subscribed`;
+        el('watchCount').textContent = `${quotes.length} assets`;
+        el('failoverBtn').textContent = feedState.in_failover ? 'Restore Primary Feed' : 'Switch Standby Feed';
+
+        const subSet = new Set(quotes.map((q) => keyOf(q.symbol, q.exchange || 'NSE')));
+        const presetBar = el('presetBar');
+        presetBar.innerHTML = '<span class="dim">Quick Toggle:</span>';
+        PRESETS.forEach((p) => {
+          const btn = document.createElement('button');
+          btn.type = 'button';
+          const active = subSet.has(keyOf(p.symbol, p.exchange));
+          btn.className = 'preset-btn' + (active ? ' active' : '');
+          btn.textContent = `${active ? '✓' : '+'} ${p.symbol}`;
+          btn.onclick = () => active ? unsubscribeAsset(p.symbol, p.exchange) : subscribeAsset(p.symbol, p.exchange, p.instrument_type, '');
+          presetBar.appendChild(btn);
+        });
+
+        if (quotes.length === 0) {
+          selectedKey = '';
+        } else if (!quotes.some((q) => keyOf(q.symbol, q.exchange || 'NSE') === selectedKey)) {
+          selectedKey = keyOf(quotes[0].symbol, quotes[0].exchange || 'NSE');
+        }
+
+        const tbody = el('quoteBody');
+        tbody.innerHTML = '';
+        if (quotes.length === 0) {
+          tbody.innerHTML = '<tr><td colspan="7" class="muted" style="text-align:center;padding:36px;">No assets subscribed. Use the form above to subscribe.</td></tr>';
+        } else {
+          quotes.forEach((q) => {
+            const exch = q.exchange || 'NSE';
+            const k = keyOf(q.symbol, exch);
+            const tr = document.createElement('tr');
+            tr.className = 'quote-row' + (k === selectedKey ? ' selected' : '');
+            tr.onclick = () => { selectedKey = k; render(); };
+
+            const chg = q.change_pct;
+            const cls = (q.direction === 'up' || (chg != null && chg > 0)) ? 'up' : ((q.direction === 'down' || (chg != null && chg < 0)) ? 'down' : '');
+            const arrow = q.direction === 'up' ? '▲ ' : (q.direction === 'down' ? '▼ ' : '');
+
+            tr.innerHTML = `
+              <td>
+                <div class="mono" style="font-weight:600;">${q.symbol}</div>
+                <div class="muted" style="font-size:11px;">${exch} · ${q.instrument_type || 'EQUITY'} · ${(q.source || '').toUpperCase()}</div>
+                ${q.note ? `<div style="font-size:11px;color:#fbbf24;">${q.note}</div>` : ''}
+              </td>
+              <td class="mono ${cls}" style="text-align:right;font-weight:600;">
+                <div>${arrow}${fmtPrice(q.ltp)}</div>
+                <div class="dim" style="font-size:11px;font-weight:400;">${shortTime(q.ts_ist)}</div>
+              </td>
+              <td class="mono ${cls}" style="text-align:right;">
+                <div>${chg != null ? `${chg > 0 ? '+' : ''}${Number(chg).toFixed(2)}%` : '—'}</div>
+                <div class="muted" style="font-size:11px;">${q.change != null ? `${q.change > 0 ? '+' : ''}${Number(q.change).toFixed(2)}` : '—'}</div>
+              </td>
+              <td class="mono muted" style="text-align:right;font-size:12px;">
+                <div>${fmtPrice(q.bid)}</div>
+                <div class="dim">${fmtPrice(q.ask)}</div>
+              </td>
+              <td class="mono muted" style="text-align:right;font-size:12px;">
+                <div>H ${fmtPrice(q.high)}</div>
+                <div class="dim">L ${fmtPrice(q.low)}</div>
+              </td>
+              <td class="mono muted" style="text-align:right;font-size:12px;">
+                <div>${fmtInt(q.volume)}</div>
+                <div>${q.oi ? 'OI ' + fmtInt(q.oi) : '—'}</div>
+              </td>
+              <td style="text-align:right;"></td>
+            `;
+            const unsubBtn = document.createElement('button');
+            unsubBtn.type = 'button';
+            unsubBtn.className = 'btn btn-sm btn-danger-hover';
+            unsubBtn.textContent = 'Unsubscribe';
+            unsubBtn.onclick = (e) => {
+              e.stopPropagation();
+              unsubscribeAsset(q.symbol, exch);
+            };
+            tr.lastElementChild.appendChild(unsubBtn);
+            tbody.appendChild(tr);
+          });
+        }
+
+        const sel = quotes.find((q) => keyOf(q.symbol, q.exchange || 'NSE') === selectedKey) || quotes[0];
+        if (sel) {
+          el('inspTitle').textContent = `${sel.exchange || 'NSE'}:${sel.symbol}`;
+          el('inspSub').textContent = `${sel.instrument_type || 'EQUITY'} · ${(sel.source || '').toUpperCase()} · ${shortTime(sel.ts_ist)} IST`;
+          el('inspLtp').textContent = fmtPrice(sel.ltp);
+          const sc = sel.change_pct;
+          el('inspChg').textContent = sc != null ? `${sc > 0 ? '+' : ''}${Number(sc).toFixed(2)}%` : '—';
+          el('inspChg').className = sc > 0 ? 'up' : (sc < 0 ? 'down' : 'muted');
+          el('inspNote').textContent = sel.note || '';
+          el('inspOpen').textContent = fmtPrice(sel.open);
+          el('inspHigh').textContent = fmtPrice(sel.high);
+          el('inspLow').textContent = fmtPrice(sel.low);
+          el('inspPrev').textContent = fmtPrice(sel.prev_close);
+          el('inspVol').textContent = fmtInt(sel.volume);
+          el('inspOi').textContent = fmtInt(sel.oi);
+          el('inspDepth').textContent = `${fmtPrice(sel.bid)} / ${fmtPrice(sel.ask)}`;
+
+          const pts = (sel.history || []).filter((p) => typeof p.ltp === 'number');
+          el('sparkLabel').textContent = `Session Tick Trajectory (${pts.length} samples)`;
+          const svg = el('sparkSvg');
+          if (pts.length > 0) {
+            const vals = pts.map((p) => p.ltp);
+            const min = Math.min(...vals);
+            const max = Math.max(...vals);
+            const span = max - min || Math.max(min * 0.002, 1);
+            el('sparkRange').textContent = `${fmtPrice(min)} – ${fmtPrice(max)}`;
+            const coords = pts.map((p, i) => {
+              const x = pts.length === 1 ? 180 : (i / (pts.length - 1)) * 360;
+              const y = 80 - ((p.ltp - min) / span) * 72;
+              return `${x.toFixed(1)},${y.toFixed(1)}`;
+            });
+            const color = (sel.change_pct || 0) >= 0 ? '#16a34a' : '#dc2626';
+            const last = coords[coords.length - 1].split(',');
+            svg.innerHTML = `<polyline fill="none" stroke="${color}" stroke-width="2" points="${coords.join(' ')}" /><circle cx="${last[0]}" cy="${last[1]}" r="3.5" fill="${color}" />`;
+          } else {
+            el('sparkRange').textContent = '';
+            svg.innerHTML = '';
+          }
+        }
+
+        const tape = el('tapeList');
+        const events = (feedState.tick_events || []);
+        tape.innerHTML = events.length === 0
+          ? '<div class="dim" style="padding:20px;text-align:center;">Waiting for WebSocket ticks...</div>'
+          : events.map((ev) => `
+              <div class="tape-row">
+                <div><span class="dim">${shortTime(ev.ts_ist)}</span> <strong>${ev.symbol}</strong> <span class="dim">${ev.exchange}</span></div>
+                <div>
+                  <span class="${ev.direction === 'up' ? 'up' : (ev.direction === 'down' ? 'down' : '')}">${fmtPrice(ev.ltp)}</span>
+                  <span class="muted" style="margin-left:8px;">${ev.change_pct != null ? `${ev.change_pct > 0 ? '+' : ''}${Number(ev.change_pct).toFixed(2)}%` : '—'}</span>
+                </div>
+              </div>
+            `).join('');
+      }
+
+      async function subscribeAsset(sym, exch, itype, ikey) {
+        const cleanSym = String(sym || '').trim().toUpperCase();
+        if (!cleanSym) return;
+        selectedKey = keyOf(cleanSym, exch || 'NSE');
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ action: 'subscribe', symbol: cleanSym, exchange: exch || 'NSE', instrument_type: itype || '', instrument_key: ikey || '' }));
+        }
+        const res = await fetch('/api/live/subscribe', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ symbol: cleanSym, exchange: exch || 'NSE', instrument_type: itype || '', instrument_key: ikey || '' })
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          setFeedback(data.detail || 'Subscribe failed', true);
+          return;
+        }
+        applyPayload(data);
+        setFeedback(data.message || `Subscribed ${exch}:${cleanSym}`, false);
+        el('symbolInput').value = '';
+        el('lookupMenu').classList.remove('open');
+      }
+
+      async function unsubscribeAsset(sym, exch) {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify({ action: 'unsubscribe', symbol: sym, exchange: exch }));
+        }
+        const res = await fetch('/api/live/unsubscribe', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ symbol: sym, exchange: exch })
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          setFeedback(data.detail || 'Unsubscribe failed', true);
+          return;
+        }
+        applyPayload(data);
+        setFeedback(data.message || `Unsubscribed ${exch}:${sym}`, false);
+      }
+
+      function closeStream() {
+        if (ws) { ws.onclose = null; ws.close(); ws = null; }
+        if (sse) { sse.close(); sse = null; }
+      }
+
+      function connectStream() {
+        if (paused) return;
+        closeStream();
+        el('mSocket').textContent = 'Connecting...';
+        el('statusDot').className = 'dot';
+
+        const startSse = () => {
+          if (paused) return;
+          sse = new EventSource('/api/live/stream');
+          sse.onopen = () => {
+            el('mSocket').textContent = 'EventStream Active';
+            el('statusDot').className = 'dot open';
+          };
+          sse.onmessage = (e) => {
+            try { applyPayload(JSON.parse(e.data)); } catch {}
+          };
+          sse.onerror = () => {
+            sse.close();
+            if (!paused) setTimeout(connectStream, 3000);
+          };
+        };
+
+        try {
+          const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+          ws = new WebSocket(`${proto}//${location.host}/ws/live`);
+          let opened = false;
+          ws.onopen = () => {
+            opened = true;
+            el('mSocket').textContent = 'WebSocket Connected';
+            el('statusDot').className = 'dot open';
+          };
+          ws.onmessage = (e) => {
+            try { applyPayload(JSON.parse(e.data)); } catch {}
+          };
+          ws.onclose = () => {
+            ws = null;
+            if (paused) return;
+            if (!opened) startSse();
+            else setTimeout(connectStream, 2000);
+          };
+          ws.onerror = () => { if (!opened && ws) ws.close(); };
+        } catch {
+          startSse();
+        }
+      }
+
+      el('subForm').onsubmit = (e) => {
+        e.preventDefault();
+        subscribeAsset(el('symbolInput').value, el('exchangeSelect').value, selectedMeta.instrument_type, selectedMeta.instrument_key);
+      };
+
+      el('symbolInput').oninput = () => {
+        selectedMeta = { instrument_type: '', instrument_key: '' };
+        clearTimeout(lookupTimer);
+        const q = el('symbolInput').value.trim();
+        const menu = el('lookupMenu');
+        if (q.length < 2) { menu.classList.remove('open'); return; }
+        lookupTimer = setTimeout(async () => {
+          try {
+            const res = await fetch(`/api/instruments/search?q=${encodeURIComponent(q)}&limit=10`);
+            const data = await res.json();
+            const items = data.items || [];
+            if (!items.length) { menu.classList.remove('open'); return; }
+            menu.innerHTML = '';
+            items.forEach((hit) => {
+              const btn = document.createElement('button');
+              btn.type = 'button';
+              btn.className = 'lookup-item';
+              btn.innerHTML = `<span><strong class="mono">${hit.trading_symbol}</strong> <span class="muted">${hit.name || ''}</span></span><span class="mono muted">${hit.exchange} · ${hit.instrument_type}</span>`;
+              btn.onclick = () => {
+                el('symbolInput').value = hit.trading_symbol;
+                el('exchangeSelect').value = hit.exchange || 'NSE';
+                selectedMeta = { instrument_type: hit.instrument_type || '', instrument_key: hit.instrument_key || '' };
+                subscribeAsset(hit.trading_symbol, hit.exchange || 'NSE', hit.instrument_type || '', hit.instrument_key || '');
+              };
+              menu.appendChild(btn);
+            });
+            menu.classList.add('open');
+          } catch {}
+        }, 180);
+      };
+
+      el('pauseBtn').onclick = () => {
+        paused = !paused;
+        el('pauseBtn').textContent = paused ? 'Resume Stream' : 'Pause Stream';
+        if (paused) {
+          closeStream();
+          el('mSocket').textContent = 'Stream Paused';
+          el('statusDot').className = 'dot paused';
+        } else {
+          connectStream();
+        }
+      };
+
+      el('pollBtn').onclick = async () => {
+        const res = await fetch('/api/live/poll', { method: 'POST' });
+        applyPayload(await res.json());
+      };
+
+      el('failoverBtn').onclick = async () => {
+        const ep = (feedState && feedState.in_failover) ? '/api/live/recover-primary' : '/api/live/failover';
+        const res = await fetch(ep, { method: 'POST' });
+        applyPayload(await res.json());
+      };
+
+      fetch('/api/live/status').then((r) => r.json()).then(applyPayload).catch(() => {});
+      connectStream();
+    })();
+  </script>
+</body>
+</html>

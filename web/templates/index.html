@@ -304,18 +304,30 @@
     /* Phase 3 Historical Data & Snapshot Table */
     .hist-grid {
       display: grid;
-      grid-template-columns: 1.1fr 0.7fr 0.9fr 1fr 1fr 1fr auto;
+      grid-template-columns: 1.15fr 0.85fr 0.85fr 0.95fr 0.95fr 1fr auto;
       gap: 12px;
       align-items: end;
     }
     .instr-bar {
       display: grid;
-      grid-template-columns: 1fr auto auto;
+      grid-template-columns: 1fr 200px auto auto;
       gap: 12px;
       align-items: end;
       padding-bottom: 18px;
       margin-bottom: 18px;
       border-bottom: 1px solid var(--border);
+    }
+    .fno-box {
+      padding-bottom: 18px;
+      margin-bottom: 18px;
+      border-bottom: 1px solid var(--border);
+    }
+    .fno-grid {
+      display: grid;
+      grid-template-columns: 0.8fr 1.1fr 0.9fr 1fr 1fr auto;
+      gap: 12px;
+      align-items: end;
+      margin-top: 12px;
     }
     .chip-row {
       display: flex;
@@ -364,7 +376,7 @@
     }
     .summary-strip {
       display: grid;
-      grid-template-columns: repeat(5, minmax(0, 1fr));
+      grid-template-columns: repeat(6, minmax(0, 1fr));
       gap: 14px;
       padding: 12px 0;
       border-top: 1px solid var(--border);
@@ -410,8 +422,63 @@
       white-space: nowrap;
     }
     @media (max-width: 960px) {
-      .hist-grid, .instr-bar { grid-template-columns: 1fr; }
+      .hist-grid, .instr-bar, .fno-grid { grid-template-columns: 1fr; }
       .summary-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+
+    /* Phase 4 Live Feed Failover, Preflight & Kill Switch */
+    .p4-split {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 24px;
+    }
+    .p4-panel-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      flex-wrap: wrap;
+      margin-bottom: 14px;
+    }
+    .p4-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .p4-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+      font-variant-numeric: tabular-nums;
+    }
+    .p4-table th {
+      text-align: left;
+      color: var(--text-muted);
+      font-weight: 600;
+      padding: 8px 10px 8px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .p4-table td {
+      padding: 9px 10px 9px 0;
+      border-bottom: 1px solid rgba(30, 41, 59, 0.7);
+    }
+    .p4-table th.num, .p4-table td.num { text-align: right; padding-right: 0; }
+    .p4-check-row {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 10px 0;
+      border-bottom: 1px solid var(--border);
+      font-size: 12px;
+    }
+    .p4-check-row:last-child { border-bottom: none; }
+    .status-pass { color: #4ade80; font-weight: 600; }
+    .status-warn { color: #fbbf24; font-weight: 600; }
+    .status-fail { color: #f87171; font-weight: 600; }
+    @media (max-width: 960px) {
+      .p4-split { grid-template-columns: 1fr; }
     }
 
     /* Modal */
@@ -500,7 +567,8 @@
         <a href="#routing">Routing</a>
         <a href="#connections">Connections</a>
         <a href="#historical-data">Historical Data</a>
-        <a href="#roadmap">Roadmap</a>
+        <a href="#live-controls">Live &amp; Safety</a>
+        <a href="/terminal" style="color: var(--accent); font-weight: 600;">Live Terminal</a>
       </nav>
       <button id="refreshBtn" class="btn btn-primary" type="button">Refresh Status</button>
     </div>
@@ -544,7 +612,7 @@
       <div style="display:flex; align-items:flex-end; justify-content:space-between; gap:12px; flex-wrap:wrap;">
         <div>
           <h2>Historical Data &amp; SQLite Instrument Index</h2>
-          <p class="section-desc">Downloads only missing trading days (zero API calls for cached dates) and provides Snapshot and Full Data views.</p>
+          <p class="section-desc">Supports Equity, Index, Futures &amp; Options (NFO/BFO/MCX). Downloads only missing trading days and provides Snapshot and Full Data views.</p>
         </div>
         <div id="instrStatsMeta" class="mono" style="font-size:12px; color:var(--text-muted);">SQLite Index Ready</div>
       </div>
@@ -552,24 +620,90 @@
         <div class="instr-bar">
           <div class="field">
             <label for="instrSearchInput">SQLite Instrument Lookup (Under 5 MB RAM)</label>
-            <input id="instrSearchInput" type="text" placeholder="Search symbol (RELIANCE, NIFTY, INFY, HDFCBANK)..." />
+            <input id="instrSearchInput" type="text" placeholder="Search Equity or F&O (e.g. RELIANCE, NIFTY FUT, NIFTY 24500 CE)..." />
+          </div>
+          <div class="field">
+            <label for="instrTypeFilter">Segment / Contract</label>
+            <select id="instrTypeFilter">
+              <option value="ALL">All Instruments</option>
+              <option value="EQUITY">Equity &amp; Index</option>
+              <option value="FO">Futures &amp; Options (F&amp;O)</option>
+              <option value="FUT">Futures (FUT)</option>
+              <option value="OPT">Options (CE / PE)</option>
+              <option value="CE">Call Options (CE)</option>
+              <option value="PE">Put Options (PE)</option>
+            </select>
           </div>
           <button id="syncUpstoxInstrBtn" class="btn" type="button">Sync Upstox Master</button>
           <button id="syncZerodhaInstrBtn" class="btn" type="button">Sync Zerodha Master</button>
         </div>
         <div id="instrFeedback" class="feedback" role="status" aria-live="polite"></div>
-        <div id="instrChipRow" class="chip-row"></div>
+        <div id="instrChipRow" class="chip-row" style="margin-bottom:14px;"></div>
+
+        <div class="fno-box">
+          <div style="display:flex; align-items:center; justify-content:space-between; gap:12px; flex-wrap:wrap;">
+            <div>
+              <div style="font-size:14px; font-weight:600;">Futures &amp; Options Contract Finder (NFO / BFO / MCX)</div>
+              <div style="font-size:12px; color:var(--text-muted);">Select underlying, contract type (FUT / CE / PE), expiry, and strike from SQLite before downloading OHLCV + OI.</div>
+            </div>
+            <button id="fnoToggleBtn" class="btn" type="button" style="min-height:34px; padding:5px 12px; font-size:12px;">Open F&amp;O Contract Finder</button>
+          </div>
+          <div id="fnoPanel" style="display:none;">
+            <div class="fno-grid">
+              <div class="field">
+                <label for="fnoExchange">F&amp;O Exchange</label>
+                <select id="fnoExchange">
+                  <option value="NFO">NFO (NSE F&amp;O)</option>
+                  <option value="BFO">BFO (BSE F&amp;O)</option>
+                  <option value="MCX">MCX (Commodities)</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="fnoUnderlying">Underlying</label>
+                <input id="fnoUnderlying" type="text" list="fnoUnderlyingList" placeholder="NIFTY, BANKNIFTY, RELIANCE..." class="mono" />
+                <datalist id="fnoUnderlyingList"></datalist>
+              </div>
+              <div class="field">
+                <label for="fnoType">Contract Type</label>
+                <select id="fnoType">
+                  <option value="FUT">Futures (FUT)</option>
+                  <option value="CE">Call Options (CE)</option>
+                  <option value="PE">Put Options (PE)</option>
+                  <option value="FO">All F&amp;O</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="fnoExpiry">Expiry Date</label>
+                <select id="fnoExpiry" class="mono">
+                  <option value="">All Expiries</option>
+                </select>
+              </div>
+              <div class="field">
+                <label for="fnoStrike">Strike Price</label>
+                <select id="fnoStrike" class="mono" disabled>
+                  <option value="">N/A (Futures)</option>
+                </select>
+              </div>
+              <button id="fnoRefreshBtn" class="btn" type="button" style="min-height:42px;">Refresh Contracts</button>
+            </div>
+            <div id="fnoMetaLine" style="margin-top:10px; font-size:12px; color:var(--text-muted);"></div>
+            <div id="fnoContractsRow" class="chip-row" style="max-height:160px; overflow-y:auto;"></div>
+          </div>
+        </div>
 
         <div class="hist-grid" style="margin-top:16px;">
           <div class="field">
-            <label for="histSymbol">Symbol</label>
-            <input id="histSymbol" type="text" value="RELIANCE" class="mono" />
+            <label for="histSymbol">Symbol / Contract</label>
+            <input id="histSymbol" type="text" value="RELIANCE" placeholder="RELIANCE or NIFTY26NOVFUT" class="mono" />
           </div>
           <div class="field">
             <label for="histExchange">Exchange</label>
             <select id="histExchange">
-              <option value="NSE">NSE</option>
-              <option value="BSE">BSE</option>
+              <option value="NSE">NSE (Equity / Index)</option>
+              <option value="BSE">BSE (Equity)</option>
+              <option value="NFO">NFO (NSE F&amp;O)</option>
+              <option value="BFO">BFO (BSE F&amp;O)</option>
+              <option value="MCX">MCX (Commodity F&amp;O)</option>
             </select>
           </div>
           <div class="field">
@@ -600,6 +734,7 @@
           <button id="downloadHistBtn" class="btn btn-primary" type="button">Download Missing Days</button>
         </div>
 
+        <div id="histContractHint" class="mono" style="font-size:12px; color:var(--text-muted); margin-top:8px;"></div>
         <div id="histFeedback" class="feedback" role="status" aria-live="polite"></div>
         <div id="histAuditLine" class="mono" style="font-size:12px; color:var(--text-muted); margin-top:6px;"></div>
         <div id="catalogChipRow" class="chip-row"></div>
@@ -618,6 +753,102 @@
 
         <div id="summaryStrip" class="summary-strip mono" style="display:none;"></div>
         <div id="recordsTableContainer" style="margin-top:12px;"></div>
+      </div>
+    </section>
+
+    <section id="live-controls">
+      <div style="display:flex; align-items:flex-end; justify-content:space-between; gap:12px; flex-wrap:wrap;">
+        <div>
+          <h2>Live Feed Failover, Preflight &amp; Kill Switch</h2>
+          <p class="section-desc">Automatic primary-to-standby market data failover, pre-trade broker margin &amp; symbol gate checks, and SEBI SHA-256 hash-chained safety ledger.</p>
+        </div>
+        <div id="p4FeedMeta" class="mono" style="font-size:12px; color:var(--text-muted);">Loading live feed telemetry...</div>
+      </div>
+
+      <div class="panel">
+        <div class="p4-panel-head">
+          <div style="font-size:14px; font-weight:600;">Hot-Standby Market Data Failover Chain</div>
+          <div class="p4-actions">
+            <button id="p4PollBtn" class="btn btn-primary" type="button" style="min-height:36px; padding:6px 14px; font-size:12px;">Poll Live Quotes</button>
+            <button id="p4FailoverBtn" class="btn" type="button" style="min-height:36px; padding:6px 14px; font-size:12px;">Simulate Failover</button>
+            <button id="p4RecoverBtn" class="btn" type="button" style="min-height:36px; padding:6px 14px; font-size:12px;">Restore Primary</button>
+          </div>
+        </div>
+        <div id="p4FeedFeedback" class="feedback" style="margin-top:0; margin-bottom:10px;" role="status" aria-live="polite"></div>
+        <div style="overflow-x:auto; border-top:1px solid var(--border); padding-top:8px;">
+          <table class="p4-table mono">
+            <thead>
+              <tr>
+                <th>Provider</th>
+                <th>Role</th>
+                <th>Transport</th>
+                <th>State</th>
+                <th class="num">Ticks / Errs</th>
+                <th class="num">Latency</th>
+                <th class="num">Last Tick (IST)</th>
+              </tr>
+            </thead>
+            <tbody id="p4SlotsBody"></tbody>
+          </table>
+        </div>
+        <div id="p4QuotesStrip" class="summary-strip mono" style="display:none; border-bottom:none; padding-bottom:0;"></div>
+      </div>
+
+      <div class="p4-split" style="margin-top:20px;">
+        <div class="panel">
+          <div class="p4-panel-head">
+            <div>
+              <div style="font-size:15px; font-weight:600;">Preflight Safety &amp; Margin Gate</div>
+              <div id="p4PreflightSummary" style="font-size:12px; color:var(--text-muted);">Verify auth, margin, mapping, market hours, and kill switch.</div>
+            </div>
+            <button id="p4PreflightBtn" class="btn" type="button" style="min-height:36px; padding:6px 14px; font-size:12px;">Run Preflight Checks</button>
+          </div>
+          <div id="p4PreflightList" style="border-top:1px solid var(--border);">
+            <div style="padding-top:12px; font-size:12px; color:var(--text-subtle);">Click Run Preflight Checks to probe margin balance, symbol mapping, and kill-switch state.</div>
+          </div>
+        </div>
+
+        <div class="panel" style="display:flex; flex-direction:column; justify-content:space-between; gap:14px;">
+          <div>
+            <div class="p4-panel-head" style="margin-bottom:8px;">
+              <div style="font-size:15px; font-weight:600;">Emergency Kill Switch</div>
+              <span id="p4KillBadge" class="mono status-pass" style="font-size:12px;">ARMED / CLEAR</span>
+            </div>
+            <div style="font-size:12px; color:var(--text-muted); margin-bottom:12px;">Persists immediately to disk, cancels active open orders, and blocks all new strategy signals.</div>
+            <div id="p4KillDetail" class="feedback" style="margin:0 0 10px; min-height:0;"></div>
+            <div class="field">
+              <label for="p4KillReason" style="font-size:12px;">Operator Audit Reason</label>
+              <input id="p4KillReason" type="text" placeholder="Reason for emergency halt or reset (logged to SHA-256 chain)..." />
+            </div>
+          </div>
+          <div>
+            <button id="p4KillToggleBtn" class="btn" type="button" style="background:var(--red); border-color:var(--red); color:#fff;">Engage Emergency Kill Switch</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="panel" style="margin-top:20px;">
+        <div class="p4-panel-head">
+          <div>
+            <div style="font-size:15px; font-weight:600;">SEBI Hash-Chained Audit Trail</div>
+            <div id="p4AuditSummary" class="mono" style="font-size:12px; color:var(--text-muted);">Append-only SHA-256 ledger</div>
+          </div>
+          <button id="p4VerifyAuditBtn" class="btn" type="button" style="min-height:34px; padding:5px 12px; font-size:12px;">Verify SHA-256 Chain</button>
+        </div>
+        <div style="max-height:240px; overflow:auto; border-top:1px solid var(--border);">
+          <table class="p4-table mono">
+            <thead>
+              <tr>
+                <th>Timestamp (IST)</th>
+                <th>Event</th>
+                <th>Actor</th>
+                <th>Detail</th>
+                <th class="num">SHA-256 Chain Hash</th>
+              </tr>
+            </thead>
+            <tbody id="p4AuditBody"></tbody>
+          </table>
+        </div>
       </div>
     </section>
 
@@ -649,8 +880,8 @@
         <div class="roadmap-item">
           <div class="roadmap-phase mono">Phase 04</div>
           <div>
-            <div class="roadmap-title">Hot-Standby Feed Failover &amp; Kill Switch</div>
-            <div class="roadmap-detail">Expose WebSocket tick telemetry, automatic primary-to-fallback feed switching, preflight margin checks, and SEBI hash-chained kill switch controls.</div>
+            <div class="roadmap-title">Hot-Standby Feed Failover &amp; Kill Switch (Active)</div>
+            <div class="roadmap-detail">Hot-standby primary-to-fallback feed switching, 6-gate preflight safety &amp; margin checks, persisted emergency kill switch, and SEBI SHA-256 hash-chained audit ledger.</div>
           </div>
         </div>
         <div class="roadmap-item">
@@ -1275,12 +1506,27 @@
     // Phase 3: SQLite Instrument Index & Historical Data JS
     const p3 = {
       viewMode: 'snapshot',
+      fnoOpen: false,
+      selectedInstrumentKey: '',
+      selectedInstrumentType: '',
       instrInput: document.getElementById('instrSearchInput'),
+      instrType: document.getElementById('instrTypeFilter'),
       instrStats: document.getElementById('instrStatsMeta'),
       instrFeedback: document.getElementById('instrFeedback'),
       instrChips: document.getElementById('instrChipRow'),
       syncUpstox: document.getElementById('syncUpstoxInstrBtn'),
       syncZerodha: document.getElementById('syncZerodhaInstrBtn'),
+      fnoToggleBtn: document.getElementById('fnoToggleBtn'),
+      fnoPanel: document.getElementById('fnoPanel'),
+      fnoExch: document.getElementById('fnoExchange'),
+      fnoUl: document.getElementById('fnoUnderlying'),
+      fnoUlList: document.getElementById('fnoUnderlyingList'),
+      fnoType: document.getElementById('fnoType'),
+      fnoExp: document.getElementById('fnoExpiry'),
+      fnoStrike: document.getElementById('fnoStrike'),
+      fnoRefreshBtn: document.getElementById('fnoRefreshBtn'),
+      fnoMetaLine: document.getElementById('fnoMetaLine'),
+      fnoContractsRow: document.getElementById('fnoContractsRow'),
       sym: document.getElementById('histSymbol'),
       exch: document.getElementById('histExchange'),
       tf: document.getElementById('histTimeframe'),
@@ -1288,6 +1534,7 @@
       to: document.getElementById('histTo'),
       prov: document.getElementById('histProvider'),
       dlBtn: document.getElementById('downloadHistBtn'),
+      contractHint: document.getElementById('histContractHint'),
       feedback: document.getElementById('histFeedback'),
       audit: document.getElementById('histAuditLine'),
       catalogRow: document.getElementById('catalogChipRow'),
@@ -1302,6 +1549,21 @@
     p3.to.value = new Date().toISOString().slice(0, 10);
     p3.from.value = new Date(Date.now() - 30 * 86400000).toISOString().slice(0, 10);
 
+    function syncContractHint() {
+      const isFno = ['NFO', 'BFO', 'MCX'].includes(p3.exch.value);
+      const bits = [];
+      if (p3.selectedInstrumentKey) {
+        bits.push(`Bound Contract Key: ${p3.selectedInstrumentKey}${p3.selectedInstrumentType ? ` (${p3.selectedInstrumentType})` : ''}`);
+      } else if (isFno) {
+        bits.push(`F&O Segment Selected: ${p3.exch.value}`);
+      }
+      const dataConn = (state.overview && state.overview.selections && state.overview.selections.data_connection) || '';
+      if (isFno && (p3.prov.value === 'yfinance' || (p3.prov.value === 'auto' && dataConn === 'yfinance'))) {
+        bits.push('Yahoo Finance does not serve NSE/BSE F&O — switch Source to Upstox or Zerodha Kite.');
+      }
+      p3.contractHint.textContent = bits.join(' · ');
+    }
+
     function syncCsvHref() {
       const qs = new URLSearchParams({
         symbol: p3.sym.value.trim().toUpperCase(),
@@ -1311,11 +1573,111 @@
         to_date: p3.to.value,
       });
       p3.csvLink.href = `/api/data/export.csv?${qs.toString()}`;
+      syncContractHint();
     }
     syncCsvHref();
 
-    async function searchInstruments(q) {
-      const res = await fetch(`/api/instruments/search?q=${encodeURIComponent(q || '')}&limit=10`);
+    function selectInstrumentItem(item) {
+      p3.sym.value = item.trading_symbol;
+      p3.exch.value = item.exchange;
+      p3.selectedInstrumentKey = item.instrument_key || '';
+      p3.selectedInstrumentType = item.instrument_type || '';
+      const isFno = ['NFO', 'BFO', 'MCX', 'NSE_FO', 'BSE_FO', 'MCX_FO'].includes(item.exchange)
+        || ['FUT', 'CE', 'PE'].includes((item.instrument_type || '').toUpperCase());
+      if (isFno) {
+        setFnoOpen(true);
+        p3.fnoExch.value = item.exchange;
+        if (item.asset_symbol) p3.fnoUl.value = item.asset_symbol;
+        if (['FUT', 'CE', 'PE'].includes((item.instrument_type || '').toUpperCase())) {
+          p3.fnoType.value = item.instrument_type.toUpperCase();
+        }
+      }
+      syncCsvHref();
+      loadRecords();
+    }
+
+    function setFnoOpen(open) {
+      p3.fnoOpen = Boolean(open);
+      p3.fnoPanel.style.display = p3.fnoOpen ? 'block' : 'none';
+      p3.fnoToggleBtn.textContent = p3.fnoOpen ? 'Hide F&O Finder' : 'Open F&O Contract Finder';
+    }
+
+    async function loadFnoContracts() {
+      p3.fnoRefreshBtn.disabled = true;
+      try {
+        const params = new URLSearchParams({
+          underlying: p3.fnoUl.value.trim().toUpperCase(),
+          exchange: p3.fnoExch.value || 'NFO',
+          contract_type: p3.fnoType.value || 'FO',
+          limit: '40',
+        });
+        if (p3.fnoExp.value) params.set('expiry', p3.fnoExp.value);
+        if (p3.fnoStrike.value) params.set('strike', p3.fnoStrike.value);
+        const res = await fetch(`/api/instruments/fno?${params.toString()}`);
+        if (!res.ok) return;
+        const body = await res.json();
+
+        p3.fnoUlList.innerHTML = '';
+        (body.underlyings || []).forEach((ul) => {
+          const opt = document.createElement('option');
+          opt.value = ul;
+          p3.fnoUlList.appendChild(opt);
+        });
+
+        const prevExp = p3.fnoExp.value;
+        p3.fnoExp.innerHTML = `<option value="">All Expiries (${(body.expiries || []).length})</option>`;
+        (body.expiries || []).forEach((exp) => {
+          const opt = document.createElement('option');
+          opt.value = exp;
+          opt.textContent = exp;
+          p3.fnoExp.appendChild(opt);
+        });
+        if (prevExp && (body.expiries || []).includes(prevExp)) p3.fnoExp.value = prevExp;
+
+        const isFut = p3.fnoType.value === 'FUT';
+        p3.fnoStrike.disabled = isFut;
+        const prevStrike = p3.fnoStrike.value;
+        p3.fnoStrike.innerHTML = `<option value="">${isFut ? 'N/A (Futures)' : `All Strikes (${(body.strikes || []).length})`}</option>`;
+        if (!isFut) {
+          (body.strikes || []).forEach((stk) => {
+            const opt = document.createElement('option');
+            opt.value = String(stk);
+            opt.textContent = String(stk);
+            p3.fnoStrike.appendChild(opt);
+          });
+          if (prevStrike) p3.fnoStrike.value = prevStrike;
+        }
+
+        p3.fnoContractsRow.innerHTML = '';
+        const list = body.contracts || [];
+        if (list.length === 0) {
+          p3.fnoMetaLine.textContent = `No ${p3.fnoExch.value} ${p3.fnoType.value} contracts found in SQLite for this filter — click Sync Upstox Master or Sync Zerodha Master above.`;
+          return;
+        }
+        p3.fnoMetaLine.textContent = `Matching F&O Contracts (${body.count}) — click one to bind exact contract symbol & instrument key:`;
+        list.forEach((item) => {
+          const b = document.createElement('button');
+          b.type = 'button';
+          b.className = 'quick-btn mono' + (p3.sym.value.toUpperCase() === item.trading_symbol && p3.selectedInstrumentKey === item.instrument_key ? ' active' : '');
+          const parts = [item.trading_symbol];
+          if (item.expiry) parts.push(`Exp ${item.expiry}`);
+          if (item.strike && item.strike > 0) parts.push(String(item.strike));
+          if (item.lot_size && item.lot_size > 1) parts.push(`Lot ${item.lot_size}`);
+          parts.push(item.broker_id);
+          b.textContent = parts.join(' · ');
+          b.addEventListener('click', () => selectInstrumentItem(item));
+          p3.fnoContractsRow.appendChild(b);
+        });
+      } finally {
+        p3.fnoRefreshBtn.disabled = false;
+      }
+    }
+
+    async function searchInstruments(q, instType) {
+      const params = new URLSearchParams({ q: q || '', limit: '16' });
+      const activeType = instType ?? (p3.instrType ? p3.instrType.value : 'ALL');
+      if (activeType && activeType !== 'ALL') params.set('instrument_type', activeType);
+      const res = await fetch(`/api/instruments/search?${params.toString()}`);
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
         p3.instrFeedback.className = 'feedback err';
@@ -1326,28 +1688,28 @@
       }
       const body = await res.json();
       if (body.stats) {
-        p3.instrStats.textContent = `Indexed Symbols: ${Number(body.stats.total_instruments).toLocaleString()} · DB: ${body.stats.db_size_mb} MB`;
+        const fnoPart = typeof body.stats.fno_instruments === 'number' ? ` · F&O Contracts: ${Number(body.stats.fno_instruments).toLocaleString()}` : '';
+        p3.instrStats.textContent = `Indexed Symbols: ${Number(body.stats.total_instruments).toLocaleString()}${fnoPart} · DB: ${body.stats.db_size_mb} MB`;
       }
       const rows = body.results || [];
       if ((q || '').trim() && rows.length === 0) {
         p3.instrFeedback.className = 'feedback err';
-        p3.instrFeedback.textContent = `No symbol matching "${q.trim().toUpperCase()}" in local SQLite yet. Click Sync Upstox Master or Sync Zerodha Master.`;
+        p3.instrFeedback.textContent = `No matching ${activeType === 'ALL' ? '' : activeType + ' '}symbol for "${q.trim().toUpperCase()}" in local SQLite yet. Click Sync Upstox Master or Sync Zerodha Master.`;
       } else if (p3.instrFeedback.className.includes('err')) {
         p3.instrFeedback.className = 'feedback';
         p3.instrFeedback.textContent = '';
       }
       p3.instrChips.innerHTML = '';
-      rows.slice(0, 8).forEach((item) => {
+      rows.slice(0, 10).forEach((item) => {
         const b = document.createElement('button');
         b.type = 'button';
-        b.className = 'quick-btn' + (p3.sym.value.toUpperCase() === item.trading_symbol ? ' active' : '');
-        b.textContent = `${item.trading_symbol} · ${item.exchange} (${item.broker_id})`;
-        b.addEventListener('click', () => {
-          p3.sym.value = item.trading_symbol;
-          p3.exch.value = item.exchange;
-          syncCsvHref();
-          loadRecords();
-        });
+        b.className = 'quick-btn mono' + (p3.sym.value.toUpperCase() === item.trading_symbol && p3.exch.value === item.exchange ? ' active' : '');
+        const meta = [item.exchange];
+        if (item.instrument_type && item.instrument_type !== 'EQUITY') meta.push(item.instrument_type);
+        if (item.expiry) meta.push(`Exp ${item.expiry}`);
+        if (item.strike && item.strike > 0) meta.push(`@${item.strike}`);
+        b.textContent = `${item.trading_symbol} · ${meta.join(' · ')} (${item.broker_id})`;
+        b.addEventListener('click', () => selectInstrumentItem(item));
         p3.instrChips.appendChild(b);
       });
     }
@@ -1366,8 +1728,9 @@
         const body = await res.json();
         if (!res.ok) throw new Error(body.detail || 'Sync failed');
         p3.instrFeedback.className = 'feedback ok';
-        p3.instrFeedback.textContent = `Indexed ${Number(body.indexed_count || 0).toLocaleString()} ${brokerId} instruments.`;
-        await searchInstruments(p3.instrInput.value);
+        p3.instrFeedback.textContent = `Indexed ${Number(body.indexed_count || 0).toLocaleString()} ${brokerId} instruments (Equity + F&O).`;
+        await searchInstruments(p3.instrInput.value, p3.instrType.value);
+        if (p3.fnoOpen) await loadFnoContracts();
       } catch (err) {
         p3.instrFeedback.className = 'feedback err';
         p3.instrFeedback.textContent = err.message;
@@ -1394,10 +1757,12 @@
         const b = document.createElement('button');
         b.type = 'button';
         b.className = 'quick-btn mono';
-        b.textContent = `${ds.symbol} · ${ds.timeframe} (${ds.row_count} bars)`;
+        b.textContent = `${ds.symbol} · ${ds.exchange} · ${ds.timeframe} (${ds.row_count} bars)`;
         b.addEventListener('click', () => {
           p3.sym.value = ds.symbol;
           p3.exch.value = ds.exchange;
+          p3.selectedInstrumentKey = '';
+          p3.selectedInstrumentType = '';
           p3.tf.value = ds.timeframe;
           p3.from.value = ds.start_date;
           p3.to.value = ds.end_date;
@@ -1416,7 +1781,7 @@
         p3.summaryStrip.style.display = 'none';
         const empty = document.createElement('div');
         empty.style.cssText = 'padding:14px; border:1px solid var(--border); border-radius:8px; background:var(--bg); font-size:13px; color:var(--text-muted);';
-        empty.textContent = `No locally stored candles yet for ${p3.sym.value.toUpperCase()} (${p3.tf.value}).`;
+        empty.textContent = `No locally stored candles yet for ${p3.sym.value.toUpperCase()} (${p3.exch.value} · ${p3.tf.value}).`;
         p3.tableContainer.appendChild(empty);
         return;
       }
@@ -1429,16 +1794,17 @@
         <div><div style="color:var(--text-muted)">Range Low</div><div class="summary-val">${s.min_low ?? '—'}</div></div>
         <div><div style="color:var(--text-muted)">Range High</div><div class="summary-val">${s.max_high ?? '—'}</div></div>
         <div><div style="color:var(--text-muted)">Total Volume</div><div class="summary-val">${Number(s.total_volume || 0).toLocaleString()}</div></div>
+        <div><div style="color:var(--text-muted)">Latest OI</div><div class="summary-val">${Number(s.latest_oi || 0).toLocaleString()}</div></div>
       `;
       const wrap = document.createElement('div');
       wrap.className = 'table-wrap';
       const tbl = document.createElement('table');
       tbl.className = 'ohlcv-table mono';
-      tbl.innerHTML = '<thead><tr><th>Timestamp (IST)</th><th>Open</th><th>High</th><th>Low</th><th>Close</th><th>Volume</th><th>Source</th></tr></thead>';
+      tbl.innerHTML = '<thead><tr><th>Timestamp (IST)</th><th>Open</th><th>High</th><th>Low</th><th>Close</th><th>Volume</th><th>OI</th><th>Source</th></tr></thead>';
       const tb = document.createElement('tbody');
       payload.rows.forEach((r) => {
         const tr = document.createElement('tr');
-        tr.innerHTML = `<td>${r.ts_ist}</td><td>${Number(r.open).toFixed(2)}</td><td>${Number(r.high).toFixed(2)}</td><td>${Number(r.low).toFixed(2)}</td><td style="font-weight:600">${Number(r.close).toFixed(2)}</td><td>${Number(r.volume).toLocaleString()}</td><td style="color:var(--text-muted)">${r.source}</td>`;
+        tr.innerHTML = `<td>${r.ts_ist}</td><td>${Number(r.open).toFixed(2)}</td><td>${Number(r.high).toFixed(2)}</td><td>${Number(r.low).toFixed(2)}</td><td style="font-weight:600">${Number(r.close).toFixed(2)}</td><td>${Number(r.volume).toLocaleString()}</td><td>${Number(r.oi || 0).toLocaleString()}</td><td style="color:var(--text-muted)">${r.source}</td>`;
         tb.appendChild(tr);
       });
       tbl.appendChild(tb);
@@ -1483,6 +1849,8 @@
             from_date: p3.from.value,
             to_date: p3.to.value,
             provider: p3.prov.value === 'auto' ? null : p3.prov.value,
+            instrument_type: p3.selectedInstrumentType || null,
+            instrument_key: p3.selectedInstrumentKey || null,
           }),
         });
         const body = await res.json().catch(() => ({}));
@@ -1507,7 +1875,62 @@
       }
     }
 
-    p3.instrInput.addEventListener('input', () => searchInstruments(p3.instrInput.value));
+    p3.instrInput.addEventListener('input', () => searchInstruments(p3.instrInput.value, p3.instrType.value));
+    p3.instrType.addEventListener('change', () => {
+      const val = p3.instrType.value;
+      searchInstruments(p3.instrInput.value, val);
+      if (['FO', 'FUT', 'OPT', 'CE', 'PE'].includes(val)) {
+        setFnoOpen(true);
+        p3.fnoType.value = val === 'OPT' ? 'CE' : val;
+        loadFnoContracts();
+      }
+    });
+    p3.fnoToggleBtn.addEventListener('click', () => {
+      const next = !p3.fnoOpen;
+      setFnoOpen(next);
+      if (next) {
+        if (['NFO', 'BFO', 'MCX'].includes(p3.exch.value)) p3.fnoExch.value = p3.exch.value;
+        loadFnoContracts();
+      }
+    });
+    p3.fnoExch.addEventListener('change', () => {
+      p3.exch.value = p3.fnoExch.value;
+      p3.fnoExp.value = '';
+      p3.fnoStrike.value = '';
+      syncContractHint();
+      loadFnoContracts();
+    });
+    p3.fnoUl.addEventListener('input', () => {
+      p3.fnoExp.value = '';
+      p3.fnoStrike.value = '';
+      loadFnoContracts();
+    });
+    p3.fnoType.addEventListener('change', () => {
+      if (p3.fnoType.value === 'FUT') p3.fnoStrike.value = '';
+      loadFnoContracts();
+    });
+    p3.fnoExp.addEventListener('change', () => {
+      p3.fnoStrike.value = '';
+      loadFnoContracts();
+    });
+    p3.fnoStrike.addEventListener('change', () => loadFnoContracts());
+    p3.fnoRefreshBtn.addEventListener('click', () => loadFnoContracts());
+    p3.sym.addEventListener('input', () => {
+      p3.selectedInstrumentKey = '';
+      p3.selectedInstrumentType = '';
+      syncContractHint();
+    });
+    p3.exch.addEventListener('change', () => {
+      p3.selectedInstrumentKey = '';
+      if (['NFO', 'BFO', 'MCX'].includes(p3.exch.value)) {
+        setFnoOpen(true);
+        p3.fnoExch.value = p3.exch.value;
+        loadFnoContracts();
+      }
+      syncContractHint();
+    });
+    p3.prov.addEventListener('change', syncContractHint);
+
     p3.syncUpstox.addEventListener('click', () => syncMaster('upstox'));
     p3.syncZerodha.addEventListener('click', () => syncMaster('zerodha'));
     p3.dlBtn.addEventListener('click', downloadMissingDays);
@@ -1526,8 +1949,164 @@
     });
 
     loadOverview(true);
-    searchInstruments('');
+    searchInstruments('', 'ALL');
     loadCatalog();
+
+    // Phase 4: Hot-Standby Feed Failover, Preflight & SEBI Kill Switch JS
+    const p4 = {
+      feedMeta: document.getElementById('p4FeedMeta'),
+      pollBtn: document.getElementById('p4PollBtn'),
+      failoverBtn: document.getElementById('p4FailoverBtn'),
+      recoverBtn: document.getElementById('p4RecoverBtn'),
+      feedFeedback: document.getElementById('p4FeedFeedback'),
+      slotsBody: document.getElementById('p4SlotsBody'),
+      quotesStrip: document.getElementById('p4QuotesStrip'),
+      preflightBtn: document.getElementById('p4PreflightBtn'),
+      preflightSummary: document.getElementById('p4PreflightSummary'),
+      preflightList: document.getElementById('p4PreflightList'),
+      killBadge: document.getElementById('p4KillBadge'),
+      killDetail: document.getElementById('p4KillDetail'),
+      killReason: document.getElementById('p4KillReason'),
+      killBtn: document.getElementById('p4KillToggleBtn'),
+      auditSummary: document.getElementById('p4AuditSummary'),
+      verifyBtn: document.getElementById('p4VerifyAuditBtn'),
+      auditBody: document.getElementById('p4AuditBody'),
+      killEngaged: false,
+    };
+
+    function renderLiveStatus(data) {
+      if (!data) return;
+      const feeds = data.feeds || (data.slots ? data : null);
+      if (feeds) {
+        p4.feedMeta.textContent = `Primary: ${String(feeds.primary_feed || '').toUpperCase()} · Active Feed: ${String(feeds.active_feed || '').toUpperCase()} · Failovers: ${feeds.failover_count || 0}`;
+        p4.slotsBody.innerHTML = '';
+        (feeds.slots || []).forEach((s) => {
+          const tr = document.createElement('tr');
+          const cls = s.status === 'CONNECTED' ? 'status-pass' : (s.status === 'FAILOVER' || s.status === 'DISCONNECTED' ? 'status-warn' : '');
+          tr.innerHTML = `<td style="font-weight:600; color:var(--text)">${s.display_name}</td><td style="color:var(--text-muted)">${s.role}</td><td style="color:var(--text-muted)">${s.transport}</td><td class="${cls}">${s.status}</td><td class="num">${s.ticks_received} / ${s.error_count}</td><td class="num">${s.latency_ms !== null && s.latency_ms !== undefined ? s.latency_ms + ' ms' : '—'}</td><td class="num" style="color:var(--text-muted)">${s.last_tick_ist ? s.last_tick_ist.slice(11, 19) : '—'}</td>`;
+          p4.slotsBody.appendChild(tr);
+        });
+        const quotes = feeds.quotes || [];
+        if (quotes.length > 0) {
+          p4.quotesStrip.style.display = 'grid';
+          p4.quotesStrip.innerHTML = quotes.map((q) => `<div><div style="color:var(--text-muted)">${q.symbol} · ${q.source}</div><div class="summary-val">₹${Number(q.ltp).toFixed(2)}</div></div>`).join('');
+        } else {
+          p4.quotesStrip.style.display = 'none';
+        }
+      }
+      if (data.kill_switch) {
+        p4.killEngaged = Boolean(data.kill_switch.engaged);
+        p4.killBadge.textContent = p4.killEngaged ? 'ENGAGED' : 'ARMED / CLEAR';
+        p4.killBadge.className = 'mono ' + (p4.killEngaged ? 'status-fail' : 'status-pass');
+        p4.killDetail.className = p4.killEngaged ? 'feedback err' : 'feedback';
+        p4.killDetail.textContent = p4.killEngaged ? `Stopped at ${data.kill_switch.engaged_at_ist || 'now'} · ${data.kill_switch.reason || ''}` : '';
+        p4.killBtn.textContent = p4.killEngaged ? 'Reset Kill Switch' : 'Engage Emergency Kill Switch';
+        p4.killBtn.style.background = p4.killEngaged ? 'var(--green)' : 'var(--red)';
+        p4.killBtn.style.borderColor = p4.killEngaged ? 'var(--green)' : 'var(--red)';
+      }
+      const v = data.audit_verify || data.verification;
+      if (v) {
+        p4.auditSummary.textContent = `${v.valid ? 'VERIFIED' : 'TAMPER ALERT'} · ${v.total_events} events · Head: ${String(v.head_hash || '').slice(0, 14)}…`;
+      }
+      const events = data.audit_events || data.events;
+      if (Array.isArray(events)) {
+        p4.auditBody.innerHTML = events.map((ev) => {
+          const detail = (ev.payload && (ev.payload.reason || ev.payload.trading_broker || ev.payload.trading_symbol)) || '—';
+          return `<tr><td style="color:var(--text-muted)">${String(ev.ts_ist || '').slice(0, 19)}</td><td style="font-weight:600">${ev.event_type}</td><td style="color:var(--text-muted)">${ev.actor}</td><td>${detail}</td><td class="num" style="color:var(--accent)">${String(ev.chain_hash || '').slice(0, 16)}…</td></tr>`;
+        }).join('');
+      }
+    }
+
+    async function loadLiveStatus() {
+      try {
+        const res = await fetch('/api/live/status');
+        if (res.ok) renderLiveStatus(await res.json());
+      } catch {}
+    }
+
+    async function runFeedAction(endpoint, payloadObj) {
+      p4.pollBtn.disabled = true;
+      p4.failoverBtn.disabled = true;
+      p4.recoverBtn.disabled = true;
+      try {
+        const res = await fetch(endpoint, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payloadObj || {}),
+        });
+        const body = await res.json();
+        if (!res.ok) throw new Error(body.detail || 'Feed operation failed');
+        renderLiveStatus(body);
+        p4.feedFeedback.className = 'feedback ' + (body.ok ? 'ok' : 'err');
+        p4.feedFeedback.textContent = body.message || 'Feed updated.';
+      } catch (err) {
+        p4.feedFeedback.className = 'feedback err';
+        p4.feedFeedback.textContent = err.message;
+      } finally {
+        p4.pollBtn.disabled = false;
+        p4.failoverBtn.disabled = false;
+        p4.recoverBtn.disabled = false;
+      }
+    }
+
+    async function runPreflight() {
+      p4.preflightBtn.disabled = true;
+      try {
+        const res = await fetch('/api/live/preflight', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ symbols: [p3.sym.value.trim().toUpperCase() || 'RELIANCE', 'NIFTY'] }),
+        });
+        const body = await res.json();
+        p4.preflightSummary.textContent = `${body.passed_count}/${body.total_count} passed · ${body.overall_ready ? 'Ready for execution' : 'Execution blocked until ERROR checks pass'}`;
+        p4.preflightList.innerHTML = (body.checks || []).map((c) => {
+          const cls = c.status === 'PASS' ? 'status-pass' : (c.status === 'WARN' ? 'status-warn' : 'status-fail');
+          return `<div class="p4-check-row"><div><div style="font-weight:600; color:var(--text)">${c.name}</div><div style="color:var(--text-muted)">${c.message}</div></div><span class="mono ${cls}">${c.status}</span></div>`;
+        }).join('');
+        renderLiveStatus(body);
+      } finally {
+        p4.preflightBtn.disabled = false;
+      }
+    }
+
+    async function toggleKillSwitch() {
+      p4.killBtn.disabled = true;
+      try {
+        const res = await fetch('/api/live/kill-switch', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            engaged: !p4.killEngaged,
+            reason: p4.killReason.value.trim(),
+          }),
+        });
+        const body = await res.json();
+        renderLiveStatus(body);
+        if (!p4.killEngaged) p4.killReason.value = '';
+        await runPreflight();
+      } finally {
+        p4.killBtn.disabled = false;
+      }
+    }
+
+    async function verifyAudit() {
+      p4.verifyBtn.disabled = true;
+      try {
+        const res = await fetch('/api/audit/verify?limit=20');
+        if (res.ok) renderLiveStatus(await res.json());
+      } finally {
+        p4.verifyBtn.disabled = false;
+      }
+    }
+
+    p4.pollBtn.addEventListener('click', () => runFeedAction('/api/live/feeds/poll'));
+    p4.failoverBtn.addEventListener('click', () => runFeedAction('/api/live/feeds/failover', { reason: 'Operator failover drill' }));
+    p4.recoverBtn.addEventListener('click', () => runFeedAction('/api/live/feeds/recover'));
+    p4.preflightBtn.addEventListener('click', runPreflight);
+    p4.killBtn.addEventListener('click', toggleKillSwitch);
+    p4.verifyBtn.addEventListener('click', verifyAudit);
+
+    loadLiveStatus();
   </script>
 </body>
 </html>

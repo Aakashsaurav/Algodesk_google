@@ -58,12 +58,12 @@ _SEGMENT_TO_EXCHANGE = {
     "BSE_EQ": "BSE",
     "NSE_INDEX": "NSE",
     "BSE_INDEX": "BSE",
-    "NSE_FO": "NSE",
-    "BSE_FO": "BSE",
+    "NSE_FO": "NFO",
+    "BSE_FO": "BFO",
     "MCX_FO": "MCX",
     "NSE_COM": "NSE",
-    "NCD_FO": "NSE",
-    "BCD_FO": "BSE",
+    "NCD_FO": "NCD",
+    "BCD_FO": "BCD",
 }
 
 _ZERODHA_INDEX_ALIASES = {
@@ -73,6 +73,55 @@ _ZERODHA_INDEX_ALIASES = {
     "NIFTY MID SELECT": "MIDCPNIFTY",
     "INDIA VIX": "INDIAVIX",
 }
+
+
+def _normalize_expiry(raw_exp: Any) -> Optional[str]:
+    if raw_exp is None:
+        return None
+    text = str(raw_exp).strip()
+    if not text:
+        return None
+    if text.isdigit():
+        try:
+            num = int(text)
+            if num > 10_000_000_000:
+                num_sec = num / 1000.0
+            else:
+                num_sec = float(num)
+            return datetime.fromtimestamp(num_sec, tz=IST_TZ).date().isoformat()
+        except (ValueError, OverflowError, OSError):
+            return text
+    return text[:10] if len(text) >= 10 and text[4] == "-" and text[7] == "-" else text
+
+
+def _exchange_sql_filter(exchange: str) -> tuple[str, List[Any]]:
+    ex = (exchange or "").strip().upper()
+    if ex in {"NFO", "NSE_FO"}:
+        return "(UPPER(exchange) IN ('NFO', 'NSE_FO') OR UPPER(segment) = 'NSE_FO')", []
+    if ex in {"BFO", "BSE_FO"}:
+        return "(UPPER(exchange) IN ('BFO', 'BSE_FO') OR UPPER(segment) = 'BSE_FO')", []
+    if ex in {"MCX", "MCX_FO"}:
+        return "(UPPER(exchange) IN ('MCX', 'MCX_FO') OR UPPER(segment) = 'MCX_FO')", []
+    if ex in {"NSE", "NSE_EQ", "NSE_INDEX"}:
+        return "(UPPER(exchange) IN ('NSE', 'NSE_EQ', 'NSE_INDEX') AND UPPER(segment) != 'NSE_FO')", []
+    if ex in {"BSE", "BSE_EQ", "BSE_INDEX"}:
+        return "(UPPER(exchange) IN ('BSE', 'BSE_EQ', 'BSE_INDEX') AND UPPER(segment) != 'BSE_FO')", []
+    return "UPPER(exchange) = ?", [ex]
+
+
+def _instrument_type_sql_filter(instrument_type: Optional[str]) -> tuple[str, List[Any]]:
+    it = (instrument_type or "").strip().upper()
+    if not it or it == "ALL":
+        return "", []
+    if it in {"FUTURES", "FUT"}:
+        return "UPPER(instrument_type) LIKE 'FUT%'", []
+    if it in {"OPTIONS", "OPT"}:
+        return "(UPPER(instrument_type) IN ('CE', 'PE') OR UPPER(instrument_type) LIKE 'OPT%')", []
+    if it in {"FO", "FNO", "F&O"}:
+        return "(UPPER(instrument_type) LIKE 'FUT%' OR UPPER(instrument_type) IN ('CE', 'PE') OR UPPER(instrument_type) LIKE 'OPT%')", []
+    if it in {"EQUITY", "EQ", "CASH"}:
+        return "UPPER(instrument_type) IN ('EQUITY', 'EQ', 'INDEX')", []
+    return "UPPER(instrument_type) = ?", [it]
 
 
 @dataclass(frozen=True)
@@ -150,7 +199,21 @@ class InstrumentIndex:
             "CREATE INDEX IF NOT EXISTS idx_instr_asset ON instruments (asset_symbol COLLATE NOCASE, broker_id);"
         )
         conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_instr_fno ON instruments (instrument_type, exchange, asset_symbol COLLATE NOCASE, expiry);"
+        )
+        conn.execute(
             "CREATE TABLE IF NOT EXISTS index_meta (broker_id TEXT PRIMARY KEY, last_synced_at TEXT, row_count INTEGER);"
+        )
+
+        # Normalize legacy Upstox F&O exchange label if upgrading existing DB on disk
+        conn.execute(
+            "UPDATE instruments SET exchange = 'NFO' WHERE segment = 'NSE_FO' AND exchange = 'NSE';"
+        )
+        conn.execute(
+            "UPDATE instruments SET exchange = 'BFO' WHERE segment = 'BSE_FO' AND exchange = 'BSE';"
+        )
+        conn.execute(
+            "UPDATE instruments SET exchange = 'MCX' WHERE segment = 'MCX_FO' AND exchange != 'MCX';"
         )
 
         # Seed core flagship symbols only when empty so searches work immediately offline
@@ -177,6 +240,9 @@ class InstrumentIndex:
                     "SELECT broker_id, COUNT(*) AS cnt FROM instruments GROUP BY broker_id"
                 ).fetchall()
             }
+            fno_count = conn.execute(
+                "SELECT COUNT(*) FROM instruments WHERE UPPER(instrument_type) LIKE 'FUT%' OR UPPER(instrument_type) IN ('CE', 'PE') OR UPPER(instrument_type) LIKE 'OPT%'"
+            ).fetchone()[0]
             metas = {
                 row["broker_id"]: {
                     "last_synced_at": row["last_synced_at"],
@@ -189,15 +255,19 @@ class InstrumentIndex:
             "db_path": str(self.db_path),
             "db_size_mb": round(db_bytes / (1024 * 1024), 3),
             "total_instruments": total,
+            "fno_instruments": fno_count,
             "counts_by_broker": by_broker,
             "sync_meta": metas,
         }
 
     def search(
         self,
-        query: str,
+        query: str = "",
         broker_id: Optional[str] = None,
         exchange: Optional[str] = None,
+        instrument_type: Optional[str] = None,
+        expiry: Optional[str] = None,
+        strike: Optional[float] = None,
         limit: int = 25,
     ) -> List[Dict[str, Any]]:
         clean_q = (query or "").strip().upper()
@@ -209,26 +279,45 @@ class InstrumentIndex:
             clauses.append("broker_id = ?")
             params.append(broker_id.strip().lower())
         if exchange and exchange.strip().lower() not in {"all", ""}:
-            clauses.append("exchange = ?")
-            params.append(exchange.strip().upper())
+            ex_sql, ex_params = _exchange_sql_filter(exchange)
+            clauses.append(ex_sql)
+            params.extend(ex_params)
+
+        it_sql, it_params = _instrument_type_sql_filter(instrument_type)
+        if it_sql:
+            clauses.append(it_sql)
+            params.extend(it_params)
+
+        if expiry and expiry.strip():
+            clauses.append("expiry = ?")
+            params.append(_normalize_expiry(expiry.strip()))
+
+        if strike is not None:
+            clauses.append("strike = ?")
+            params.append(float(strike))
 
         if clean_q:
-            clauses.append(
-                "(UPPER(trading_symbol) LIKE ? OR UPPER(asset_symbol) LIKE ? OR UPPER(name) LIKE ?)"
-            )
-            prefix = f"{clean_q}%"
-            contains = f"%{clean_q}%"
-            params.extend([prefix, contains, contains])
+            tokens = [t for t in clean_q.split() if t]
+            for tok in tokens:
+                contains = f"%{tok}%"
+                clauses.append(
+                    "(UPPER(trading_symbol) LIKE ? OR UPPER(asset_symbol) LIKE ? "
+                    "OR UPPER(name) LIKE ? OR COALESCE(expiry, '') LIKE ? "
+                    "OR CAST(COALESCE(strike, '') AS TEXT) LIKE ? OR UPPER(instrument_type) LIKE ?)"
+                )
+                params.extend([contains, contains, contains, contains, contains, contains])
 
         where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-        order_sql = (
-            "ORDER BY CASE WHEN UPPER(trading_symbol) = ? THEN 0 "
-            "WHEN UPPER(trading_symbol) LIKE ? THEN 1 ELSE 2 END, trading_symbol ASC LIMIT ?"
-        )
         if clean_q:
-            params.extend([clean_q, f"{clean_q}%", capped_limit])
+            order_sql = (
+                "ORDER BY CASE WHEN UPPER(trading_symbol) = ? THEN 0 "
+                "WHEN UPPER(asset_symbol) = ? THEN 1 "
+                "WHEN UPPER(trading_symbol) LIKE ? THEN 2 ELSE 3 END, "
+                "COALESCE(expiry, '9999-12-31') ASC, COALESCE(strike, 0) ASC, trading_symbol ASC LIMIT ?"
+            )
+            params.extend([clean_q, clean_q, f"{clean_q}%", capped_limit])
         else:
-            order_sql = "ORDER BY trading_symbol ASC LIMIT ?"
+            order_sql = "ORDER BY COALESCE(expiry, '9999-12-31') ASC, COALESCE(strike, 0) ASC, trading_symbol ASC LIMIT ?"
             params.append(capped_limit)
 
         with self._connect() as conn:
@@ -243,7 +332,141 @@ class InstrumentIndex:
                 """,
                 params,
             ).fetchall()
-        return [dict(row) for row in rows]
+        out = []
+        for row in rows:
+            item = dict(row)
+            item["expiry"] = _normalize_expiry(item.get("expiry"))
+            out.append(item)
+        return out
+
+    def list_fno_contracts(
+        self,
+        *,
+        underlying: str = "",
+        exchange: str = "NFO",
+        contract_type: str = "FO",
+        expiry: Optional[str] = None,
+        strike: Optional[float] = None,
+        broker_id: Optional[str] = None,
+        limit: int = 40,
+    ) -> Dict[str, Any]:
+        """Return structured F&O underlyings, expiries, strikes, and matching contracts from SQLite."""
+        clean_ul = (underlying or "").strip().upper()
+        ex_sql, ex_params = _exchange_sql_filter(exchange or "NFO")
+        eff_type = (contract_type or "FO").strip().upper()
+        if eff_type == "ALL":
+            eff_type = "FO"
+        it_sql, it_params = _instrument_type_sql_filter(eff_type)
+
+        base_clauses = ["(UPPER(instrument_type) LIKE 'FUT%' OR UPPER(instrument_type) IN ('CE', 'PE') OR UPPER(instrument_type) LIKE 'OPT%')"]
+        base_params: List[Any] = []
+        if exchange and exchange.strip().upper() != "ALL":
+            base_clauses.append(ex_sql)
+            base_params.extend(ex_params)
+        if broker_id and broker_id.strip().lower() not in {"all", ""}:
+            base_clauses.append("broker_id = ?")
+            base_params.append(broker_id.strip().lower())
+
+        with self._connect() as conn:
+            ul_clauses = list(base_clauses)
+            ul_params = list(base_params)
+            if clean_ul:
+                ul_clauses.append("UPPER(asset_symbol) LIKE ?")
+                ul_params.append(f"{clean_ul}%")
+            underlyings = [
+                r["asset_symbol"]
+                for r in conn.execute(
+                    f"""
+                    SELECT DISTINCT asset_symbol
+                    FROM instruments
+                    WHERE {' AND '.join(ul_clauses)}
+                    ORDER BY asset_symbol ASC
+                    LIMIT 40
+                    """,
+                    ul_params,
+                ).fetchall()
+                if r["asset_symbol"]
+            ]
+
+            exp_clauses = list(base_clauses)
+            exp_params = list(base_params)
+            if it_sql:
+                exp_clauses.append(it_sql)
+                exp_params.extend(it_params)
+            if clean_ul:
+                exp_clauses.append("(UPPER(asset_symbol) = ? OR UPPER(asset_symbol) LIKE ?)")
+                exp_params.extend([clean_ul, f"{clean_ul}%"])
+            expiries = sorted(
+                {
+                    norm
+                    for r in conn.execute(
+                        f"""
+                        SELECT DISTINCT expiry
+                        FROM instruments
+                        WHERE {' AND '.join(exp_clauses)} AND expiry IS NOT NULL AND expiry != ''
+                        ORDER BY expiry ASC
+                        LIMIT 40
+                        """,
+                        exp_params,
+                    ).fetchall()
+                    if (norm := _normalize_expiry(r["expiry"])) is not None
+                }
+            )
+
+            strike_clauses = list(exp_clauses)
+            strike_params = list(exp_params)
+            if expiry and expiry.strip():
+                strike_clauses.append("expiry = ?")
+                strike_params.append(_normalize_expiry(expiry.strip()))
+            strikes = [
+                float(r["strike"])
+                for r in conn.execute(
+                    f"""
+                    SELECT DISTINCT strike
+                    FROM instruments
+                    WHERE {' AND '.join(strike_clauses)} AND strike IS NOT NULL AND strike > 0
+                    ORDER BY strike ASC
+                    LIMIT 120
+                    """,
+                    strike_params,
+                ).fetchall()
+            ]
+
+        contracts = self.search(
+            query="",
+            broker_id=broker_id,
+            exchange=exchange if exchange and exchange.strip().upper() != "ALL" else None,
+            instrument_type=eff_type,
+            expiry=expiry,
+            strike=strike,
+            limit=limit,
+        ) if not clean_ul else self.search(
+            query=clean_ul,
+            broker_id=broker_id,
+            exchange=exchange if exchange and exchange.strip().upper() != "ALL" else None,
+            instrument_type=eff_type,
+            expiry=expiry,
+            strike=strike,
+            limit=limit,
+        )
+
+        # Tighten underlying filter so "NIFTY" doesn't get pushed down by longer prefixes when exact exists
+        if clean_ul and contracts:
+            exact_ul = [c for c in contracts if str(c.get("asset_symbol", "")).upper() == clean_ul]
+            if exact_ul:
+                contracts = exact_ul
+
+        return {
+            "ok": True,
+            "exchange": (exchange or "NFO").strip().upper(),
+            "contract_type": eff_type,
+            "underlying": clean_ul,
+            "underlyings": underlyings,
+            "expiries": expiries,
+            "strikes": strikes,
+            "contracts": contracts[:limit],
+            "count": len(contracts[:limit]),
+        }
 
     def resolve_key(
         self,
@@ -251,17 +474,27 @@ class InstrumentIndex:
         broker_id: str = "upstox",
         exchange: str = "NSE",
         instrument_type: Optional[str] = None,
+        expiry: Optional[str] = None,
+        strike: Optional[float] = None,
     ) -> Optional[str]:
         """Resolve single instrument_key (Upstox) or instrument_token (Zerodha) via SQLite index."""
         sym = trading_symbol.strip().upper()
         bid = broker_id.strip().lower()
         exch = exchange.strip().upper()
+        ex_sql, ex_params = _exchange_sql_filter(exch)
 
-        clauses = ["broker_id = ?", "exchange = ?", "(UPPER(trading_symbol) = ? OR UPPER(asset_symbol) = ?)"]
-        params: List[Any] = [bid, exch, sym, sym]
-        if instrument_type:
-            clauses.append("UPPER(instrument_type) = ?")
-            params.append(instrument_type.strip().upper())
+        clauses = ["broker_id = ?", ex_sql, "(UPPER(trading_symbol) = ? OR UPPER(asset_symbol) = ?)"]
+        params: List[Any] = [bid, *ex_params, sym, sym]
+        it_sql, it_params = _instrument_type_sql_filter(instrument_type)
+        if it_sql:
+            clauses.append(it_sql)
+            params.extend(it_params)
+        if expiry and expiry.strip():
+            clauses.append("expiry = ?")
+            params.append(_normalize_expiry(expiry.strip()))
+        if strike is not None:
+            clauses.append("strike = ?")
+            params.append(float(strike))
 
         with self._connect() as conn:
             row = conn.execute(
@@ -269,11 +502,43 @@ class InstrumentIndex:
                 SELECT instrument_key, instrument_token
                 FROM instruments
                 WHERE {' AND '.join(clauses)}
-                ORDER BY CASE WHEN UPPER(trading_symbol) = ? THEN 0 ELSE 1 END
+                ORDER BY CASE WHEN UPPER(trading_symbol) = ? THEN 0 ELSE 1 END,
+                         COALESCE(expiry, '9999-12-31') ASC
                 LIMIT 1
                 """,
                 [*params, sym],
             ).fetchone()
+
+            # Cross-broker F&O fallback: e.g. user picked a Zerodha NFO symbol (NIFTY26NOVFUT)
+            # and requested historical candles from Upstox (which uses a distinct trading_symbol).
+            if not row and exch in {"NFO", "BFO", "MCX", "NSE_FO", "BSE_FO", "MCX_FO"}:
+                ref = conn.execute(
+                    f"""
+                    SELECT asset_symbol, instrument_type, expiry, strike
+                    FROM instruments
+                    WHERE UPPER(trading_symbol) = ? AND {ex_sql}
+                    LIMIT 1
+                    """,
+                    [sym, *ex_params],
+                ).fetchone()
+                if ref:
+                    cb_clauses = ["broker_id = ?", ex_sql, "UPPER(asset_symbol) = ?", "UPPER(instrument_type) = ?"]
+                    cb_params: List[Any] = [
+                        bid,
+                        *ex_params,
+                        str(ref["asset_symbol"]).upper(),
+                        str(ref["instrument_type"]).upper(),
+                    ]
+                    if ref["expiry"]:
+                        cb_clauses.append("expiry = ?")
+                        cb_params.append(_normalize_expiry(ref["expiry"]))
+                    if ref["strike"] is not None:
+                        cb_clauses.append("strike = ?")
+                        cb_params.append(float(ref["strike"]))
+                    row = conn.execute(
+                        f"SELECT instrument_key, instrument_token FROM instruments WHERE {' AND '.join(cb_clauses)} LIMIT 1",
+                        cb_params,
+                    ).fetchone()
 
         if not row:
             return None
@@ -295,7 +560,7 @@ class InstrumentIndex:
                 r.instrument_type.upper(),
                 r.instrument_key,
                 r.instrument_token,
-                r.expiry,
+                _normalize_expiry(r.expiry),
                 r.strike,
                 r.lot_size,
                 r.tick_size,
@@ -328,7 +593,7 @@ class InstrumentIndex:
         """Stream Upstox complete.json.gz straight into SQLite without retaining full list in RAM."""
         req = urllib.request.Request(
             config.INSTRUMENT_KEY_URL,
-            headers={"User-Agent": "AlgoDesk/3.0"},
+            headers={"User-Agent": "AlgoDesk/4.0"},
         )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw_gz = resp.read()
@@ -344,17 +609,16 @@ class InstrumentIndex:
 
         with self._connect() as conn:
             for item in items:
-                seg = str(item.get("segment", ""))
+                seg = str(item.get("segment", "")).upper()
                 exch = _SEGMENT_TO_EXCHANGE.get(seg, str(item.get("exchange", "NSE"))).upper()
                 sym = str(item.get("trading_symbol", "")).strip().upper()
-                asset_sym = str(item.get("asset_symbol") or sym).strip().upper()
+                asset_sym = str(item.get("underlying_symbol") or item.get("asset_symbol") or sym).strip().upper()
                 raw_type = str(item.get("instrument_type", "EQUITY")).upper()
                 norm_type = "EQUITY" if raw_type in {"EQ", "EQUITY"} else raw_type
                 ikey = str(item.get("instrument_key", "")).strip()
                 if not sym or not ikey:
                     continue
-                exp_val = item.get("expiry")
-                expiry_str = str(exp_val) if exp_val else None
+                expiry_str = _normalize_expiry(item.get("expiry"))
                 strike_val = item.get("strike_price")
                 batch.append(
                     (
@@ -368,7 +632,7 @@ class InstrumentIndex:
                         ikey,
                         None,
                         expiry_str,
-                        float(strike_val) if strike_val is not None else None,
+                        float(strike_val) if strike_val is not None and float(strike_val) > 0 else None,
                         int(item.get("lot_size") or 1),
                         float(item.get("tick_size") or 0.05),
                         now_ist,
@@ -414,7 +678,7 @@ class InstrumentIndex:
         """Stream public Kite Connect instruments CSV straight into SQLite."""
         req = urllib.request.Request(
             config.ZERODHA_INSTRUMENT_URL,
-            headers={"X-Kite-Version": "3", "User-Agent": "AlgoDesk/3.0"},
+            headers={"X-Kite-Version": "3", "User-Agent": "AlgoDesk/4.0"},
         )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             csv_text = resp.read().decode("utf-8")
@@ -436,7 +700,11 @@ class InstrumentIndex:
                 norm_type = "EQUITY" if raw_type == "EQ" else ("INDEX" if seg == "INDICES" else raw_type)
                 strike_raw = str(row.get("strike", "")).strip()
                 strike_val = float(strike_raw) if strike_raw and float(strike_raw) != 0 else None
-                asset_sym = _ZERODHA_INDEX_ALIASES.get(sym, sym)
+                raw_name = str(row.get("name", "")).strip()
+                if norm_type in {"FUT", "CE", "PE"} or raw_type.startswith("FUT") or raw_type.startswith("OPT"):
+                    asset_sym = (raw_name.upper() if raw_name else _ZERODHA_INDEX_ALIASES.get(sym, sym))
+                else:
+                    asset_sym = _ZERODHA_INDEX_ALIASES.get(sym, sym)
                 batch.append(
                     (
                         "zerodha",
@@ -444,11 +712,11 @@ class InstrumentIndex:
                         seg,
                         sym,
                         asset_sym,
-                        str(row.get("name", "")).strip(),
+                        raw_name,
                         norm_type,
                         f"{exch}:{sym}",
                         token,
-                        str(row.get("expiry", "")).strip() or None,
+                        _normalize_expiry(row.get("expiry")),
                         strike_val,
                         int(float(row.get("lot_size") or 1)),
                         float(row.get("tick_size") or 0.05),

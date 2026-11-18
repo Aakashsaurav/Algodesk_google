@@ -14,7 +14,10 @@ import argparse
 import html
 import json
 import logging
+import queue
+import socket
 import sys
+import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -22,10 +25,21 @@ from typing import Any, Dict, Optional
 from urllib.parse import parse_qs, urlparse
 
 from config import setup_logging
+from core.ws_protocol import (
+    OPCODE_CLOSE,
+    OPCODE_PING,
+    OPCODE_TEXT,
+    perform_handshake,
+    read_ws_frame,
+    send_ws_close,
+    send_ws_pong,
+    send_ws_text,
+)
 from web.service import hub_service
 
 logger = logging.getLogger(__name__)
 TEMPLATE_PATH = Path(__file__).resolve().parent / "templates" / "index.html"
+TERMINAL_TEMPLATE_PATH = Path(__file__).resolve().parent / "templates" / "terminal.html"
 
 
 class _StdlibBrokerHandler(BaseHTTPRequestHandler):
@@ -71,8 +85,15 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
             self._send_html(200, TEMPLATE_PATH.read_text(encoding="utf-8"))
             return
 
+        if path == "/terminal":
+            if not TERMINAL_TEMPLATE_PATH.exists():
+                self._send_json(500, {"detail": "terminal.html template missing"})
+                return
+            self._send_html(200, TERMINAL_TEMPLATE_PATH.read_text(encoding="utf-8"))
+            return
+
         if path == "/api/health":
-            self._send_json(200, {"ok": True, "service": "algodesk", "phase": 3})
+            self._send_json(200, {"ok": True, "service": "algodesk", "phase": 4})
             return
 
         if path == "/api/overview":
@@ -89,10 +110,39 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
             q = query.get("q", [""])[0]
             broker_id = query.get("broker_id", [None])[0]
             exchange = query.get("exchange", [None])[0]
+            instrument_type = query.get("instrument_type", [None])[0]
+            expiry = query.get("expiry", [None])[0]
+            strike_raw = query.get("strike", [None])[0]
+            strike = float(strike_raw) if strike_raw else None
             limit = int(query.get("limit", ["25"])[0] or 25)
             self._send_json(
                 200,
-                hub_service.search_instruments(query=q, broker_id=broker_id, exchange=exchange, limit=limit),
+                hub_service.search_instruments(
+                    query=q,
+                    broker_id=broker_id,
+                    exchange=exchange,
+                    instrument_type=instrument_type,
+                    expiry=expiry,
+                    strike=strike,
+                    limit=limit,
+                ),
+            )
+            return
+
+        if path == "/api/instruments/fno":
+            strike_raw = query.get("strike", [None])[0]
+            strike = float(strike_raw) if strike_raw else None
+            self._send_json(
+                200,
+                hub_service.list_fno_contracts(
+                    underlying=query.get("underlying", [""])[0],
+                    exchange=query.get("exchange", ["NFO"])[0],
+                    contract_type=query.get("contract_type", ["FO"])[0],
+                    expiry=query.get("expiry", [None])[0],
+                    strike=strike,
+                    broker_id=query.get("broker_id", [None])[0],
+                    limit=int(query.get("limit", ["40"])[0] or 40),
+                ),
             )
             return
 
@@ -142,6 +192,118 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Disposition", f'attachment; filename="{safe_sym}_{timeframe}.csv"')
             self.end_headers()
             self.wfile.write(raw)
+            return
+
+        if path == "/api/live/status":
+            self._send_json(200, hub_service.get_live_status())
+            return
+
+        if path == "/api/live/subscriptions":
+            self._send_json(200, hub_service.get_subscriptions())
+            return
+
+        if path == "/api/live/stream":
+            listener_q = hub_service.register_live_listener()
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.end_headers()
+            try:
+                initial = hub_service.get_live_status()["feeds"]
+                self.wfile.write(f"data: {json.dumps({'type': 'tick_snapshot', **initial})}\n\n".encode("utf-8"))
+                self.wfile.flush()
+                while True:
+                    try:
+                        ev = listener_q.get(timeout=5.0)
+                        self.wfile.write(f"data: {json.dumps(ev)}\n\n".encode("utf-8"))
+                        self.wfile.flush()
+                    except queue.Empty:
+                        self.wfile.write(b": ping\n\n")
+                        self.wfile.flush()
+            except (BrokenPipeError, ConnectionResetError, OSError):
+                pass
+            finally:
+                hub_service.unregister_live_listener(listener_q)
+            return
+
+        if path == "/ws/live":
+            if not perform_handshake(self):
+                self._send_json(400, {"detail": "Expected WebSocket Upgrade header"})
+                return
+            self.close_connection = True
+            listener_q = hub_service.register_live_listener()
+            send_lock = threading.Lock()
+            stop_event = threading.Event()
+            sock: socket.socket = self.connection
+
+            def _ws_writer() -> None:
+                try:
+                    initial = hub_service.get_live_status()["feeds"]
+                    send_ws_text(sock, json.dumps({"type": "tick_snapshot", **initial}), send_lock)
+                    while not stop_event.is_set():
+                        try:
+                            ev = listener_q.get(timeout=1.0)
+                            send_ws_text(sock, json.dumps(ev), send_lock)
+                        except queue.Empty:
+                            continue
+                except OSError:
+                    stop_event.set()
+
+            writer_thread = threading.Thread(target=_ws_writer, daemon=True)
+            writer_thread.start()
+            try:
+                sock.settimeout(1.0)
+                while not stop_event.is_set():
+                    try:
+                        frame = read_ws_frame(sock)
+                    except socket.timeout:
+                        continue
+                    if frame is None:
+                        break
+                    opcode, raw_payload = frame
+                    if opcode == OPCODE_CLOSE:
+                        send_ws_close(sock, send_lock)
+                        break
+                    if opcode == OPCODE_PING:
+                        send_ws_pong(sock, raw_payload, send_lock)
+                        continue
+                    if opcode == OPCODE_TEXT:
+                        try:
+                            cmd = json.loads(raw_payload.decode("utf-8"))
+                        except Exception:
+                            cmd = {}
+                        action = str(cmd.get("action") or "").strip().lower()
+                        try:
+                            if action == "subscribe":
+                                res = hub_service.subscribe_asset(
+                                    symbol=str(cmd.get("symbol") or ""),
+                                    exchange=str(cmd.get("exchange") or "NSE"),
+                                    instrument_type=cmd.get("instrument_type"),
+                                    instrument_key=cmd.get("instrument_key"),
+                                )
+                                send_ws_text(sock, json.dumps({"type": "ack", **res}), send_lock)
+                            elif action == "unsubscribe":
+                                res = hub_service.unsubscribe_asset(
+                                    symbol=str(cmd.get("symbol") or ""),
+                                    exchange=cmd.get("exchange"),
+                                )
+                                send_ws_text(sock, json.dumps({"type": "ack", **res}), send_lock)
+                            elif action == "poll":
+                                res = hub_service.poll_live_feeds()
+                                send_ws_text(sock, json.dumps({"type": "tick_snapshot", **res}), send_lock)
+                        except Exception as exc:
+                            send_ws_text(sock, json.dumps({"type": "error", "detail": str(exc)}), send_lock)
+            except OSError:
+                pass
+            finally:
+                stop_event.set()
+                hub_service.unregister_live_listener(listener_q)
+            return
+
+        if path == "/api/audit/verify":
+            limit = int(query.get("limit", ["25"])[0] or 25)
+            self._send_json(200, hub_service.verify_audit_chain(limit=limit))
             return
 
         parts = path.strip("/").split("/")
@@ -278,8 +440,56 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
                     from_date=body.get("from_date"),
                     to_date=body.get("to_date"),
                     provider=body.get("provider"),
+                    instrument_type=body.get("instrument_type"),
+                    instrument_key=body.get("instrument_key"),
                 )
                 self._send_json(200, res)
+                return
+
+            if path == "/api/live/feeds/poll":
+                symbols = body.get("symbols") if isinstance(body.get("symbols"), list) else None
+                self._send_json(200, hub_service.poll_live_feeds(symbols=symbols))
+                return
+
+            if path == "/api/live/feeds/failover":
+                self._send_json(200, hub_service.trigger_feed_failover(reason=body.get("reason")))
+                return
+
+            if path == "/api/live/feeds/recover":
+                self._send_json(200, hub_service.recover_primary_feed())
+                return
+
+            if path == "/api/live/subscribe":
+                self._send_json(
+                    200,
+                    hub_service.subscribe_asset(
+                        symbol=str(body.get("symbol", "")),
+                        exchange=str(body.get("exchange", "NSE")),
+                        instrument_type=body.get("instrument_type"),
+                        instrument_key=body.get("instrument_key"),
+                    ),
+                )
+                return
+
+            if path == "/api/live/unsubscribe":
+                self._send_json(
+                    200,
+                    hub_service.unsubscribe_asset(
+                        symbol=str(body.get("symbol", "")),
+                        exchange=body.get("exchange"),
+                    ),
+                )
+                return
+
+            if path == "/api/live/preflight":
+                symbols = body.get("symbols") if isinstance(body.get("symbols"), list) else None
+                self._send_json(200, hub_service.run_preflight(symbols=symbols))
+                return
+
+            if path == "/api/live/kill-switch":
+                engaged = bool(body.get("engaged", False))
+                reason = str(body.get("reason", ""))
+                self._send_json(200, hub_service.set_kill_switch(engaged=engaged, reason=reason))
                 return
 
             self._send_json(404, {"detail": "Not Found"})

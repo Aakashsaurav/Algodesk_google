@@ -255,6 +255,14 @@ class AppConfig:
         return self.SQLITE_DIR / "ohlcv.db"
 
     @property
+    def AUDIT_DB_PATH(self) -> Path:
+        rel = os.getenv("ALGODESK_AUDIT_DB", "").strip()
+        if rel:
+            p = Path(rel)
+            return p if p.is_absolute() else (self.BASE_DIR / p)
+        return self.SQLITE_DIR / "audit_chain.db"
+
+    @property
     def ZERODHA_INSTRUMENT_URL(self) -> str:
         return "https://api.kite.trade/instruments"
 
@@ -265,6 +273,14 @@ class AppConfig:
     @property
     def SELECTION_FILE(self) -> Path:
         return self.DATA_DIR / "broker_selection.json"
+
+    @property
+    def KILL_SWITCH_FILE(self) -> Path:
+        rel = os.getenv("ALGODESK_KILL_SWITCH_FILE", "").strip()
+        if rel:
+            p = Path(rel)
+            return p if p.is_absolute() else (self.BASE_DIR / p)
+        return self.DATA_DIR / "kill_switch.json"
 
     @property
     def CREDENTIALS_VAULT_FILE(self) -> Path:

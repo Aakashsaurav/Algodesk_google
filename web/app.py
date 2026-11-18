@@ -8,18 +8,21 @@ resident memory (~45 MB).
 
 from __future__ import annotations
 
+import asyncio
 import html
 import json
+import queue
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional
 
-from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, Response
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 from web.service import hub_service
 
 TEMPLATE_PATH = Path(__file__).resolve().parent / "templates" / "index.html"
+TERMINAL_TEMPLATE_PATH = Path(__file__).resolve().parent / "templates" / "terminal.html"
 
 
 class SelectionRequest(BaseModel):
@@ -53,6 +56,32 @@ class HistoricalDownloadRequest(BaseModel):
     from_date: Optional[str] = None
     to_date: Optional[str] = None
     provider: Optional[str] = None
+    instrument_type: Optional[str] = None
+    instrument_key: Optional[str] = None
+
+
+class FeedPollRequest(BaseModel):
+    symbols: Optional[List[str]] = None
+
+
+class FeedFailoverRequest(BaseModel):
+    reason: Optional[str] = None
+
+
+class PreflightRequest(BaseModel):
+    symbols: Optional[List[str]] = None
+
+
+class KillSwitchRequest(BaseModel):
+    engaged: bool
+    reason: Optional[str] = ""
+
+
+class LiveSubscriptionRequest(BaseModel):
+    symbol: str
+    exchange: str = "NSE"
+    instrument_type: Optional[str] = None
+    instrument_key: Optional[str] = None
 
 
 def _render_callback_page(title: str, detail: str, broker_id: str, success: bool) -> str:
@@ -95,9 +124,15 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=500, detail="index.html template missing")
         return HTMLResponse(TEMPLATE_PATH.read_text(encoding="utf-8"))
 
+    @app.get("/terminal", response_class=HTMLResponse)
+    def terminal_page() -> HTMLResponse:
+        if not TERMINAL_TEMPLATE_PATH.exists():
+            raise HTTPException(status_code=500, detail="terminal.html template missing")
+        return HTMLResponse(TERMINAL_TEMPLATE_PATH.read_text(encoding="utf-8"))
+
     @app.get("/api/health")
     def api_health() -> dict:
-        return {"ok": True, "service": "algodesk", "phase": 3}
+        return {"ok": True, "service": "algodesk", "phase": 4}
 
     @app.get("/api/overview")
     def api_overview(refresh: bool = Query(default=True)) -> dict:
@@ -231,9 +266,40 @@ def create_app() -> FastAPI:
         q: str = Query(default=""),
         broker_id: Optional[str] = Query(default=None),
         exchange: Optional[str] = Query(default=None),
+        instrument_type: Optional[str] = Query(default=None),
+        expiry: Optional[str] = Query(default=None),
+        strike: Optional[float] = Query(default=None),
         limit: int = Query(default=25),
     ) -> dict:
-        return hub_service.search_instruments(query=q, broker_id=broker_id, exchange=exchange, limit=limit)
+        return hub_service.search_instruments(
+            query=q,
+            broker_id=broker_id,
+            exchange=exchange,
+            instrument_type=instrument_type,
+            expiry=expiry,
+            strike=strike,
+            limit=limit,
+        )
+
+    @app.get("/api/instruments/fno")
+    def api_instrument_fno(
+        underlying: str = Query(default=""),
+        exchange: str = Query(default="NFO"),
+        contract_type: str = Query(default="FO"),
+        expiry: Optional[str] = Query(default=None),
+        strike: Optional[float] = Query(default=None),
+        broker_id: Optional[str] = Query(default=None),
+        limit: int = Query(default=40),
+    ) -> dict:
+        return hub_service.list_fno_contracts(
+            underlying=underlying,
+            exchange=exchange,
+            contract_type=contract_type,
+            expiry=expiry,
+            strike=strike,
+            broker_id=broker_id,
+            limit=limit,
+        )
 
     @app.post("/api/instruments/sync")
     def api_instrument_sync(payload: InstrumentSyncRequest) -> dict:
@@ -256,6 +322,8 @@ def create_app() -> FastAPI:
                 from_date=payload.from_date,
                 to_date=payload.to_date,
                 provider=payload.provider,
+                instrument_type=payload.instrument_type,
+                instrument_key=payload.instrument_key,
             )
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -306,6 +374,149 @@ def create_app() -> FastAPI:
             media_type="text/csv; charset=utf-8",
             headers={"Content-Disposition": f'attachment; filename="{safe_sym}_{timeframe}.csv"'},
         )
+
+    @app.get("/api/live/status")
+    def api_live_status() -> dict:
+        return hub_service.get_live_status()
+
+    @app.post("/api/live/feeds/poll")
+    def api_live_feeds_poll(payload: Optional[FeedPollRequest] = None) -> dict:
+        return hub_service.poll_live_feeds(symbols=payload.symbols if payload else None)
+
+    @app.post("/api/live/feeds/failover")
+    def api_live_feeds_failover(payload: Optional[FeedFailoverRequest] = None) -> dict:
+        try:
+            return hub_service.trigger_feed_failover(reason=payload.reason if payload else None)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/live/feeds/recover")
+    def api_live_feeds_recover() -> dict:
+        return hub_service.recover_primary_feed()
+
+    @app.get("/api/live/subscriptions")
+    def api_live_subscriptions() -> dict:
+        return hub_service.get_subscriptions()
+
+    @app.post("/api/live/subscribe")
+    def api_live_subscribe(payload: LiveSubscriptionRequest) -> dict:
+        try:
+            return hub_service.subscribe_asset(
+                symbol=payload.symbol,
+                exchange=payload.exchange,
+                instrument_type=payload.instrument_type,
+                instrument_key=payload.instrument_key,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/live/unsubscribe")
+    def api_live_unsubscribe(payload: LiveSubscriptionRequest) -> dict:
+        try:
+            return hub_service.unsubscribe_asset(
+                symbol=payload.symbol,
+                exchange=payload.exchange,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/live/stream")
+    async def api_live_stream(request: Request) -> StreamingResponse:
+        listener_q = hub_service.register_live_listener()
+
+        async def _event_gen():
+            try:
+                initial = hub_service.get_live_status()["feeds"]
+                yield f"data: {json.dumps({'type': 'tick_snapshot', **initial})}\n\n"
+                while True:
+                    if await request.is_disconnected():
+                        break
+                    try:
+                        event = listener_q.get_nowait()
+                        yield f"data: {json.dumps(event)}\n\n"
+                    except queue.Empty:
+                        await asyncio.sleep(0.25)
+            finally:
+                hub_service.unregister_live_listener(listener_q)
+
+        return StreamingResponse(
+            _event_gen(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    @app.websocket("/ws/live")
+    async def ws_live(websocket: WebSocket) -> None:
+        await websocket.accept()
+        listener_q = hub_service.register_live_listener()
+
+        async def _sender() -> None:
+            initial = hub_service.get_live_status()["feeds"]
+            await websocket.send_text(json.dumps({"type": "tick_snapshot", **initial}))
+            while True:
+                try:
+                    event = listener_q.get_nowait()
+                    await websocket.send_text(json.dumps(event))
+                except queue.Empty:
+                    await asyncio.sleep(0.2)
+
+        async def _receiver() -> None:
+            while True:
+                raw = await websocket.receive_text()
+                try:
+                    cmd = json.loads(raw) if raw.strip() else {}
+                except json.JSONDecodeError:
+                    cmd = {}
+                action = str(cmd.get("action") or "").strip().lower()
+                if action == "subscribe":
+                    try:
+                        res = hub_service.subscribe_asset(
+                            symbol=str(cmd.get("symbol") or ""),
+                            exchange=str(cmd.get("exchange") or "NSE"),
+                            instrument_type=cmd.get("instrument_type"),
+                            instrument_key=cmd.get("instrument_key"),
+                        )
+                        await websocket.send_text(json.dumps({"type": "ack", **res}))
+                    except Exception as exc:
+                        await websocket.send_text(json.dumps({"type": "error", "detail": str(exc)}))
+                elif action == "unsubscribe":
+                    try:
+                        res = hub_service.unsubscribe_asset(
+                            symbol=str(cmd.get("symbol") or ""),
+                            exchange=cmd.get("exchange"),
+                        )
+                        await websocket.send_text(json.dumps({"type": "ack", **res}))
+                    except Exception as exc:
+                        await websocket.send_text(json.dumps({"type": "error", "detail": str(exc)}))
+                elif action == "poll":
+                    res = hub_service.poll_live_feeds()
+                    await websocket.send_text(json.dumps({"type": "tick_snapshot", **res}))
+
+        sender_task = asyncio.create_task(_sender())
+        receiver_task = asyncio.create_task(_receiver())
+        try:
+            await asyncio.wait({sender_task, receiver_task}, return_when=asyncio.FIRST_COMPLETED)
+        except WebSocketDisconnect:
+            pass
+        finally:
+            sender_task.cancel()
+            receiver_task.cancel()
+            hub_service.unregister_live_listener(listener_q)
+
+    @app.post("/api/live/preflight")
+    def api_live_preflight(payload: Optional[PreflightRequest] = None) -> dict:
+        return hub_service.run_preflight(symbols=payload.symbols if payload else None)
+
+    @app.post("/api/live/kill-switch")
+    def api_live_kill_switch(payload: KillSwitchRequest) -> dict:
+        return hub_service.set_kill_switch(
+            engaged=payload.engaged,
+            reason=payload.reason or "",
+        )
+
+    @app.get("/api/audit/verify")
+    def api_audit_verify(limit: int = Query(default=25)) -> dict:
+        return hub_service.verify_audit_chain(limit=limit)
 
     return app
 

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { RefreshCw, ExternalLink, X, Check, AlertCircle, Download, Search, Database } from 'lucide-react';
+import { RefreshCw, ExternalLink, X, Check, AlertCircle, Download, Search, Database, ShieldAlert, ShieldCheck, Activity } from 'lucide-react';
+import { LiveTerminal } from './components/LiveTerminal';
 
 type ConnectionState =
   | 'CONNECTED'
@@ -74,6 +75,7 @@ interface InstrumentStats {
   db_path: string;
   db_size_mb: number;
   total_instruments: number;
+  fno_instruments?: number;
   counts_by_broker: Record<string, number>;
 }
 
@@ -82,10 +84,26 @@ interface InstrumentItem {
   exchange: string;
   segment: string;
   trading_symbol: string;
+  asset_symbol?: string;
   name: string;
   instrument_type: string;
   instrument_key: string;
   instrument_token: string | null;
+  expiry?: string | null;
+  strike?: number | null;
+  lot_size?: number;
+  tick_size?: number;
+}
+
+interface FnoContractsPayload {
+  underlying: string;
+  exchange: string;
+  contract_type: string;
+  underlyings: string[];
+  expiries: string[];
+  strikes: number[];
+  contracts: InstrumentItem[];
+  count: number;
 }
 
 interface OhlcvRow {
@@ -116,6 +134,7 @@ interface DataRecordsPayload {
     latest_close: number | null;
     change_pct: number | null;
     total_volume: number;
+    latest_oi?: number;
   };
   rows: OhlcvRow[];
 }
@@ -147,6 +166,96 @@ interface CatalogDataset {
   provider: string;
 }
 
+interface FeedSlotHealth {
+  feed_id: string;
+  display_name: string;
+  role: 'primary' | 'standby';
+  transport: string;
+  status: 'CONNECTED' | 'STANDBY' | 'FAILOVER' | 'DISCONNECTED';
+  active: boolean;
+  ticks_received: number;
+  error_count: number;
+  reconnect_count: number;
+  latency_ms: number | null;
+  last_tick_ist: string | null;
+  last_error: string;
+}
+
+interface LiveQuote {
+  symbol: string;
+  ltp: number;
+  change_pct: number;
+  source: string;
+  ts_ist: string;
+}
+
+interface FeedManagerStatus {
+  primary_feed: string;
+  active_feed: string;
+  in_failover: boolean;
+  forced_failover: boolean;
+  failover_count: number;
+  last_failover_reason: string;
+  watchlist: string[];
+  slots: FeedSlotHealth[];
+  quotes: LiveQuote[];
+}
+
+interface KillSwitchState {
+  armed: boolean;
+  engaged: boolean;
+  reason: string;
+  engaged_at_ist: string | null;
+  actor: string;
+}
+
+interface AuditVerifyResult {
+  valid: boolean;
+  total_events: number;
+  broken_index: number | null;
+  broken_event_id: string | null;
+  reason: string;
+  head_hash: string;
+}
+
+interface AuditEvent {
+  id: string;
+  ts_ist: string;
+  event_type: string;
+  actor: string;
+  payload: Record<string, unknown>;
+  payload_hash: string;
+  prev_hash: string;
+  chain_hash: string;
+}
+
+interface LiveStatusPayload {
+  ok: boolean;
+  feeds: FeedManagerStatus;
+  kill_switch: KillSwitchState;
+  audit_verify: AuditVerifyResult;
+  audit_events: AuditEvent[];
+}
+
+interface PreflightCheck {
+  id: string;
+  name: string;
+  passed: boolean;
+  status: 'PASS' | 'WARN' | 'FAIL';
+  severity: 'ERROR' | 'WARNING';
+  message: string;
+}
+
+interface PreflightPayload {
+  ok: boolean;
+  overall_ready: boolean;
+  passed_count: number;
+  total_count: number;
+  blocking_failures: number;
+  checked_at_ist: string;
+  checks: PreflightCheck[];
+}
+
 const ROADMAP_PHASES = [
   {
     phase: 'Phase 01',
@@ -168,9 +277,9 @@ const ROADMAP_PHASES = [
   },
   {
     phase: 'Phase 04',
-    title: 'Hot-Standby Feed Failover & Kill Switch',
+    title: 'Hot-Standby Feed Failover & Kill Switch (Active)',
     detail:
-      'Surface WebSocket tick telemetry, automatic primary-to-fallback feed switching, preflight margin checks, and SEBI hash-chained kill switch controls.',
+      'Hot-standby primary-to-fallback market feed failover, 6-gate preflight safety & margin checks, persisted emergency kill switch, and SEBI SHA-256 hash-chained audit ledger.',
   },
   {
     phase: 'Phase 05',
@@ -215,10 +324,27 @@ function getLedColorClass(state: ConnectionState, isProbing: boolean): string {
 }
 
 export default function App() {
+  const [routePath, setRoutePath] = useState<string>(() =>
+    typeof window !== 'undefined' ? window.location.pathname : '/'
+  );
   const [overview, setOverview] = useState<OverviewPayload | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const onPop = () => setRoutePath(window.location.pathname);
+    window.addEventListener('popstate', onPop);
+    return () => window.removeEventListener('popstate', onPop);
+  }, []);
+
+  const navigateTo = useCallback((nextPath: string) => {
+    if (window.location.pathname !== nextPath) {
+      window.history.pushState({}, '', nextPath);
+    }
+    setRoutePath(nextPath);
+    window.scrollTo({ top: 0, behavior: 'auto' });
+  }, []);
 
   const [tradingSelection, setTradingSelection] = useState('upstox');
   const [dataSelection, setDataSelection] = useState('upstox');
@@ -251,13 +377,26 @@ export default function App() {
   const thirtyDaysAgoIso = new Date(Date.now() - 30 * 86400_000).toISOString().slice(0, 10);
 
   const [instrQuery, setInstrQuery] = useState('');
+  const [instrTypeFilter, setInstrTypeFilter] = useState('ALL');
   const [instrResults, setInstrResults] = useState<InstrumentItem[]>([]);
   const [instrStats, setInstrStats] = useState<InstrumentStats | null>(null);
   const [syncingMaster, setSyncingMaster] = useState<string | null>(null);
   const [instrFeedback, setInstrFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
 
+  // F&O Contract Finder state
+  const [fnoOpen, setFnoOpen] = useState(false);
+  const [fnoExchange, setFnoExchange] = useState('NFO');
+  const [fnoUnderlying, setFnoUnderlying] = useState('');
+  const [fnoContractType, setFnoContractType] = useState('FUT');
+  const [fnoExpiry, setFnoExpiry] = useState('');
+  const [fnoStrike, setFnoStrike] = useState('');
+  const [fnoData, setFnoData] = useState<FnoContractsPayload | null>(null);
+  const [loadingFno, setLoadingFno] = useState(false);
+
   const [histSymbol, setHistSymbol] = useState('RELIANCE');
   const [histExchange, setHistExchange] = useState('NSE');
+  const [histContractType, setHistContractType] = useState('');
+  const [histInstrumentKey, setHistInstrumentKey] = useState('');
   const [histTimeframe, setHistTimeframe] = useState('1day');
   const [histFrom, setHistFrom] = useState(thirtyDaysAgoIso);
   const [histTo, setHistTo] = useState(todayIso);
@@ -270,6 +409,16 @@ export default function App() {
   const [dataRecords, setDataRecords] = useState<DataRecordsPayload | null>(null);
   const [loadingRecords, setLoadingRecords] = useState(false);
   const [catalog, setCatalog] = useState<CatalogDataset[]>([]);
+
+  // Phase 4: Hot-Standby Feed Failover, Preflight & Kill Switch state
+  const [liveStatus, setLiveStatus] = useState<LiveStatusPayload | null>(null);
+  const [feedActionLoading, setFeedActionLoading] = useState(false);
+  const [feedFeedback, setFeedFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+  const [preflight, setPreflight] = useState<PreflightPayload | null>(null);
+  const [runningPreflight, setRunningPreflight] = useState(false);
+  const [killReason, setKillReason] = useState('');
+  const [killBusy, setKillBusy] = useState(false);
+  const [verifyingAudit, setVerifyingAudit] = useState(false);
 
   const fetchOverview = useCallback(async (refresh = true): Promise<OverviewPayload | null> => {
     setRefreshing(true);
@@ -296,10 +445,14 @@ export default function App() {
 
   const instrSearchSeq = useRef(0);
 
-  const searchInstruments = useCallback(async (q: string) => {
+  const searchInstruments = useCallback(async (q: string, instType = 'ALL') => {
     const seq = ++instrSearchSeq.current;
     try {
-      const res = await fetch(`/api/instruments/search?q=${encodeURIComponent(q)}&limit=12`);
+      const params = new URLSearchParams({ q, limit: '16' });
+      if (instType && instType !== 'ALL') {
+        params.set('instrument_type', instType);
+      }
+      const res = await fetch(`/api/instruments/search?${params.toString()}`);
       if (seq !== instrSearchSeq.current) return;
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
@@ -318,7 +471,7 @@ export default function App() {
       if (q.trim() && rows.length === 0) {
         setInstrFeedback({
           type: 'err',
-          text: `No symbol matching "${q.trim().toUpperCase()}" in local SQLite yet. Click Sync Upstox Master or Sync Zerodha Master above.`,
+          text: `No matching ${instType === 'ALL' ? '' : `${instType} `}symbol for "${q.trim().toUpperCase()}" in local SQLite yet. Click Sync Upstox Master or Sync Zerodha Master.`,
         });
       } else {
         setInstrFeedback((prev) => (prev?.type === 'err' ? null : prev));
@@ -327,6 +480,46 @@ export default function App() {
       // ignore transient startup polling error
     }
   }, []);
+
+  const fnoFetchSeq = useRef(0);
+
+  const fetchFnoContracts = useCallback(
+    async (opts?: {
+      underlying?: string;
+      exchange?: string;
+      contractType?: string;
+      expiry?: string;
+      strike?: string;
+    }) => {
+      const seq = ++fnoFetchSeq.current;
+      const ul = opts?.underlying ?? fnoUnderlying;
+      const exch = opts?.exchange ?? fnoExchange;
+      const ctype = opts?.contractType ?? fnoContractType;
+      const exp = opts?.expiry ?? fnoExpiry;
+      const stk = opts?.strike ?? fnoStrike;
+      setLoadingFno(true);
+      try {
+        const params = new URLSearchParams({
+          underlying: ul.trim().toUpperCase(),
+          exchange: exch || 'NFO',
+          contract_type: ctype || 'FO',
+          limit: '40',
+        });
+        if (exp) params.set('expiry', exp);
+        if (stk && !Number.isNaN(Number(stk))) params.set('strike', stk);
+        const res = await fetch(`/api/instruments/fno?${params.toString()}`);
+        if (seq !== fnoFetchSeq.current || !res.ok) return;
+        const payload: FnoContractsPayload = await res.json();
+        if (seq !== fnoFetchSeq.current) return;
+        setFnoData(payload);
+      } catch {
+        // ignore transient error
+      } finally {
+        if (seq === fnoFetchSeq.current) setLoadingFno(false);
+      }
+    },
+    [fnoContractType, fnoExchange, fnoExpiry, fnoStrike, fnoUnderlying]
+  );
 
   const fetchCatalog = useCallback(async () => {
     try {
@@ -378,11 +571,172 @@ export default function App() {
     []
   );
 
+  const fetchLiveStatus = useCallback(async () => {
+    try {
+      const res = await fetch('/api/live/status');
+      if (!res.ok) return;
+      const body: LiveStatusPayload = await res.json();
+      setLiveStatus(body);
+    } catch {
+      // ignore transient startup polling error
+    }
+  }, []);
+
   useEffect(() => {
     void fetchOverview(true);
-    void searchInstruments('');
+    void searchInstruments('', 'ALL');
     void fetchCatalog();
-  }, [fetchOverview, searchInstruments, fetchCatalog]);
+    void fetchLiveStatus();
+  }, [fetchOverview, searchInstruments, fetchCatalog, fetchLiveStatus]);
+
+  const handlePollFeeds = async () => {
+    setFeedActionLoading(true);
+    setFeedFeedback(null);
+    try {
+      const res = await fetch('/api/live/feeds/poll', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({}),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.detail || 'Live quote poll failed.');
+      setLiveStatus((prev) => ({
+        ok: true,
+        feeds: body,
+        kill_switch: prev?.kill_switch ?? { armed: true, engaged: false, reason: '', engaged_at_ist: null, actor: 'system' },
+        audit_verify: body.audit_verify ?? prev?.audit_verify,
+        audit_events: body.audit_events ?? prev?.audit_events ?? [],
+      }));
+      setFeedFeedback({ type: body.ok ? 'ok' : 'err', text: body.message || 'Feed polled.' });
+    } catch (err) {
+      setFeedFeedback({ type: 'err', text: err instanceof Error ? err.message : 'Feed poll failed.' });
+    } finally {
+      setFeedActionLoading(false);
+    }
+  };
+
+  const handleTriggerFailover = async () => {
+    setFeedActionLoading(true);
+    setFeedFeedback(null);
+    try {
+      const res = await fetch('/api/live/feeds/failover', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ reason: 'Operator hot-standby failover drill from dashboard' }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.detail || 'Failover trigger failed.');
+      setLiveStatus((prev) => ({
+        ok: true,
+        feeds: body,
+        kill_switch: prev?.kill_switch ?? { armed: true, engaged: false, reason: '', engaged_at_ist: null, actor: 'system' },
+        audit_verify: body.audit_verify ?? prev?.audit_verify,
+        audit_events: body.audit_events ?? prev?.audit_events ?? [],
+      }));
+      setFeedFeedback({ type: 'ok', text: body.message || 'Failover triggered.' });
+    } catch (err) {
+      setFeedFeedback({ type: 'err', text: err instanceof Error ? err.message : 'Failover failed.' });
+    } finally {
+      setFeedActionLoading(false);
+    }
+  };
+
+  const handleRecoverPrimary = async () => {
+    setFeedActionLoading(true);
+    setFeedFeedback(null);
+    try {
+      const res = await fetch('/api/live/feeds/recover', { method: 'POST' });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.detail || 'Primary recovery failed.');
+      setLiveStatus((prev) => ({
+        ok: true,
+        feeds: body,
+        kill_switch: prev?.kill_switch ?? { armed: true, engaged: false, reason: '', engaged_at_ist: null, actor: 'system' },
+        audit_verify: body.audit_verify ?? prev?.audit_verify,
+        audit_events: body.audit_events ?? prev?.audit_events ?? [],
+      }));
+      setFeedFeedback({ type: body.ok ? 'ok' : 'err', text: body.message || 'Primary restore attempted.' });
+    } catch (err) {
+      setFeedFeedback({ type: 'err', text: err instanceof Error ? err.message : 'Recovery failed.' });
+    } finally {
+      setFeedActionLoading(false);
+    }
+  };
+
+  const handleRunPreflight = async () => {
+    setRunningPreflight(true);
+    try {
+      const res = await fetch('/api/live/preflight', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ symbols: [histSymbol.trim().toUpperCase() || 'RELIANCE', 'NIFTY'] }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.detail || 'Preflight check failed.');
+      setPreflight(body as PreflightPayload);
+      setLiveStatus((prev) =>
+        prev
+          ? {
+              ...prev,
+              kill_switch: body.kill_switch ?? prev.kill_switch,
+              audit_verify: body.audit_verify ?? prev.audit_verify,
+              audit_events: body.audit_events ?? prev.audit_events,
+            }
+          : prev
+      );
+    } catch (err) {
+      setFeedFeedback({ type: 'err', text: err instanceof Error ? err.message : 'Preflight failed.' });
+    } finally {
+      setRunningPreflight(false);
+    }
+  };
+
+  const handleToggleKillSwitch = async (engage: boolean) => {
+    setKillBusy(true);
+    try {
+      const res = await fetch('/api/live/kill-switch', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          engaged: engage,
+          reason:
+            killReason.trim() ||
+            (engage
+              ? 'Emergency stop engaged by operator via AlgoDesk console'
+              : 'Operator cleared kill switch after inspection'),
+        }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.detail || 'Kill switch update failed.');
+      setLiveStatus(body as LiveStatusPayload);
+      if (!engage) setKillReason('');
+      await handleRunPreflight();
+    } catch (err) {
+      setFeedFeedback({ type: 'err', text: err instanceof Error ? err.message : 'Kill switch update failed.' });
+    } finally {
+      setKillBusy(false);
+    }
+  };
+
+  const handleVerifyAuditChain = async () => {
+    setVerifyingAudit(true);
+    try {
+      const res = await fetch('/api/audit/verify?limit=20');
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.detail || 'Audit verification failed.');
+      setLiveStatus((prev) =>
+        prev
+          ? {
+              ...prev,
+              audit_verify: body.verification,
+              audit_events: body.events ?? prev.audit_events,
+            }
+          : prev
+      );
+    } finally {
+      setVerifyingAudit(false);
+    }
+  };
 
   const handleSyncInstruments = async (brokerId: 'upstox' | 'zerodha') => {
     setSyncingMaster(brokerId);
@@ -398,9 +752,12 @@ export default function App() {
       if (body.stats) setInstrStats(body.stats);
       setInstrFeedback({
         type: 'ok',
-        text: `Indexed ${Number(body.indexed_count || 0).toLocaleString()} ${brokerId} instruments into SQLite.`,
+        text: `Indexed ${Number(body.indexed_count || 0).toLocaleString()} ${brokerId} instruments (Equity + F&O) into SQLite.`,
       });
-      await searchInstruments(instrQuery);
+      await searchInstruments(instrQuery, instrTypeFilter);
+      if (fnoOpen) {
+        await fetchFnoContracts();
+      }
     } catch (err) {
       setInstrFeedback({
         type: 'err',
@@ -411,9 +768,35 @@ export default function App() {
     }
   };
 
+  const handleSelectInstrument = (item: InstrumentItem) => {
+    setHistSymbol(item.trading_symbol);
+    setHistExchange(item.exchange);
+    setHistContractType(item.instrument_type || '');
+    setHistInstrumentKey(item.instrument_key || '');
+    const isFnoItem =
+      ['NFO', 'BFO', 'MCX', 'NSE_FO', 'BSE_FO', 'MCX_FO'].includes(item.exchange) ||
+      ['FUT', 'CE', 'PE'].includes((item.instrument_type || '').toUpperCase());
+    if (isFnoItem) {
+      setFnoOpen(true);
+      setFnoExchange(item.exchange);
+      if (item.asset_symbol) setFnoUnderlying(item.asset_symbol);
+      if (['FUT', 'CE', 'PE'].includes((item.instrument_type || '').toUpperCase())) {
+        setFnoContractType(item.instrument_type.toUpperCase());
+      }
+    }
+    void fetchDataRecords(
+      item.trading_symbol,
+      item.exchange,
+      histTimeframe,
+      viewMode,
+      histFrom,
+      histTo
+    );
+  };
+
   const handleDownloadHistorical = async () => {
     if (!histSymbol.trim()) {
-      setDataFeedback({ type: 'err', text: 'Enter a trading symbol before downloading.' });
+      setDataFeedback({ type: 'err', text: 'Enter a trading symbol or pick a contract before downloading.' });
       return;
     }
     setDownloadingHist(true);
@@ -429,6 +812,8 @@ export default function App() {
           from_date: histFrom,
           to_date: histTo,
           provider: histProvider === 'auto' ? null : histProvider,
+          instrument_type: histContractType || null,
+          instrument_key: histInstrumentKey || null,
         }),
       });
       const body = await res.json().catch(() => ({}));
@@ -522,6 +907,7 @@ export default function App() {
         type: 'ok',
         text: `Saved: Trading=${data.selections.trading_broker.toUpperCase()} · Data=${data.selections.data_connection.toUpperCase()}`,
       });
+      void fetchLiveStatus();
     } catch (err) {
       setRoutingFeedback({
         type: 'err',
@@ -756,6 +1142,10 @@ export default function App() {
     brokers.find((b) => b.broker_id === modalBrokerId)?.display_name ||
     (modalBrokerId === 'zerodha' ? 'Zerodha Kite' : 'Upstox');
 
+  if (routePath === '/terminal') {
+    return <LiveTerminal onNavigateHome={() => navigateTo('/')} />;
+  }
+
   return (
     <div className="min-h-screen bg-[#0b1120] text-slate-100">
       {/* 3-Zone Top Bar */}
@@ -785,10 +1175,20 @@ export default function App() {
               Historical Data
             </a>
             <a
-              href="#roadmap"
+              href="#live-controls"
               className="shrink-0 whitespace-nowrap text-sm font-medium text-slate-400 transition-colors hover:text-slate-100 hover:underline hover:underline-offset-8"
             >
-              Roadmap
+              Live &amp; Safety
+            </a>
+            <a
+              href="/terminal"
+              onClick={(e) => {
+                e.preventDefault();
+                navigateTo('/terminal');
+              }}
+              className="shrink-0 whitespace-nowrap text-sm font-semibold text-sky-400 transition-colors hover:text-sky-300 hover:underline hover:underline-offset-8"
+            >
+              Live Terminal
             </a>
           </nav>
 
@@ -1054,12 +1454,16 @@ export default function App() {
                 Historical Data &amp; SQLite Instrument Index
               </h2>
               <p className="text-sm text-slate-400">
-                Downloads only missing trading days (zero API calls for dates already stored locally) and supports instant Snapshot or Full Data inspection.
+                Supports Equity, Index, Futures &amp; Options (NFO/BFO/MCX). Downloads only missing trading days and supports Snapshot or Full Data inspection.
               </p>
             </div>
             {instrStats && (
               <div className="font-mono text-xs tabular-nums text-slate-400">
-                Indexed Symbols: {instrStats.total_instruments.toLocaleString()} · DB: {instrStats.db_size_mb} MB
+                Indexed Symbols: {instrStats.total_instruments.toLocaleString()}
+                {typeof instrStats.fno_instruments === 'number'
+                  ? ` · F&O Contracts: ${instrStats.fno_instruments.toLocaleString()}`
+                  : ''}{' '}
+                · DB: {instrStats.db_size_mb} MB
               </div>
             )}
           </div>
@@ -1067,7 +1471,7 @@ export default function App() {
           <div className="space-y-6 rounded-xl border border-slate-800 bg-[#111827] p-6">
             {/* Instrument Lookup & Master Sync */}
             <div className="space-y-3 border-b border-slate-800 pb-6">
-              <div className="grid grid-cols-1 items-end gap-3 md:grid-cols-[1fr_auto_auto]">
+              <div className="grid grid-cols-1 items-end gap-3 md:grid-cols-[1fr_200px_auto_auto]">
                 <div>
                   <label htmlFor="instr-search" className="mb-1.5 block text-[13px] font-semibold text-slate-200">
                     SQLite Instrument Lookup (Under 5 MB RAM)
@@ -1079,13 +1483,46 @@ export default function App() {
                       type="text"
                       value={instrQuery}
                       onChange={(e) => {
-                        setInstrQuery(e.target.value);
-                        void searchInstruments(e.target.value);
+                        const val = e.target.value;
+                        setInstrQuery(val);
+                        void searchInstruments(val, instrTypeFilter);
                       }}
-                      placeholder="Search symbol (e.g. RELIANCE, NIFTY, INFY, HDFCBANK)..."
+                      placeholder="Search Equity or F&O (e.g. RELIANCE, NIFTY FUT, NIFTY 24500 CE)..."
                       className="min-h-[42px] w-full rounded-lg border border-slate-700 bg-[#0b1120] py-2 pr-3 pl-9 text-sm text-slate-100 focus:border-sky-400 focus:outline-none"
                     />
                   </div>
+                </div>
+
+                <div>
+                  <label htmlFor="instr-type-filter" className="mb-1.5 block text-[13px] font-semibold text-slate-200">
+                    Segment / Contract
+                  </label>
+                  <select
+                    id="instr-type-filter"
+                    value={instrTypeFilter}
+                    onChange={(e) => {
+                      const nextType = e.target.value;
+                      setInstrTypeFilter(nextType);
+                      void searchInstruments(instrQuery, nextType);
+                      if (['FO', 'FUT', 'OPT', 'CE', 'PE'].includes(nextType)) {
+                        setFnoOpen(true);
+                        if (nextType !== 'OPT') setFnoContractType(nextType);
+                        else setFnoContractType('CE');
+                        void fetchFnoContracts({
+                          contractType: nextType === 'OPT' ? 'CE' : nextType,
+                        });
+                      }
+                    }}
+                    className="min-h-[42px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 text-sm text-slate-100 focus:border-sky-400 focus:outline-none"
+                  >
+                    <option value="ALL">All Instruments</option>
+                    <option value="EQUITY">Equity &amp; Index</option>
+                    <option value="FO">Futures &amp; Options (F&amp;O)</option>
+                    <option value="FUT">Futures (FUT)</option>
+                    <option value="OPT">Options (CE / PE)</option>
+                    <option value="CE">Call Options (CE)</option>
+                    <option value="PE">Put Options (PE)</option>
+                  </select>
                 </div>
 
                 <button
@@ -1122,48 +1559,275 @@ export default function App() {
 
               {instrResults.length > 0 && (
                 <div className="flex flex-wrap items-center gap-1.5 pt-1">
-                  {instrResults.slice(0, 8).map((item) => (
+                  {instrResults.slice(0, 10).map((item) => {
+                    const metaBits = [item.exchange];
+                    if (item.instrument_type && item.instrument_type !== 'EQUITY') {
+                      metaBits.push(item.instrument_type);
+                    }
+                    if (item.expiry) metaBits.push(`Exp ${item.expiry}`);
+                    if (item.strike && item.strike > 0) metaBits.push(`@${item.strike}`);
+                    return (
+                      <button
+                        key={`${item.broker_id}-${item.instrument_key}`}
+                        type="button"
+                        onClick={() => handleSelectInstrument(item)}
+                        className={`min-h-[32px] shrink-0 whitespace-nowrap rounded-md border px-2.5 py-1 font-mono text-xs tabular-nums transition-colors ${
+                          histSymbol === item.trading_symbol && histExchange === item.exchange
+                            ? 'border-sky-400 bg-sky-400/15 text-sky-300'
+                            : 'border-slate-700 bg-[#0b1120] text-slate-300 hover:border-slate-500'
+                        }`}
+                      >
+                        {item.trading_symbol} · {metaBits.join(' · ')} ({item.broker_id})
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
+
+            {/* Futures & Options (F&O) Contract Finder */}
+            <div className="space-y-4 border-b border-slate-800 pb-6">
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <div className="text-sm font-semibold text-slate-100">
+                    Futures &amp; Options Contract Finder (NFO / BFO / MCX)
+                  </div>
+                  <p className="text-xs text-slate-400">
+                    Pick an underlying, contract type (FUT / CE / PE), expiry, and strike from local SQLite before downloading OHLCV + OI.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const next = !fnoOpen;
+                    setFnoOpen(next);
+                    if (next) {
+                      const targetEx = ['NFO', 'BFO', 'MCX'].includes(histExchange) ? histExchange : fnoExchange;
+                      setFnoExchange(targetEx);
+                      void fetchFnoContracts({ exchange: targetEx });
+                    }
+                  }}
+                  className="min-h-[36px] shrink-0 whitespace-nowrap rounded-lg border border-slate-700 bg-[#0b1120] px-3.5 py-1.5 text-xs font-semibold text-slate-200 transition-colors hover:border-sky-400 hover:bg-slate-800"
+                >
+                  {fnoOpen ? 'Hide F&O Finder' : 'Open F&O Contract Finder'}
+                </button>
+              </div>
+
+              {fnoOpen && (
+                <div className="space-y-4 pt-1">
+                  <div className="grid grid-cols-1 items-end gap-3 sm:grid-cols-2 lg:grid-cols-[0.8fr_1.1fr_0.9fr_1fr_1fr_auto]">
+                    <div>
+                      <label htmlFor="fno-exchange" className="mb-1.5 block text-xs font-semibold text-slate-300">
+                        F&amp;O Exchange
+                      </label>
+                      <select
+                        id="fno-exchange"
+                        value={fnoExchange}
+                        onChange={(e) => {
+                          const ex = e.target.value;
+                          setFnoExchange(ex);
+                          setHistExchange(ex);
+                          setFnoExpiry('');
+                          setFnoStrike('');
+                          void fetchFnoContracts({ exchange: ex, expiry: '', strike: '' });
+                        }}
+                        className="min-h-[40px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 text-sm text-slate-100 focus:border-sky-400 focus:outline-none"
+                      >
+                        <option value="NFO">NFO (NSE F&amp;O)</option>
+                        <option value="BFO">BFO (BSE F&amp;O)</option>
+                        <option value="MCX">MCX (Commodities)</option>
+                      </select>
+                    </div>
+
+                    <div>
+                      <label htmlFor="fno-underlying" className="mb-1.5 block text-xs font-semibold text-slate-300">
+                        Underlying
+                      </label>
+                      <input
+                        id="fno-underlying"
+                        type="text"
+                        list="fno-underlying-list"
+                        value={fnoUnderlying}
+                        onChange={(e) => {
+                          const ul = e.target.value.toUpperCase();
+                          setFnoUnderlying(ul);
+                          setFnoExpiry('');
+                          setFnoStrike('');
+                          void fetchFnoContracts({ underlying: ul, expiry: '', strike: '' });
+                        }}
+                        placeholder="NIFTY, BANKNIFTY, RELIANCE..."
+                        className="min-h-[40px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 font-mono text-sm text-slate-100 focus:border-sky-400 focus:outline-none"
+                      />
+                      <datalist id="fno-underlying-list">
+                        {(fnoData?.underlyings ?? []).map((ul) => (
+                          <option key={ul} value={ul} />
+                        ))}
+                      </datalist>
+                    </div>
+
+                    <div>
+                      <label htmlFor="fno-type" className="mb-1.5 block text-xs font-semibold text-slate-300">
+                        Contract Type
+                      </label>
+                      <select
+                        id="fno-type"
+                        value={fnoContractType}
+                        onChange={(e) => {
+                          const ct = e.target.value;
+                          setFnoContractType(ct);
+                          const nextStrike = ct === 'FUT' ? '' : fnoStrike;
+                          if (ct === 'FUT') setFnoStrike('');
+                          void fetchFnoContracts({ contractType: ct, strike: nextStrike });
+                        }}
+                        className="min-h-[40px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 text-sm text-slate-100 focus:border-sky-400 focus:outline-none"
+                      >
+                        <option value="FUT">Futures (FUT)</option>
+                        <option value="CE">Call Options (CE)</option>
+                        <option value="PE">Put Options (PE)</option>
+                        <option value="FO">All F&amp;O</option>
+                      </select>
+                    </div>
+
+                    <div>
+                      <label htmlFor="fno-expiry" className="mb-1.5 block text-xs font-semibold text-slate-300">
+                        Expiry Date
+                      </label>
+                      <select
+                        id="fno-expiry"
+                        value={fnoExpiry}
+                        onChange={(e) => {
+                          const exp = e.target.value;
+                          setFnoExpiry(exp);
+                          setFnoStrike('');
+                          void fetchFnoContracts({ expiry: exp, strike: '' });
+                        }}
+                        className="min-h-[40px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 font-mono text-sm text-slate-100 focus:border-sky-400 focus:outline-none"
+                      >
+                        <option value="">All Expiries ({fnoData?.expiries.length ?? 0})</option>
+                        {(fnoData?.expiries ?? []).map((exp) => (
+                          <option key={exp} value={exp}>
+                            {exp}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div>
+                      <label htmlFor="fno-strike" className="mb-1.5 block text-xs font-semibold text-slate-300">
+                        Strike Price
+                      </label>
+                      <select
+                        id="fno-strike"
+                        value={fnoStrike}
+                        disabled={fnoContractType === 'FUT'}
+                        onChange={(e) => {
+                          const stk = e.target.value;
+                          setFnoStrike(stk);
+                          void fetchFnoContracts({ strike: stk });
+                        }}
+                        className="min-h-[40px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 font-mono text-sm text-slate-100 focus:border-sky-400 focus:outline-none disabled:opacity-50"
+                      >
+                        <option value="">
+                          {fnoContractType === 'FUT'
+                            ? 'N/A (Futures)'
+                            : `All Strikes (${fnoData?.strikes.length ?? 0})`}
+                        </option>
+                        {(fnoData?.strikes ?? []).map((stk) => (
+                          <option key={stk} value={String(stk)}>
+                            {stk}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
                     <button
-                      key={`${item.broker_id}-${item.instrument_key}`}
                       type="button"
-                      onClick={() => {
-                        setHistSymbol(item.trading_symbol);
-                        setHistExchange(item.exchange);
-                        void fetchDataRecords(
-                          item.trading_symbol,
-                          item.exchange,
-                          histTimeframe,
-                          viewMode,
-                          histFrom,
-                          histTo
-                        );
-                      }}
-                      className={`min-h-[32px] shrink-0 whitespace-nowrap rounded-md border px-2.5 py-1 text-xs font-medium transition-colors ${
-                        histSymbol === item.trading_symbol
-                          ? 'border-sky-400 bg-sky-400/15 text-sky-300'
-                          : 'border-slate-700 bg-[#0b1120] text-slate-300 hover:border-slate-500'
-                      }`}
+                      onClick={() => void fetchFnoContracts()}
+                      disabled={loadingFno}
+                      className="min-h-[40px] shrink-0 whitespace-nowrap rounded-lg border border-slate-700 bg-[#0b1120] px-3.5 py-2 text-xs font-semibold text-slate-200 hover:border-slate-500 hover:bg-slate-800 disabled:opacity-50"
                     >
-                      {item.trading_symbol} · {item.exchange} ({item.broker_id})
+                      {loadingFno ? 'Loading...' : 'Refresh Contracts'}
                     </button>
-                  ))}
+                  </div>
+
+                  {fnoData && fnoData.contracts.length > 0 ? (
+                    <div className="space-y-2">
+                      <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-slate-400">
+                        <span>
+                          Matching F&amp;O Contracts ({fnoData.count}) — click one to bind exact contract symbol &amp; instrument key:
+                        </span>
+                        {fnoData.underlyings.length > 0 && !fnoUnderlying && (
+                          <span className="font-mono text-slate-500">
+                            Underlyings: {fnoData.underlyings.slice(0, 6).join(', ')}
+                          </span>
+                        )}
+                      </div>
+                      <div className="flex max-h-[168px] flex-wrap gap-1.5 overflow-y-auto pt-0.5">
+                        {fnoData.contracts.map((item) => (
+                          <button
+                            key={`fno-${item.broker_id}-${item.instrument_key}`}
+                            type="button"
+                            onClick={() => handleSelectInstrument(item)}
+                            className={`min-h-[32px] shrink-0 whitespace-nowrap rounded-md border px-2.5 py-1 font-mono text-xs tabular-nums transition-colors ${
+                              histSymbol === item.trading_symbol && histInstrumentKey === item.instrument_key
+                                ? 'border-sky-400 bg-sky-400/15 text-sky-300'
+                                : 'border-slate-700 bg-[#0b1120] text-slate-300 hover:border-slate-500'
+                            }`}
+                          >
+                            {item.trading_symbol}
+                            {item.expiry ? ` · Exp ${item.expiry}` : ''}
+                            {item.strike && item.strike > 0 ? ` · ${item.strike}` : ''}
+                            {item.lot_size && item.lot_size > 1 ? ` · Lot ${item.lot_size}` : ''} · {item.broker_id}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="flex flex-wrap items-center justify-between gap-3 border-t border-slate-800/80 pt-3 text-xs text-slate-400">
+                      <span>
+                        No {fnoExchange} {fnoContractType} contracts found in SQLite for the current filter. Sync Upstox or Zerodha instrument master to load live Futures &amp; Options contracts.
+                      </span>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => void handleSyncInstruments('upstox')}
+                          disabled={syncingMaster !== null}
+                          className="shrink-0 whitespace-nowrap rounded-md border border-slate-700 bg-[#0b1120] px-3 py-1.5 text-xs font-semibold text-slate-200 hover:border-sky-400 disabled:opacity-50"
+                        >
+                          Sync Upstox Master
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => void handleSyncInstruments('zerodha')}
+                          disabled={syncingMaster !== null}
+                          className="shrink-0 whitespace-nowrap rounded-md border border-slate-700 bg-[#0b1120] px-3 py-1.5 text-xs font-semibold text-slate-200 hover:border-sky-400 disabled:opacity-50"
+                        >
+                          Sync Zerodha Master
+                        </button>
+                      </div>
+                    </div>
+                  )}
                 </div>
               )}
             </div>
 
             {/* Gap-Only Historical Downloader Form */}
             <div className="space-y-4">
-              <div className="grid grid-cols-1 items-end gap-4 sm:grid-cols-2 lg:grid-cols-[1.1fr_0.75fr_0.9fr_1fr_1fr_1fr_auto]">
+              <div className="grid grid-cols-1 items-end gap-4 sm:grid-cols-2 lg:grid-cols-[1.15fr_0.85fr_0.85fr_0.95fr_0.95fr_1fr_auto]">
                 <div>
                   <label htmlFor="hist-symbol" className="mb-1.5 block text-[13px] font-semibold text-slate-200">
-                    Symbol
+                    Symbol / Contract
                   </label>
                   <input
                     id="hist-symbol"
                     type="text"
                     value={histSymbol}
-                    onChange={(e) => setHistSymbol(e.target.value.toUpperCase())}
-                    placeholder="RELIANCE"
+                    onChange={(e) => {
+                      setHistSymbol(e.target.value.toUpperCase());
+                      setHistInstrumentKey('');
+                      setHistContractType('');
+                    }}
+                    placeholder="RELIANCE or NIFTY26NOVFUT"
                     className="min-h-[42px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 font-mono text-sm text-slate-100 focus:border-sky-400 focus:outline-none"
                   />
                 </div>
@@ -1175,11 +1839,23 @@ export default function App() {
                   <select
                     id="hist-exchange"
                     value={histExchange}
-                    onChange={(e) => setHistExchange(e.target.value)}
+                    onChange={(e) => {
+                      const ex = e.target.value;
+                      setHistExchange(ex);
+                      setHistInstrumentKey('');
+                      if (['NFO', 'BFO', 'MCX'].includes(ex)) {
+                        setFnoOpen(true);
+                        setFnoExchange(ex);
+                        void fetchFnoContracts({ exchange: ex });
+                      }
+                    }}
                     className="min-h-[42px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 text-sm text-slate-100 focus:border-sky-400 focus:outline-none"
                   >
-                    <option value="NSE">NSE</option>
-                    <option value="BSE">BSE</option>
+                    <option value="NSE">NSE (Equity / Index)</option>
+                    <option value="BSE">BSE (Equity)</option>
+                    <option value="NFO">NFO (NSE F&amp;O)</option>
+                    <option value="BFO">BFO (BSE F&amp;O)</option>
+                    <option value="MCX">MCX (Commodity F&amp;O)</option>
                   </select>
                 </div>
 
@@ -1253,6 +1929,22 @@ export default function App() {
                 </button>
               </div>
 
+              {(histInstrumentKey || ['NFO', 'BFO', 'MCX'].includes(histExchange)) && (
+                <div className="flex flex-wrap items-center justify-between gap-2 font-mono text-xs text-slate-400">
+                  <span>
+                    {histInstrumentKey
+                      ? `Bound Contract Key: ${histInstrumentKey}${histContractType ? ` (${histContractType})` : ''}`
+                      : `F&O Segment Selected: ${histExchange}`}
+                  </span>
+                  {(histProvider === 'yfinance' || (histProvider === 'auto' && dataSelection === 'yfinance')) &&
+                    ['NFO', 'BFO', 'MCX'].includes(histExchange) && (
+                      <span className="font-sans text-amber-400">
+                        Yahoo Finance does not serve NSE/BSE F&amp;O — switch Source to Upstox or Zerodha Kite.
+                      </span>
+                    )}
+                </div>
+              )}
+
               {dataFeedback && (
                 <div
                   className={`flex flex-wrap items-center justify-between gap-3 text-[13px] ${
@@ -1285,6 +1977,8 @@ export default function App() {
                       onClick={() => {
                         setHistSymbol(ds.symbol);
                         setHistExchange(ds.exchange);
+                        setHistInstrumentKey('');
+                        setHistContractType('');
                         setHistTimeframe(ds.timeframe);
                         setHistFrom(ds.start_date);
                         setHistTo(ds.end_date);
@@ -1292,7 +1986,7 @@ export default function App() {
                       }}
                       className="min-h-[30px] shrink-0 whitespace-nowrap rounded-md border border-slate-700 bg-[#0b1120] px-2.5 py-1 font-mono text-xs tabular-nums text-slate-300 transition-colors hover:border-sky-400"
                     >
-                      {ds.symbol} · {ds.timeframe} ({ds.row_count} bars)
+                      {ds.symbol} · {ds.exchange} · {ds.timeframe} ({ds.row_count} bars)
                     </button>
                   ))}
                 </div>
@@ -1348,7 +2042,7 @@ export default function App() {
               </div>
 
               {dataRecords && dataRecords.total_rows > 0 && (
-                <div className="grid grid-cols-2 gap-4 border-y border-slate-800 py-3 font-mono text-xs tabular-nums sm:grid-cols-5">
+                <div className="grid grid-cols-2 gap-4 border-y border-slate-800 py-3 font-mono text-xs tabular-nums sm:grid-cols-3 lg:grid-cols-6">
                   <div>
                     <div className="text-slate-500">Latest Close</div>
                     <div className="mt-0.5 text-sm font-semibold text-slate-100">
@@ -1385,6 +2079,12 @@ export default function App() {
                       {dataRecords.summary.total_volume.toLocaleString()}
                     </div>
                   </div>
+                  <div>
+                    <div className="text-slate-500">Latest OI</div>
+                    <div className="mt-0.5 text-sm font-semibold text-slate-100">
+                      {(dataRecords.summary.latest_oi ?? 0).toLocaleString()}
+                    </div>
+                  </div>
                 </div>
               )}
 
@@ -1397,7 +2097,7 @@ export default function App() {
               ) : !dataRecords || dataRecords.rows.length === 0 ? (
                 <div className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-slate-800 bg-[#0b1120] px-4 py-4 text-sm text-slate-400">
                   <span>
-                    No locally stored candles yet for {histSymbol} ({histTimeframe}). Click Download Missing Days or Load Stored Data.
+                    No locally stored candles yet for {histSymbol} ({histExchange} · {histTimeframe}). Click Download Missing Days or Load Stored Data.
                   </span>
                   <button
                     type="button"
@@ -1418,6 +2118,7 @@ export default function App() {
                         <th className="px-3.5 py-2.5 text-right font-semibold">Low</th>
                         <th className="px-3.5 py-2.5 text-right font-semibold">Close</th>
                         <th className="px-3.5 py-2.5 text-right font-semibold">Volume</th>
+                        <th className="px-3.5 py-2.5 text-right font-semibold">OI</th>
                         <th className="px-3.5 py-2.5 text-right font-semibold">Source</th>
                       </tr>
                     </thead>
@@ -1430,6 +2131,7 @@ export default function App() {
                           <td className="px-3.5 py-2 text-right">{row.low.toFixed(2)}</td>
                           <td className="px-3.5 py-2 text-right font-semibold text-slate-100">{row.close.toFixed(2)}</td>
                           <td className="px-3.5 py-2 text-right text-slate-300">{row.volume.toLocaleString()}</td>
+                          <td className="px-3.5 py-2 text-right text-slate-300">{(row.oi ?? 0).toLocaleString()}</td>
                           <td className="px-3.5 py-2 text-right text-slate-400">{row.source}</td>
                         </tr>
                       ))}
@@ -1441,7 +2143,329 @@ export default function App() {
           </div>
         </section>
 
-        {/* Section 4: Modular Expansion Roadmap */}
+        {/* Section 4: Phase 4 — Hot-Standby Feed Failover, Preflight & SEBI Kill Switch */}
+        <section id="live-controls" className="space-y-5">
+          <div className="flex flex-wrap items-end justify-between gap-4">
+            <div>
+              <h2 className="text-lg font-semibold tracking-tight text-slate-100">
+                Live Feed Failover, Preflight &amp; Kill Switch
+              </h2>
+              <p className="text-sm text-slate-400">
+                Automatic primary-to-standby market data failover, pre-trade broker margin &amp; symbol gate checks, and SEBI SHA-256 hash-chained safety ledger.
+              </p>
+            </div>
+            {liveStatus?.feeds && (
+              <div className="font-mono text-xs tabular-nums text-slate-400">
+                Primary: {liveStatus.feeds.primary_feed.toUpperCase()} · Active Feed:{' '}
+                {liveStatus.feeds.active_feed.toUpperCase()} · Failovers: {liveStatus.feeds.failover_count}
+              </div>
+            )}
+          </div>
+
+          {/* Hot-Standby Feed Priority Table & Live Quotes */}
+          <div className="space-y-5 rounded-xl border border-slate-800 bg-[#111827] p-6">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div className="flex items-center gap-2 text-sm font-semibold text-slate-100">
+                <Activity className="h-4 w-4 text-sky-400" />
+                <span>Hot-Standby Market Data Failover Chain</span>
+              </div>
+              <div className="flex flex-wrap items-center gap-2.5">
+                <button
+                  type="button"
+                  onClick={() => navigateTo('/terminal')}
+                  className="min-h-[38px] shrink-0 whitespace-nowrap rounded-lg border border-sky-500/60 bg-[#0b1120] px-4 py-2 text-xs font-semibold text-sky-400 transition-colors hover:bg-slate-800"
+                >
+                  Open Live Terminal
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handlePollFeeds()}
+                  disabled={feedActionLoading}
+                  className="min-h-[38px] shrink-0 whitespace-nowrap rounded-lg bg-sky-400 px-4 py-2 text-xs font-semibold text-sky-950 transition-colors hover:bg-sky-300 disabled:opacity-50"
+                >
+                  {feedActionLoading ? 'Polling...' : 'Poll Live Quotes'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleTriggerFailover()}
+                  disabled={feedActionLoading}
+                  className="min-h-[38px] shrink-0 whitespace-nowrap rounded-lg border border-slate-700 bg-[#0b1120] px-4 py-2 text-xs font-semibold text-slate-200 transition-colors hover:border-amber-500/70 hover:bg-slate-800 disabled:opacity-50"
+                >
+                  Simulate Failover
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleRecoverPrimary()}
+                  disabled={feedActionLoading}
+                  className="min-h-[38px] shrink-0 whitespace-nowrap rounded-lg border border-slate-700 bg-[#0b1120] px-4 py-2 text-xs font-semibold text-slate-200 transition-colors hover:border-sky-400 hover:bg-slate-800 disabled:opacity-50"
+                >
+                  Restore Primary
+                </button>
+              </div>
+            </div>
+
+            {feedFeedback && (
+              <div
+                className={`flex items-center gap-2 text-[13px] ${
+                  feedFeedback.type === 'ok' ? 'text-emerald-400' : 'text-red-400'
+                }`}
+                role="status"
+                aria-live="polite"
+              >
+                {feedFeedback.type === 'ok' ? <Check className="h-4 w-4" /> : <AlertCircle className="h-4 w-4" />}
+                <span>{feedFeedback.text}</span>
+              </div>
+            )}
+
+            <div className="overflow-x-auto border-t border-slate-800 pt-3">
+              <table className="w-full border-collapse text-left font-mono text-xs tabular-nums">
+                <thead className="text-slate-400">
+                  <tr className="border-b border-slate-800">
+                    <th className="py-2.5 pr-4 font-semibold">Provider</th>
+                    <th className="py-2.5 pr-4 font-semibold">Role</th>
+                    <th className="py-2.5 pr-4 font-semibold">Transport</th>
+                    <th className="py-2.5 pr-4 font-semibold">State</th>
+                    <th className="py-2.5 pr-4 text-right font-semibold">Ticks / Errs</th>
+                    <th className="py-2.5 pr-4 text-right font-semibold">Latency</th>
+                    <th className="py-2.5 text-right font-semibold">Last Tick (IST)</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-800/80 text-slate-200">
+                  {(liveStatus?.feeds?.slots ?? []).map((slot) => (
+                    <tr key={slot.feed_id}>
+                      <td className="py-2.5 pr-4 font-sans text-[13px] font-semibold text-slate-100">
+                        {slot.display_name}
+                      </td>
+                      <td className="py-2.5 pr-4 text-slate-400">{slot.role}</td>
+                      <td className="py-2.5 pr-4 text-slate-400">{slot.transport}</td>
+                      <td
+                        className={`py-2.5 pr-4 font-semibold ${
+                          slot.status === 'CONNECTED'
+                            ? 'text-emerald-400'
+                            : slot.status === 'FAILOVER' || slot.status === 'DISCONNECTED'
+                              ? 'text-amber-400'
+                              : 'text-slate-400'
+                        }`}
+                      >
+                        {slot.status}
+                      </td>
+                      <td className="py-2.5 pr-4 text-right">
+                        {slot.ticks_received} / {slot.error_count}
+                      </td>
+                      <td className="py-2.5 pr-4 text-right text-slate-300">
+                        {slot.latency_ms !== null ? `${slot.latency_ms} ms` : '—'}
+                      </td>
+                      <td className="py-2.5 text-right text-slate-400">
+                        {slot.last_tick_ist ? slot.last_tick_ist.slice(11, 19) : '—'}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            {liveStatus?.feeds?.quotes && liveStatus.feeds.quotes.length > 0 && (
+              <div className="grid grid-cols-2 gap-4 border-t border-slate-800 pt-4 font-mono text-xs tabular-nums sm:grid-cols-5">
+                {liveStatus.feeds.quotes.map((q) => (
+                  <div key={q.symbol}>
+                    <div className="text-slate-400">
+                      {q.symbol} · {q.source}
+                    </div>
+                    <div className="mt-0.5 text-sm font-semibold text-slate-100">₹{q.ltp.toFixed(2)}</div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Preflight Gate & Emergency Kill Switch */}
+          <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
+            {/* Preflight Checks */}
+            <div className="flex flex-col justify-between space-y-4 rounded-xl border border-slate-800 bg-[#111827] p-6">
+              <div className="space-y-4">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <h3 className="text-base font-semibold text-slate-100">Preflight Safety &amp; Margin Gate</h3>
+                    <p className="text-xs text-slate-400">
+                      {preflight
+                        ? `${preflight.passed_count}/${preflight.total_count} passed · ${
+                            preflight.overall_ready ? 'Ready for execution' : 'Execution blocked until ERROR checks pass'
+                          }`
+                        : 'Verify auth, live equity margin, SQLite symbol mapping, market hours, and kill switch.'}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => void handleRunPreflight()}
+                    disabled={runningPreflight}
+                    className="min-h-[38px] shrink-0 whitespace-nowrap rounded-lg border border-slate-700 bg-[#0b1120] px-3.5 py-2 text-xs font-semibold text-slate-200 transition-colors hover:border-sky-400 hover:bg-slate-800 disabled:opacity-50"
+                  >
+                    {runningPreflight ? 'Checking...' : 'Run Preflight Checks'}
+                  </button>
+                </div>
+
+                {preflight ? (
+                  <div className="divide-y divide-slate-800 border-t border-slate-800">
+                    {preflight.checks.map((chk) => (
+                      <div key={chk.id} className="flex items-start justify-between gap-4 py-2.5 text-xs">
+                        <div>
+                          <div className="font-semibold text-slate-200">{chk.name}</div>
+                          <div className="mt-0.5 text-slate-400">{chk.message}</div>
+                        </div>
+                        <span
+                          className={`shrink-0 font-mono font-semibold ${
+                            chk.status === 'PASS'
+                              ? 'text-emerald-400'
+                              : chk.status === 'WARN'
+                                ? 'text-amber-400'
+                                : 'text-red-400'
+                          }`}
+                        >
+                          {chk.status}
+                        </span>
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <div className="border-t border-slate-800 pt-3 text-xs text-slate-500">
+                    Click Run Preflight Checks to probe broker margin, instrument mapping, and kill-switch state.
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Emergency Kill Switch */}
+            <div className="flex flex-col justify-between space-y-4 rounded-xl border border-slate-800 bg-[#111827] p-6">
+              <div className="space-y-4">
+                <div className="flex items-start justify-between gap-4">
+                  <div>
+                    <h3 className="text-base font-semibold text-slate-100">Emergency Kill Switch</h3>
+                    <p className="text-xs text-slate-400">
+                      Persists immediately to disk, cancels active open orders on the trading broker, and blocks all new strategy signals.
+                    </p>
+                  </div>
+                  <div
+                    className={`inline-flex shrink-0 items-center gap-1.5 font-mono text-xs font-semibold ${
+                      liveStatus?.kill_switch?.engaged ? 'text-red-400' : 'text-emerald-400'
+                    }`}
+                  >
+                    {liveStatus?.kill_switch?.engaged ? (
+                      <>
+                        <ShieldAlert className="h-4 w-4" />
+                        <span>ENGAGED</span>
+                      </>
+                    ) : (
+                      <>
+                        <ShieldCheck className="h-4 w-4" />
+                        <span>ARMED / CLEAR</span>
+                      </>
+                    )}
+                  </div>
+                </div>
+
+                {liveStatus?.kill_switch?.engaged && (
+                  <div className="border-y border-red-900/60 py-2.5 text-xs text-red-300">
+                    Stopped at {liveStatus.kill_switch.engaged_at_ist || 'now'} ·{' '}
+                    {liveStatus.kill_switch.reason || 'Operator halt'}
+                  </div>
+                )}
+
+                <div>
+                  <label htmlFor="kill-reason-input" className="mb-1.5 block text-xs font-semibold text-slate-300">
+                    Operator Audit Reason
+                  </label>
+                  <input
+                    id="kill-reason-input"
+                    type="text"
+                    value={killReason}
+                    onChange={(e) => setKillReason(e.target.value)}
+                    placeholder="Reason for emergency halt or reset (logged to SHA-256 chain)..."
+                    className="min-h-[40px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 text-xs text-slate-100 focus:border-sky-400 focus:outline-none"
+                  />
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-3 pt-2">
+                {liveStatus?.kill_switch?.engaged ? (
+                  <button
+                    type="button"
+                    onClick={() => void handleToggleKillSwitch(false)}
+                    disabled={killBusy}
+                    className="min-h-[40px] shrink-0 whitespace-nowrap rounded-lg bg-emerald-500 px-4 py-2 text-xs font-semibold text-emerald-950 transition-colors hover:bg-emerald-400 disabled:opacity-50"
+                  >
+                    {killBusy ? 'Resetting...' : 'Reset Kill Switch'}
+                  </button>
+                ) : (
+                  <button
+                    type="button"
+                    onClick={() => void handleToggleKillSwitch(true)}
+                    disabled={killBusy}
+                    className="min-h-[40px] shrink-0 whitespace-nowrap rounded-lg bg-red-600 px-4 py-2 text-xs font-semibold text-white transition-colors hover:bg-red-500 disabled:opacity-50"
+                  >
+                    {killBusy ? 'Engaging...' : 'Engage Emergency Kill Switch'}
+                  </button>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* SEBI Hash-Chained Audit Ledger */}
+          <div className="space-y-4 rounded-xl border border-slate-800 bg-[#111827] p-6">
+            <div className="flex flex-wrap items-center justify-between gap-3">
+              <div>
+                <h3 className="text-base font-semibold text-slate-100">SEBI Hash-Chained Audit Trail</h3>
+                <p className="font-mono text-xs tabular-nums text-slate-400">
+                  {liveStatus?.audit_verify
+                    ? `${liveStatus.audit_verify.valid ? 'VERIFIED' : 'TAMPER ALERT'} · ${liveStatus.audit_verify.total_events} events · Head: ${liveStatus.audit_verify.head_hash.slice(0, 14)}…`
+                    : 'Append-only SHA-256 ledger'}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => void handleVerifyAuditChain()}
+                disabled={verifyingAudit}
+                className="min-h-[36px] shrink-0 whitespace-nowrap rounded-lg border border-slate-700 bg-[#0b1120] px-3.5 py-1.5 text-xs font-semibold text-slate-200 transition-colors hover:border-sky-400 hover:bg-slate-800 disabled:opacity-50"
+              >
+                {verifyingAudit ? 'Verifying...' : 'Verify SHA-256 Chain'}
+              </button>
+            </div>
+
+            {!liveStatus?.audit_events || liveStatus.audit_events.length === 0 ? (
+              <div className="border-t border-slate-800 pt-3 text-xs text-slate-500">
+                No audit events recorded yet. Trigger a preflight check, feed failover, or kill-switch test to append a SHA-256 linked record.
+              </div>
+            ) : (
+              <div className="max-h-[260px] overflow-auto border-t border-slate-800">
+                <table className="w-full border-collapse text-left font-mono text-xs tabular-nums">
+                  <thead className="sticky top-0 bg-[#111827] text-slate-400">
+                    <tr className="border-b border-slate-800">
+                      <th className="py-2 pr-4 font-semibold">Timestamp (IST)</th>
+                      <th className="py-2 pr-4 font-semibold">Event</th>
+                      <th className="py-2 pr-4 font-semibold">Actor</th>
+                      <th className="py-2 pr-4 font-semibold">Detail</th>
+                      <th className="py-2 text-right font-semibold">SHA-256 Chain Hash</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-800/80 text-slate-300">
+                    {liveStatus.audit_events.map((ev) => (
+                      <tr key={ev.id}>
+                        <td className="py-2 pr-4 whitespace-nowrap text-slate-400">{ev.ts_ist.slice(0, 19)}</td>
+                        <td className="py-2 pr-4 font-semibold text-slate-100">{ev.event_type}</td>
+                        <td className="py-2 pr-4 text-slate-400">{ev.actor}</td>
+                        <td className="py-2 pr-4 font-sans text-slate-300">
+                          {String(ev.payload.reason || ev.payload.trading_broker || ev.payload.trading_symbol || '—')}
+                        </td>
+                        <td className="py-2 text-right text-sky-400">{ev.chain_hash.slice(0, 16)}…</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </div>
+        </section>
+
+        {/* Section 5: Modular Expansion Roadmap */}
         <section id="roadmap" className="space-y-4">
           <div>
             <h2 className="text-lg font-semibold tracking-tight text-slate-100">Modular Expansion Roadmap</h2>

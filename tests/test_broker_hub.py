@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import socket
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -19,9 +20,12 @@ from broker.upstox.auth import AuthManager, current_upstox_session_bounds
 from broker.zerodha.auth import ZerodhaAuthManager, current_zerodha_session_bounds
 from broker.zerodha.feed import KiteTickerAdapter
 from config import IST_TZ, AppConfig
-from core.instruments import InstrumentIndex, InstrumentRecord
-from core.runtime import LiveBotEngine, OrderRequest
+from core.audit import AuditTrail
+from core.feed_manager import HotStandbyFeedManager
 from core.historical import HistoricalDataManager, compute_missing_date_ranges
+from core.instruments import InstrumentIndex, InstrumentRecord
+from core.preflight import KillSwitchController, PreflightChecker
+from core.runtime import LiveBotEngine, OrderRequest
 from web.service import BrokerHubService
 
 
@@ -443,6 +447,404 @@ class TestBrokerHubArchitecture(unittest.TestCase):
                     quantity=1,
                 )
             )
+
+    def test_sebi_hash_chained_audit_trail_and_tamper_detection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "audit_chain.db"
+            trail = AuditTrail(db_path)
+
+            trail.log_preflight(
+                overall_ready=True,
+                passed_count=6,
+                total_count=6,
+                trading_broker="upstox",
+                data_connection="upstox",
+            )
+            trail.log_failover(from_feed="upstox", to_feed="yfinance", reason="WebSocket dropped")
+            trail.log_kill_switch(engaged=True, reason="Drill stop", trading_broker="upstox", orders_cancelled=0)
+
+            verified = trail.verify_chain()
+            self.assertTrue(verified["valid"])
+            self.assertEqual(verified["total_events"], 3)
+
+            # Mutate historical SQLite row directly to simulate log tampering
+            with sqlite3.connect(str(db_path)) as conn:
+                conn.execute("UPDATE audit_chain SET payload = '{\"tampered\":true}' WHERE rowid = 2")
+                conn.commit()
+
+            tampered = trail.verify_chain()
+            self.assertFalse(tampered["valid"])
+            self.assertEqual(tampered["broken_index"], 1)
+
+    def test_hot_standby_feed_auto_failover_and_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trail = AuditTrail(Path(tmpdir) / "audit_chain.db")
+            state_flags = {"upstox_up": False}
+
+            def upstox_fetcher(syms: list[str]):
+                if not state_flags["upstox_up"]:
+                    raise ConnectionError("Upstox WS dropped")
+                return {
+                    s: {"symbol": s, "ltp": 2951.25, "change_pct": 0.4, "source": "upstox", "ts_ist": "2026-11-18T10:15:00+05:30"}
+                    for s in syms
+                }
+
+            def zerodha_fetcher(_syms: list[str]):
+                raise RuntimeError("Zerodha token expired")
+
+            def yfinance_fetcher(syms: list[str]):
+                return {
+                    s: {"symbol": s, "ltp": 2950.0, "change_pct": 0.3, "source": "yfinance", "ts_ist": "2026-11-18T10:15:00+05:30"}
+                    for s in syms
+                }
+
+            mgr = HotStandbyFeedManager(
+                primary_id="upstox",
+                audit=trail,
+                fetchers={"upstox": upstox_fetcher, "zerodha": zerodha_fetcher, "yfinance": yfinance_fetcher},
+                watchlist_file=Path(tmpdir) / "watchlist.json",
+            )
+
+            res1 = mgr.poll_ticks(["RELIANCE"])
+            self.assertTrue(res1["ok"])
+            self.assertEqual(res1["active_feed"], "yfinance")
+            self.assertTrue(res1["in_failover"])
+            self.assertEqual(res1["failover_count"], 1)
+            self.assertEqual(res1["quotes"][0]["ltp"], 2950.0)
+
+            events = trail.list_events(limit=10)
+            self.assertEqual(events[0]["event_type"], "FEED_FAILOVER")
+            self.assertEqual(events[0]["payload"]["to_feed"], "yfinance")
+
+            # Restore primary and verify automatic failback
+            state_flags["upstox_up"] = True
+            res2 = mgr.recover_primary()
+            self.assertTrue(res2["ok"])
+            self.assertEqual(res2["active_feed"], "upstox")
+            self.assertFalse(res2["in_failover"])
+            self.assertEqual(res2["quotes"][0]["ltp"], 2951.25)
+
+            # Operator manual drill triggers standby cleanly
+            res3 = mgr.trigger_failover(reason="Scheduled failover drill")
+            self.assertTrue(res3["in_failover"])
+            self.assertEqual(res3["active_feed"], "yfinance")
+
+    def test_kill_switch_persistence_blocks_orders_and_preflight(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trail = AuditTrail(Path(tmpdir) / "audit_chain.db")
+            ks_file = Path(tmpdir) / "kill_switch.json"
+            ks = KillSwitchController(state_file=ks_file, audit=trail)
+
+            with patch("broker.upstox.broker.UpstoxBroker.get_orders", return_value=[]):
+                ks.engage(reason="Max drawdown guard", trading_broker="upstox")
+
+            # Verify persisted disk state survives controller re-instantiation
+            ks_reloaded = KillSwitchController(state_file=ks_file, audit=trail)
+            self.assertTrue(ks_reloaded.is_engaged())
+
+            # Global kill switch must block LiveBotEngine order execution even when state.kill_switch_engaged is False
+            engine = LiveBotEngine(
+                trading_broker_id="upstox",
+                data_connection_id="yfinance",
+                kill_switch=ks_reloaded,
+                audit=trail,
+            )
+            with self.assertRaises(RuntimeError):
+                engine.session_manager.submit_signal_order(
+                    OrderRequest(trading_symbol="RELIANCE", exchange="NSE", transaction_type="BUY", quantity=1)
+                )
+
+            pre = PreflightChecker.run_all(
+                trading_broker="upstox",
+                data_connection="yfinance",
+                symbols=["RELIANCE", "NIFTY"],
+                kill_switch=ks_reloaded,
+                audit=trail,
+                probe_brokers=False,
+            )
+            self.assertFalse(pre["overall_ready"])
+            checks_by_id = {c["id"]: c for c in pre["checks"]}
+            self.assertEqual(checks_by_id["kill_switch"]["status"], "FAIL")
+            self.assertEqual(checks_by_id["symbol_mapping"]["status"], "PASS")
+
+            ks_reloaded.reset(reason="Verified & cleared", trading_broker="upstox")
+            self.assertFalse(ks_reloaded.is_engaged())
+            self.assertTrue(trail.verify_chain()["valid"])
+
+    def test_fno_instrument_search_expiry_normalization_and_cross_broker_resolve(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            idx = InstrumentIndex(Path(tmpdir) / "instruments.db")
+
+            # Seed Upstox F&O payload with NSE_FO segment & epoch-ms expiry (2026-11-26 IST)
+            upstox_payload = [
+                {
+                    "segment": "NSE_FO",
+                    "exchange": "NSE",
+                    "trading_symbol": "NIFTY26NOVFUT",
+                    "underlying_symbol": "NIFTY",
+                    "name": "NIFTY NOV FUT",
+                    "instrument_type": "FUT",
+                    "instrument_key": "NSE_FO|50001",
+                    "exchange_token": "50001",
+                    "expiry": 1795631400000,
+                    "strike_price": 0,
+                    "lot_size": 75,
+                    "tick_size": 0.05,
+                },
+                {
+                    "segment": "NSE_FO",
+                    "exchange": "NSE",
+                    "trading_symbol": "NIFTY26NOV24500CE",
+                    "underlying_symbol": "NIFTY",
+                    "name": "NIFTY 24500 CE",
+                    "instrument_type": "CE",
+                    "instrument_key": "NSE_FO|50002",
+                    "exchange_token": "50002",
+                    "expiry": 1795631400000,
+                    "strike_price": 24500,
+                    "lot_size": 75,
+                    "tick_size": 0.05,
+                },
+            ]
+            # Seed Zerodha Kite CSV payload with NFO FUT & PE
+            zerodha_csv = (
+                "instrument_token,exchange_token,tradingsymbol,name,last_price,expiry,strike,tick_size,lot_size,instrument_type,segment,exchange\n"
+                "910001,3554,RELIANCE26NOVFUT,RELIANCE,0,2026-11-26,0,0.05,250,FUT,NFO-FUT,NFO\n"
+                "910002,3555,NIFTY26NOV24500PE,NIFTY,0,2026-11-26,24500,0.05,75,PE,NFO-OPT,NFO\n"
+            )
+
+            import gzip
+            import io
+            import json as _json
+
+            gz_bytes = gzip.compress(_json.dumps(upstox_payload).encode("utf-8"))
+
+            class _FakeResp(io.BytesIO):
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    return False
+
+            with patch("urllib.request.urlopen", return_value=_FakeResp(gz_bytes)):
+                up_res = idx.sync_upstox_master()
+            self.assertEqual(up_res["indexed_count"], 2)
+
+            with patch("urllib.request.urlopen", return_value=_FakeResp(zerodha_csv.encode("utf-8"))):
+                zd_res = idx.sync_zerodha_master()
+            self.assertEqual(zd_res["indexed_count"], 2)
+
+            stats = idx.stats()
+            self.assertGreaterEqual(stats["fno_instruments"], 4)
+
+            # Multi-token search + contract type filtering
+            ce_hits = idx.search("NIFTY 24500 CE", instrument_type="CE")
+            self.assertEqual(len(ce_hits), 1)
+            self.assertEqual(ce_hits[0]["trading_symbol"], "NIFTY26NOV24500CE")
+            self.assertEqual(ce_hits[0]["exchange"], "NFO")
+            self.assertEqual(ce_hits[0]["expiry"], "2026-11-26")
+
+            fut_hits = idx.search("RELIANCE", instrument_type="FUT")
+            self.assertEqual(len(fut_hits), 1)
+            self.assertEqual(fut_hits[0]["asset_symbol"], "RELIANCE")
+            self.assertEqual(fut_hits[0]["lot_size"], 250)
+
+            # Structured F&O Contract Finder query
+            fno_bundle = idx.list_fno_contracts(underlying="NIFTY", exchange="NFO", contract_type="OPT")
+            self.assertIn("NIFTY", fno_bundle["underlyings"])
+            self.assertIn("2026-11-26", fno_bundle["expiries"])
+            self.assertIn(24500.0, fno_bundle["strikes"])
+            self.assertEqual(fno_bundle["count"], 2)
+
+            # Cross-broker key resolution (NFO <-> NSE_FO)
+            self.assertEqual(idx.resolve_key("NIFTY26NOVFUT", broker_id="upstox", exchange="NFO", instrument_type="FUT"), "NSE_FO|50001")
+            self.assertEqual(idx.resolve_key("NIFTY26NOV24500PE", broker_id="zerodha", exchange="NFO", instrument_type="PE"), "910002")
+
+    def test_fno_historical_download_oi_and_yahoo_guard(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mgr = HistoricalDataManager(Path(tmpdir) / "ohlcv.db")
+
+            # Yahoo Finance must clearly reject NSE/BSE F&O contracts
+            with self.assertRaises(ValueError) as ctx:
+                mgr.download(
+                    symbol="NIFTY26NOVFUT",
+                    exchange="NFO",
+                    timeframe="1day",
+                    from_date="2026-11-02",
+                    to_date="2026-11-06",
+                    provider="yfinance",
+                    instrument_type="FUT",
+                )
+            self.assertIn("Upstox or Zerodha Kite", str(ctx.exception))
+
+            # F&O download via Upstox fetcher stores & surfaces Open Interest (OI)
+            seen_args = []
+
+            def fake_fno_fetcher(sym: str, exch: str, tf: str, c_start: date, c_end: date):
+                seen_args.append((sym, exch, tf, c_start, c_end))
+                return [
+                    {
+                        "ts_ist": "2026-11-02T00:00:00+05:30",
+                        "trade_date": "2026-11-02",
+                        "open": 24400.0,
+                        "high": 24610.0,
+                        "low": 24350.0,
+                        "close": 24550.0,
+                        "volume": 125000,
+                        "oi": 4825000,
+                    },
+                    {
+                        "ts_ist": "2026-11-03T00:00:00+05:30",
+                        "trade_date": "2026-11-03",
+                        "open": 24560.0,
+                        "high": 24700.0,
+                        "low": 24510.0,
+                        "close": 24680.0,
+                        "volume": 134000,
+                        "oi": 5012000,
+                    },
+                ]
+
+            res = mgr.download(
+                symbol="NFO:NIFTY26NOVFUT",
+                exchange="NFO",
+                timeframe="1day",
+                from_date="2026-11-02",
+                to_date="2026-11-03",
+                provider="upstox",
+                instrument_type="FUT",
+                instrument_key="NSE_FO|50001",
+                fetcher=fake_fno_fetcher,
+            )
+            self.assertEqual(res["symbol"], "NIFTY26NOVFUT")
+            self.assertEqual(res["exchange"], "NFO")
+            self.assertEqual(res["rows_inserted"], 2)
+            self.assertEqual(res["snapshot"]["summary"]["latest_oi"], 5012000)
+            self.assertEqual(res["snapshot"]["rows"][-1]["oi"], 5012000)
+
+            csv_out = mgr.export_csv(symbol="NIFTY26NOVFUT", exchange="NFO", timeframe="1day")
+            self.assertIn("oi", csv_out.splitlines()[0])
+            self.assertIn("5012000", csv_out)
+
+    def test_service_list_fno_contracts_parity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            svc = BrokerHubService(selection_store=SelectionStore(Path(tmpdir) / "sel.json"))
+            bundle = svc.list_fno_contracts(underlying="NIFTY", exchange="NFO", contract_type="FO")
+            self.assertIn("underlyings", bundle)
+            self.assertIn("expiries", bundle)
+            self.assertIn("strikes", bundle)
+            self.assertIn("contracts", bundle)
+            self.assertIn("count", bundle)
+
+    def test_live_feed_subscribe_unsubscribe_persistence_and_listener(self) -> None:
+        from core.feed_manager import _fetch_one_yahoo_quote
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            watchlist_path = Path(tmpdir) / "watchlist.json"
+            trail = AuditTrail(Path(tmpdir) / "audit_chain.db")
+            tick_prices = {"RELIANCE": 2950.0, "TCS": 3910.0}
+
+            def fake_yfinance_fetcher(subs: list):
+                out = {}
+                for raw_item in subs:
+                    item = raw_item if isinstance(raw_item, dict) else {"symbol": raw_item, "exchange": "NSE", "instrument_type": ""}
+                    sym = item["symbol"]
+                    if sym == "NIFTY26NOVFUT":
+                        out[sym] = _fetch_one_yahoo_quote(item)
+                    else:
+                        tick_prices[sym] = tick_prices.get(sym, 1000.0) + 1.5
+                        out[sym] = {
+                            "symbol": sym,
+                            "exchange": item.get("exchange", "NSE"),
+                            "instrument_type": item.get("instrument_type", "EQUITY"),
+                            "ltp": tick_prices[sym],
+                            "prev_close": tick_prices[sym] - 10.0,
+                            "open": tick_prices[sym] - 5.0,
+                            "high": tick_prices[sym] + 2.0,
+                            "low": tick_prices[sym] - 8.0,
+                            "change": 10.0,
+                            "change_pct": 0.45,
+                            "volume": 50000,
+                            "oi": 0,
+                            "bid": tick_prices[sym] - 0.5,
+                            "ask": tick_prices[sym] + 0.5,
+                            "source": "yfinance",
+                            "transport": "live_chart_poll",
+                            "note": "",
+                            "ts_ist": "2026-11-18T10:15:00+05:30",
+                        }
+                return out
+
+            mgr = HotStandbyFeedManager(
+                primary_id="yfinance",
+                audit=trail,
+                fetchers={"yfinance": fake_yfinance_fetcher},
+                watchlist_file=watchlist_path,
+            )
+
+            sub_res = mgr.subscribe("TATAMOTORS", exchange="NSE", instrument_type="EQUITY")
+            self.assertTrue(sub_res["ok"])
+            self.assertEqual(sub_res["subscriptions"][0]["symbol"], "TATAMOTORS")
+            self.assertGreaterEqual(len(sub_res["quotes"][0]["history"]), 1)
+
+            # Subscribe an F&O contract -> non-blocking note when on Yahoo fallback
+            fno_res = mgr.subscribe("NIFTY26NOVFUT", exchange="NFO", instrument_type="FUT")
+            fno_quote = next(q for q in fno_res["quotes"] if q["symbol"] == "NIFTY26NOVFUT")
+            self.assertIsNone(fno_quote["ltp"])
+            self.assertIn("Upstox or Zerodha", fno_quote["note"])
+
+            # Persistence check
+            mgr2 = HotStandbyFeedManager(
+                primary_id="yfinance",
+                audit=trail,
+                fetchers={"yfinance": fake_yfinance_fetcher},
+                watchlist_file=watchlist_path,
+            )
+            self.assertIn("TATAMOTORS", [s["symbol"] for s in mgr2.list_subscriptions()])
+
+            # Listener pub/sub receives broadcast upon unsubscribe
+            q = mgr2.register_listener()
+            try:
+                unsub_res = mgr2.unsubscribe("TATAMOTORS", exchange="NSE")
+                self.assertEqual(unsub_res["removed"], 1)
+                self.assertNotIn("TATAMOTORS", [s["symbol"] for s in unsub_res["subscriptions"]])
+                event = q.get(timeout=2.0)
+                self.assertEqual(event["type"], "tick_snapshot")
+            finally:
+                mgr2.unregister_listener(q)
+
+    def test_ws_protocol_rfc6455_accept_key_and_masked_frame_roundtrip(self) -> None:
+        import os
+        import socket
+        from core.ws_protocol import OPCODE_TEXT, compute_accept_key, read_ws_frame, send_ws_text
+
+        # RFC 6455 Section 1.3 canonical test vector
+        self.assertEqual(
+            compute_accept_key("dGhlIHNhbXBsZSBub25jZQ=="),
+            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=",
+        )
+
+        srv_sock, cli_sock = socket.socketpair()
+        try:
+            # Server sends text frame -> client reads unmasked frame
+            send_ws_text(srv_sock, '{"type":"tick_snapshot","ok":true}')
+            opcode, payload = read_ws_frame(cli_sock)
+            self.assertEqual(opcode, OPCODE_TEXT)
+            self.assertIn('"tick_snapshot"', payload.decode("utf-8"))
+
+            # Client sends masked frame -> server unmasks accurately
+            msg = b'{"action":"subscribe","symbol":"TCS","exchange":"NSE"}'
+            mask = os.urandom(4)
+            masked = bytes(b ^ mask[i % 4] for i, b in enumerate(msg))
+            frame = bytes([0x81, 0x80 | len(msg)]) + mask + masked
+            cli_sock.sendall(frame)
+
+            srv_opcode, srv_payload = read_ws_frame(srv_sock)
+            self.assertEqual(srv_opcode, OPCODE_TEXT)
+            self.assertEqual(srv_payload, msg)
+        finally:
+            srv_sock.close()
+            cli_sock.close()
 
 
 if __name__ == "__main__":

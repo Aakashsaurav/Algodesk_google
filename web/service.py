@@ -29,8 +29,11 @@ from broker.registry import BrokerRegistry, SelectionStore
 from broker.upstox.auth import auth_manager as upstox_auth_manager
 from broker.zerodha.auth import zerodha_auth_manager
 from config import IST_TZ, config
-from core.instruments import instrument_index
+from core.audit import audit_trail
+from core.feed_manager import feed_manager
 from core.historical import historical_data_manager
+from core.instruments import instrument_index
+from core.preflight import PreflightChecker, kill_switch_controller
 
 logger = logging.getLogger(__name__)
 
@@ -183,6 +186,7 @@ class BrokerHubService:
             raise ValueError(f"{d_adapter.display_name} does not support market data.")
 
         saved = self._store.save(trading_broker=t_id, data_connection=d_id)
+        feed_manager.sync_primary(d_id)
         return {"ok": True, "selections": saved}
 
     def save_credentials(
@@ -443,15 +447,43 @@ class BrokerHubService:
         query: str = "",
         broker_id: Optional[str] = None,
         exchange: Optional[str] = None,
+        instrument_type: Optional[str] = None,
+        expiry: Optional[str] = None,
+        strike: Optional[float] = None,
         limit: int = 25,
     ) -> Dict[str, Any]:
         results = instrument_index.search(
             query=query,
             broker_id=broker_id,
             exchange=exchange,
+            instrument_type=instrument_type,
+            expiry=expiry,
+            strike=strike,
             limit=limit,
         )
         return {"ok": True, "count": len(results), "results": results, "stats": instrument_index.stats()}
+
+    def list_fno_contracts(
+        self,
+        underlying: str = "",
+        exchange: str = "NFO",
+        contract_type: str = "FO",
+        expiry: Optional[str] = None,
+        strike: Optional[float] = None,
+        broker_id: Optional[str] = None,
+        limit: int = 40,
+    ) -> Dict[str, Any]:
+        res = instrument_index.list_fno_contracts(
+            underlying=underlying,
+            exchange=exchange,
+            contract_type=contract_type,
+            expiry=expiry,
+            strike=strike,
+            broker_id=broker_id,
+            limit=limit,
+        )
+        res["stats"] = instrument_index.stats()
+        return res
 
     def sync_instruments(self, broker_id: str) -> Dict[str, Any]:
         bid = (broker_id or "upstox").strip().lower()
@@ -473,6 +505,8 @@ class BrokerHubService:
         from_date: Optional[str] = None,
         to_date: Optional[str] = None,
         provider: Optional[str] = None,
+        instrument_type: Optional[str] = None,
+        instrument_key: Optional[str] = None,
     ) -> Dict[str, Any]:
         selected_provider = (provider or self._store.load().get("data_connection") or "yfinance").strip().lower()
         return historical_data_manager.download(
@@ -482,6 +516,8 @@ class BrokerHubService:
             from_date=from_date,
             to_date=to_date,
             provider=selected_provider,
+            instrument_type=instrument_type,
+            instrument_key=instrument_key,
         )
 
     def get_historical_records(
@@ -526,6 +562,132 @@ class BrokerHubService:
             from_date=from_date,
             to_date=to_date,
         )
+
+    # ── Phase 4: Hot-Standby Feed Failover, Preflight & SEBI Kill Switch ─
+
+    def get_live_status(self, audit_limit: int = 20) -> Dict[str, Any]:
+        sel = self._store.load()
+        feed_manager.sync_primary(sel.get("data_connection", "upstox"))
+        return {
+            "ok": True,
+            "selections": sel,
+            "feeds": feed_manager.status(),
+            "kill_switch": kill_switch_controller.status(),
+            "audit_verify": audit_trail.verify_chain(),
+            "audit_events": audit_trail.list_events(limit=audit_limit),
+        }
+
+    def poll_live_feeds(self, symbols: Optional[List[str]] = None) -> Dict[str, Any]:
+        sel = self._store.load()
+        feed_manager.sync_primary(sel.get("data_connection", "upstox"))
+        res = feed_manager.poll_ticks(symbols=symbols)
+        return {
+            **res,
+            "audit_verify": audit_trail.verify_chain(),
+            "audit_events": audit_trail.list_events(limit=20),
+        }
+
+    def trigger_feed_failover(self, reason: Optional[str] = None) -> Dict[str, Any]:
+        sel = self._store.load()
+        feed_manager.sync_primary(sel.get("data_connection", "upstox"))
+        clean_reason = (reason or "").strip() or "Operator failover drill / primary drop"
+        res = feed_manager.trigger_failover(reason=clean_reason)
+        return {
+            **res,
+            "audit_verify": audit_trail.verify_chain(),
+            "audit_events": audit_trail.list_events(limit=20),
+        }
+
+    def recover_primary_feed(self) -> Dict[str, Any]:
+        sel = self._store.load()
+        feed_manager.sync_primary(sel.get("data_connection", "upstox"))
+        res = feed_manager.recover_primary()
+        return {
+            **res,
+            "audit_verify": audit_trail.verify_chain(),
+            "audit_events": audit_trail.list_events(limit=20),
+        }
+
+    def get_subscriptions(self) -> Dict[str, Any]:
+        sel = self._store.load()
+        feed_manager.sync_primary(sel.get("data_connection", "upstox"))
+        status = feed_manager.status()
+        return {
+            "ok": True,
+            "subscriptions": status["subscriptions"],
+            "feeds": status,
+        }
+
+    def subscribe_asset(
+        self,
+        *,
+        symbol: str,
+        exchange: str = "NSE",
+        instrument_type: Optional[str] = None,
+        instrument_key: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        sel = self._store.load()
+        feed_manager.sync_primary(sel.get("data_connection", "upstox"))
+        return feed_manager.subscribe(
+            symbol=symbol,
+            exchange=exchange,
+            instrument_type=instrument_type or "",
+            instrument_key=instrument_key or "",
+        )
+
+    def unsubscribe_asset(self, *, symbol: str, exchange: Optional[str] = None) -> Dict[str, Any]:
+        sel = self._store.load()
+        feed_manager.sync_primary(sel.get("data_connection", "upstox"))
+        return feed_manager.unsubscribe(symbol=symbol, exchange=exchange)
+
+    def register_live_listener(self):
+        sel = self._store.load()
+        feed_manager.sync_primary(sel.get("data_connection", "upstox"))
+        return feed_manager.register_listener()
+
+    def unregister_live_listener(self, listener_queue) -> None:
+        feed_manager.unregister_listener(listener_queue)
+
+    def run_preflight(self, symbols: Optional[List[str]] = None) -> Dict[str, Any]:
+        sel = self._store.load()
+        res = PreflightChecker.run_all(
+            trading_broker=sel.get("trading_broker", "upstox"),
+            data_connection=sel.get("data_connection", "upstox"),
+            symbols=symbols,
+        )
+        return {
+            **res,
+            "kill_switch": kill_switch_controller.status(),
+            "audit_verify": audit_trail.verify_chain(),
+            "audit_events": audit_trail.list_events(limit=20),
+        }
+
+    def set_kill_switch(self, engaged: bool, reason: str = "") -> Dict[str, Any]:
+        sel = self._store.load()
+        t_broker = sel.get("trading_broker", "upstox")
+        if engaged:
+            event = kill_switch_controller.engage(
+                reason=reason.strip() or "Manual emergency stop triggered from dashboard",
+                actor="operator",
+                trading_broker=t_broker,
+            )
+        else:
+            event = kill_switch_controller.reset(
+                reason=reason.strip() or "Operator cleared emergency kill switch from dashboard",
+                actor="operator",
+                trading_broker=t_broker,
+            )
+        return {
+            **self.get_live_status(audit_limit=20),
+            "event": event,
+        }
+
+    def verify_audit_chain(self, limit: int = 25) -> Dict[str, Any]:
+        return {
+            "ok": True,
+            "verification": audit_trail.verify_chain(),
+            "events": audit_trail.list_events(limit=limit),
+        }
 
 
 hub_service = BrokerHubService()

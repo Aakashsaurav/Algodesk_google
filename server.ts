@@ -3,6 +3,7 @@ import type { Request, Response } from 'express';
 import { spawn } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
+import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -82,10 +83,10 @@ async function waitForPythonHub(retries = 25): Promise<boolean> {
       });
       if (res.ok) {
         const body = (await res.json().catch(() => null)) as { phase?: number } | null;
-        if (body?.phase === 3) {
+        if (Number(body?.phase ?? 0) >= 4) {
           return true;
         }
-        // A stale pre-Phase 3 process is bound to this port; move cleanly to the next port.
+        // A stale pre-Phase 4 process is bound to this port; move cleanly to the next port.
         activePythonPort += 1;
         if (pythonProc) {
           try {
@@ -136,15 +137,36 @@ async function proxyToPython(req: Request, res: Response): Promise<void> {
       method,
       headers,
       body,
-      signal: AbortSignal.timeout(15000),
+      signal: req.originalUrl.startsWith('/api/live/stream') ? undefined : AbortSignal.timeout(15000),
     });
 
     const contentType = upstream.headers.get('content-type') || 'application/json';
+    if (contentType.includes('text/event-stream') && upstream.body) {
+      res.status(upstream.status);
+      res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Connection', 'keep-alive');
+      res.flushHeaders();
+      const reader = upstream.body.getReader();
+      req.on('close', () => {
+        void reader.cancel().catch(() => {});
+      });
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        res.write(Buffer.from(value));
+      }
+      res.end();
+      return;
+    }
+
     const text = await upstream.text();
     res.status(upstream.status).setHeader('Content-Type', contentType).send(text);
   } catch (err) {
     const message = err instanceof Error ? err.message : 'Python hub unavailable';
-    res.status(502).json({ detail: `Python broker hub unreachable: ${message}` });
+    if (!res.headersSent) {
+      res.status(502).json({ detail: `Python broker hub unreachable: ${message}` });
+    }
   }
 }
 
@@ -180,6 +202,45 @@ async function bootstrap(): Promise<void> {
 
   const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`AlgoDesk server listening on http://0.0.0.0:${PORT}`);
+  });
+
+  // Tunnel /ws/* WebSocket upgrades directly to the Python broker hub (FastAPI or stdlib WS)
+  server.on('upgrade', (req, socket, head) => {
+    const reqUrl = req.url || '/';
+    if (!reqUrl.startsWith('/ws/')) {
+      return;
+    }
+    void (async () => {
+      try {
+        await ensurePythonReady();
+        const upstream = net.createConnection({ host: '127.0.0.1', port: activePythonPort }, () => {
+          const rawHeaders: string[] = [];
+          for (const [k, v] of Object.entries(req.headers)) {
+            if (v === undefined) continue;
+            if (Array.isArray(v)) {
+              for (const val of v) rawHeaders.push(`${k}: ${val}`);
+            } else {
+              rawHeaders.push(`${k}: ${v}`);
+            }
+          }
+          const reqHead = `GET ${reqUrl} HTTP/${req.httpVersion || '1.1'}\r\n${rawHeaders.join('\r\n')}\r\n\r\n`;
+          upstream.write(reqHead);
+          if (head && head.length > 0) {
+            upstream.write(head);
+          }
+          socket.pipe(upstream);
+          upstream.pipe(socket);
+        });
+        upstream.on('error', () => {
+          socket.destroy();
+        });
+        socket.on('error', () => {
+          upstream.destroy();
+        });
+      } catch {
+        socket.destroy();
+      }
+    })();
   });
 
   const shutdown = () => {

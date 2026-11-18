@@ -67,12 +67,38 @@ def _parse_iso_date(raw: Optional[str], default: Optional[date] = None) -> date:
 
 def _normalize_symbol(raw_symbol: str) -> str:
     sym = (raw_symbol or "").strip().upper()
-    for prefix in ("NSE:", "BSE:", "MCX:", "NSE_EQ|", "BSE_EQ|"):
+    for prefix in (
+        "NSE:",
+        "BSE:",
+        "NFO:",
+        "BFO:",
+        "MCX:",
+        "NSE_EQ|",
+        "BSE_EQ|",
+        "NSE_FO|",
+        "BSE_FO|",
+        "MCX_FO|",
+        "NSE_INDEX|",
+        "BSE_INDEX|",
+    ):
         if sym.startswith(prefix):
             sym = sym[len(prefix):].strip()
     if sym.endswith(".NS") or sym.endswith(".BO"):
         sym = sym[:-3].strip()
     return sym
+
+
+def _is_fno_contract(symbol: str, exchange: str, instrument_type: Optional[str] = None) -> bool:
+    ex = (exchange or "").strip().upper()
+    if ex in {"NFO", "BFO", "MCX", "NSE_FO", "BSE_FO", "MCX_FO", "NCD", "BCD"}:
+        return True
+    it = (instrument_type or "").strip().upper()
+    if it and (it.startswith("FUT") or it.startswith("OPT") or it in {"CE", "PE", "FO", "FNO", "F&O"}):
+        return True
+    sym = (symbol or "").strip().upper()
+    if len(sym) > 5 and any(ch.isdigit() for ch in sym) and (sym.endswith("FUT") or sym.endswith("CE") or sym.endswith("PE")):
+        return True
+    return False
 
 
 def compute_missing_date_ranges(
@@ -228,13 +254,38 @@ class HistoricalDataManager:
         timeframe: str,
         chunk_start: date,
         chunk_end: date,
+        instrument_type: Optional[str] = None,
+        instrument_key: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         if provider == "upstox":
-            return self._fetch_upstox_chunk(symbol, exchange, timeframe, chunk_start, chunk_end)
+            return self._fetch_upstox_chunk(
+                symbol,
+                exchange,
+                timeframe,
+                chunk_start,
+                chunk_end,
+                instrument_type=instrument_type,
+                instrument_key=instrument_key,
+            )
         if provider == "zerodha":
-            return self._fetch_zerodha_chunk(symbol, exchange, timeframe, chunk_start, chunk_end)
+            return self._fetch_zerodha_chunk(
+                symbol,
+                exchange,
+                timeframe,
+                chunk_start,
+                chunk_end,
+                instrument_type=instrument_type,
+                instrument_key=instrument_key,
+            )
         if provider == "yfinance":
-            return self._fetch_yahoo_chunk(symbol, exchange, timeframe, chunk_start, chunk_end)
+            return self._fetch_yahoo_chunk(
+                symbol,
+                exchange,
+                timeframe,
+                chunk_start,
+                chunk_end,
+                instrument_type=instrument_type,
+            )
         raise ValueError(f"Unsupported historical data provider '{provider}'.")
 
     def _fetch_upstox_chunk(
@@ -244,20 +295,36 @@ class HistoricalDataManager:
         timeframe: str,
         chunk_start: date,
         chunk_end: date,
+        instrument_type: Optional[str] = None,
+        instrument_key: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
-        ikey = instrument_index.resolve_key(symbol, broker_id="upstox", exchange=exchange)
+        ikey = (
+            instrument_key.strip()
+            if instrument_key and "|" in instrument_key
+            else instrument_index.resolve_key(
+                symbol,
+                broker_id="upstox",
+                exchange=exchange,
+                instrument_type=instrument_type,
+            )
+        )
         if not ikey:
             sync_meta = instrument_index.stats().get("sync_meta", {})
             if "upstox" not in sync_meta:
                 try:
                     instrument_index.sync_upstox_master()
-                    ikey = instrument_index.resolve_key(symbol, broker_id="upstox", exchange=exchange)
+                    ikey = instrument_index.resolve_key(
+                        symbol,
+                        broker_id="upstox",
+                        exchange=exchange,
+                        instrument_type=instrument_type,
+                    )
                 except Exception:
                     pass
         if not ikey:
             raise ValueError(
-                f"Symbol '{symbol}' ({exchange}) was not found in Upstox instruments. "
-                "Click Sync Upstox Master or verify the exact NSE/BSE trading symbol."
+                f"Contract '{symbol}' ({exchange}) was not found in Upstox instruments. "
+                "Click Sync Upstox Master or select the exact contract from the F&O Finder."
             )
         interval = VALID_TIMEFRAMES[timeframe]["upstox"]
         encoded_key = urllib.parse.quote(ikey, safe="")
@@ -311,24 +378,40 @@ class HistoricalDataManager:
         timeframe: str,
         chunk_start: date,
         chunk_end: date,
+        instrument_type: Optional[str] = None,
+        instrument_key: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         api_key = zerodha_auth.api_key
         if not api_key:
             raise ValueError("Zerodha API credentials required for Kite historical download.")
         token = zerodha_auth.get_valid_token()
-        inst_token = instrument_index.resolve_key(symbol, broker_id="zerodha", exchange=exchange)
+        inst_token = (
+            instrument_key.strip()
+            if instrument_key and instrument_key.strip().isdigit()
+            else instrument_index.resolve_key(
+                symbol,
+                broker_id="zerodha",
+                exchange=exchange,
+                instrument_type=instrument_type,
+            )
+        )
         if not inst_token:
             sync_meta = instrument_index.stats().get("sync_meta", {})
             if "zerodha" not in sync_meta:
                 try:
                     instrument_index.sync_zerodha_master()
-                    inst_token = instrument_index.resolve_key(symbol, broker_id="zerodha", exchange=exchange)
+                    inst_token = instrument_index.resolve_key(
+                        symbol,
+                        broker_id="zerodha",
+                        exchange=exchange,
+                        instrument_type=instrument_type,
+                    )
                 except Exception:
                     pass
         if not inst_token:
             raise ValueError(
-                f"Symbol '{symbol}' ({exchange}) was not found in Zerodha Kite instruments. "
-                "Click Sync Zerodha Master or verify the exact trading symbol."
+                f"Contract '{symbol}' ({exchange}) was not found in Zerodha Kite instruments. "
+                "Click Sync Zerodha Master or select the exact contract from the F&O Finder."
             )
 
         interval = VALID_TIMEFRAMES[timeframe]["zerodha"]
@@ -384,8 +467,14 @@ class HistoricalDataManager:
         timeframe: str,
         chunk_start: date,
         chunk_end: date,
+        instrument_type: Optional[str] = None,
     ) -> List[Dict[str, Any]]:
         clean = symbol.strip().upper()
+        if _is_fno_contract(clean, exchange, instrument_type):
+            raise ValueError(
+                "Yahoo Finance does not provide Indian F&O (Futures/Options) historical contracts. "
+                "Select Upstox or Zerodha Kite as Source and ensure your broker instrument master is synced."
+            )
         if clean in _YAHOO_SYMBOL_OVERRIDES:
             ticker = _YAHOO_SYMBOL_OVERRIDES[clean]
         elif "." in clean or clean.startswith("^"):
@@ -478,6 +567,8 @@ class HistoricalDataManager:
         from_date: Optional[str] = None,
         to_date: Optional[str] = None,
         provider: Optional[str] = None,
+        instrument_type: Optional[str] = None,
+        instrument_key: Optional[str] = None,
         fetcher: Optional[Callable[[str, str, str, date, date], List[Dict[str, Any]]]] = None,
     ) -> Dict[str, Any]:
         """
@@ -522,6 +613,11 @@ class HistoricalDataManager:
         fetched_ranges: List[Dict[str, str]] = []
 
         if missing_gaps:
+            if fetcher is None and eff_provider == "yfinance" and _is_fno_contract(clean_sym, clean_exch, instrument_type):
+                raise ValueError(
+                    "Yahoo Finance does not support Indian Futures & Options contracts. "
+                    "Switch Source to Upstox or Zerodha Kite to download F&O data."
+                )
             now_ist_str = datetime.now(tz=IST_TZ).isoformat(timespec="seconds")
             all_candles: List[Dict[str, Any]] = []
             dates_with_data: Set[str] = set()
@@ -535,7 +631,14 @@ class HistoricalDataManager:
                         chunk_rows = fetcher(clean_sym, clean_exch, tf, c_start, c_end)
                     else:
                         chunk_rows = self._fetch_chunk_from_provider(
-                            eff_provider, clean_sym, clean_exch, tf, c_start, c_end
+                            eff_provider,
+                            clean_sym,
+                            clean_exch,
+                            tf,
+                            c_start,
+                            c_end,
+                            instrument_type=instrument_type,
+                            instrument_key=instrument_key,
                         )
 
                     for item in chunk_rows:
@@ -680,7 +783,7 @@ class HistoricalDataManager:
                 params,
             ).fetchone()
             last_row = conn.execute(
-                f"SELECT close FROM candles WHERE {where_sql} ORDER BY ts_ist DESC LIMIT 1",
+                f"SELECT close, oi FROM candles WHERE {where_sql} ORDER BY ts_ist DESC LIMIT 1",
                 params,
             ).fetchone()
 
@@ -733,6 +836,7 @@ class HistoricalDataManager:
 
         first_open = float(first_row["open"]) if first_row else None
         latest_close = float(last_row["close"]) if last_row else None
+        latest_oi = int(last_row["oi"] or 0) if last_row else 0
         change_pct = (
             round(((latest_close - first_open) / first_open) * 100.0, 2)
             if (first_open and latest_close is not None and first_open != 0)
@@ -755,6 +859,7 @@ class HistoricalDataManager:
                 "latest_close": round(latest_close, 4) if latest_close is not None else None,
                 "change_pct": change_pct,
                 "total_volume": int(agg["total_volume"] or 0),
+                "latest_oi": latest_oi,
             },
             "rows": rows_out,
         }

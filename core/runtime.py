@@ -18,6 +18,8 @@ from typing import Any, Dict, List, Optional
 
 from broker.base import BrokerBase
 from broker.registry import BrokerRegistry
+from core.audit import AuditTrail, audit_trail
+from core.preflight import KillSwitchController, kill_switch_controller
 
 logger = logging.getLogger(__name__)
 
@@ -103,17 +105,49 @@ class CanonicalSessionManager:
         order_manager: Optional[CanonicalOrderManager] = None,
         risk_engine: Optional[Any] = None,
         session_store: Optional[Any] = None,
+        kill_switch: Optional[KillSwitchController] = None,
+        audit: Optional[AuditTrail] = None,
     ) -> None:
         self.state = state
         self.broker = broker
         self.order_manager = order_manager or CanonicalOrderManager(broker=broker)
         self.risk_engine = risk_engine
         self.session_store = session_store
+        self._kill_switch = kill_switch or kill_switch_controller
+        self._audit = audit or audit_trail
 
     def submit_signal_order(self, req: OrderRequest) -> Any:
-        if self.state.kill_switch_engaged:
+        if self.state.kill_switch_engaged or self._kill_switch.is_engaged():
+            try:
+                self._audit.log(
+                    event_type="ORDER_BLOCKED_KILL_SWITCH",
+                    actor="session_manager",
+                    payload={
+                        "trading_symbol": req.trading_symbol,
+                        "exchange": req.exchange,
+                        "transaction_type": req.transaction_type,
+                        "quantity": req.quantity,
+                    },
+                )
+            except Exception:
+                pass
             raise RuntimeError("Trading kill switch is engaged; order rejected.")
-        return self.order_manager.place(req)
+        res = self.order_manager.place(req)
+        try:
+            self._audit.log(
+                event_type="ORDER_SUBMITTED",
+                actor="session_manager",
+                payload={
+                    "trading_symbol": req.trading_symbol,
+                    "exchange": req.exchange,
+                    "transaction_type": req.transaction_type,
+                    "quantity": req.quantity,
+                    "order_type": req.order_type,
+                },
+            )
+        except Exception:
+            pass
+        return res
 
 
 class LiveBotEngine:
@@ -125,6 +159,8 @@ class LiveBotEngine:
         data_connection_id: str = "upstox",
         session_store: Optional[Any] = None,
         risk_engine: Optional[Any] = None,
+        kill_switch: Optional[KillSwitchController] = None,
+        audit: Optional[AuditTrail] = None,
     ) -> None:
         self.state = TradingState(
             active_trading_broker=trading_broker_id,
@@ -138,6 +174,8 @@ class LiveBotEngine:
             order_manager=self.order_manager,
             risk_engine=risk_engine,
             session_store=session_store,
+            kill_switch=kill_switch,
+            audit=audit,
         )
 
 
