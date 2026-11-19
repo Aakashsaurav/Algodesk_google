@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Any, Dict, List
 
 from indicators.toolkit import IndicatorToolkit
-from screener.base import BaseScreen, ParamSpec, ScreenMatch
+from screener.base import BaseScreen, ColumnSpec, ParamSpec, ScreenMatch
 
 
 class OversoldReboundScreen(BaseScreen):
@@ -24,6 +24,19 @@ class OversoldReboundScreen(BaseScreen):
         ParamSpec("rsi_rebound_max", "Rebound Bounce RSI <= ", "float", 44.0, min_val=20.0, max_val=60.0, step=1.0),
         ParamSpec("require_positive_bounce", "Require Positive Day", "bool", False),
     ]
+
+    def required_bars(self, params: Dict[str, Any]) -> int:
+        rsi_p = int(params.get("rsi_period", 14))
+        return max(45, rsi_p * 3 + 15)
+
+    def get_columns(self, params: Dict[str, Any]) -> List[ColumnSpec]:
+        return [
+            ColumnSpec("rsi14", f"RSI ({int(params.get('rsi_period', 14))})", "number", 1),
+            ColumnSpec("atr_pct", "ATR%", "pct", 2),
+            ColumnSpec("ema20", "EMA 20", "price", 2),
+            ColumnSpec("vol_ratio", "Vol Ratio", "ratio", 2),
+            ColumnSpec("supertrend", "Supertrend", "badge", 0, "left"),
+        ]
 
     def evaluate(
         self,

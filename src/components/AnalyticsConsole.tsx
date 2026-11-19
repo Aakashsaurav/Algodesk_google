@@ -23,13 +23,30 @@ interface ParamSpec {
   description?: string;
 }
 
+interface ColumnSpec {
+  key: string;
+  label: string;
+  fmt: 'price' | 'number' | 'pct' | 'signed_pct' | 'ratio' | 'badge' | 'text';
+  decimals: number;
+  align: 'left' | 'right';
+}
+
+interface TimeframeMeta {
+  id: string;
+  label: string;
+  base: string;
+  resampled: boolean;
+}
+
 interface ScreenMeta {
   id: string;
   name: string;
   description: string;
   category: string;
   min_bars: number;
+  required_bars?: number;
   params: ParamSpec[];
+  columns?: ColumnSpec[];
 }
 
 interface StrategyMeta {
@@ -50,6 +67,7 @@ interface AnalyticsMetaPayload {
   screens: ScreenMeta[];
   strategy_specs: StrategyMeta[];
   universes: UniverseMeta[];
+  timeframes?: TimeframeMeta[];
   indicator_backends: Record<string, boolean>;
   storage: {
     configured_mode: string;
@@ -72,19 +90,12 @@ interface ScreenerRow {
   last_date: string;
   close: number;
   change_pct: number;
-  ema20: number | null;
-  ema50: number | null;
-  rsi14: number | null;
-  atr_pct: number | null;
-  vol_ratio: number;
-  contraction_ratio: number | null;
-  dist_50d_high_pct: number | null;
-  supertrend: string;
   signal: string;
   tags: string[];
   score: number;
   matched: boolean;
   api_calls: number;
+  [key: string]: unknown;
 }
 
 interface ScreenerResultPayload {
@@ -92,13 +103,19 @@ interface ScreenerResultPayload {
   screen_name?: string;
   preset: string;
   preset_label: string;
+  columns?: ColumnSpec[];
   universe: string;
   universe_label: string;
   as_of_date: string;
+  from_date?: string;
   is_historical_as_of?: boolean;
   provider: string;
   exchange: string;
   timeframe: string;
+  base_timeframe?: string;
+  resampled?: boolean;
+  required_bars?: number;
+  lookback_days?: number;
   storage_backend?: string;
   scanned_count: number;
   evaluated_count: number;
@@ -207,6 +224,64 @@ interface AnalyticsConsoleProps {
 
 const DEFAULT_WATCHLIST = 'RELIANCE, TCS, INFY, HDFCBANK, ICICIBANK, SBIN, BHARTIARTL, ITC, LT, AXISBANK';
 
+const FALLBACK_TIMEFRAMES: TimeframeMeta[] = [
+  { id: '1day', label: '1 Day', base: '1day', resampled: false },
+  { id: '1week', label: '1 Week', base: '1day', resampled: true },
+  { id: '1month', label: '1 Month', base: '1day', resampled: true },
+  { id: '1minute', label: '1 Min', base: '1minute', resampled: false },
+  { id: '5minute', label: '5 Min', base: '1minute', resampled: true },
+  { id: '15minute', label: '15 Min', base: '1minute', resampled: true },
+  { id: '30minute', label: '30 Min', base: '1minute', resampled: true },
+  { id: '60minute', label: '60 Min (1H)', base: '1minute', resampled: true },
+];
+
+const DEFAULT_FALLBACK_COLUMNS: ColumnSpec[] = [
+  { key: 'ema20', label: 'EMA 20', fmt: 'price', decimals: 2, align: 'right' },
+  { key: 'ema50', label: 'EMA 50', fmt: 'price', decimals: 2, align: 'right' },
+  { key: 'rsi14', label: 'RSI (14)', fmt: 'number', decimals: 1, align: 'right' },
+  { key: 'atr_pct', label: 'ATR%', fmt: 'pct', decimals: 2, align: 'right' },
+  { key: 'vol_ratio', label: 'Vol Ratio', fmt: 'ratio', decimals: 2, align: 'right' },
+  { key: 'supertrend', label: 'Supertrend', fmt: 'badge', decimals: 0, align: 'left' },
+];
+
+function formatDynamicCell(value: unknown, col: ColumnSpec): { text: string; toneClass: string } {
+  if (value === null || value === undefined || value === '') {
+    return { text: '—', toneClass: 'text-slate-500' };
+  }
+  if (col.fmt === 'badge') {
+    const raw = String(value).toUpperCase();
+    const toneClass =
+      raw === 'BULL' || raw === 'UP' || raw === 'STRONG'
+        ? 'font-semibold text-emerald-400'
+        : raw === 'BEAR' || raw === 'DOWN'
+          ? 'font-semibold text-red-400'
+          : 'text-slate-400';
+    return { text: raw, toneClass };
+  }
+  if (col.fmt === 'text') {
+    return { text: String(value), toneClass: 'text-slate-300' };
+  }
+  const num = Number(value);
+  if (Number.isNaN(num)) {
+    return { text: String(value), toneClass: 'text-slate-300' };
+  }
+  const dec = Number.isFinite(col.decimals) ? col.decimals : 2;
+  if (col.fmt === 'signed_pct') {
+    const sign = num >= 0 ? '+' : '';
+    return {
+      text: `${sign}${num.toFixed(dec)}%`,
+      toneClass: num >= 0 ? 'text-emerald-400' : 'text-red-400',
+    };
+  }
+  if (col.fmt === 'pct') {
+    return { text: `${num.toFixed(dec)}%`, toneClass: 'text-slate-300' };
+  }
+  if (col.fmt === 'ratio') {
+    return { text: `${num.toFixed(dec)}x`, toneClass: num >= 1.2 ? 'text-sky-300' : 'text-slate-300' };
+  }
+  return { text: num.toFixed(dec), toneClass: 'text-slate-200' };
+}
+
 function formatInr(val: number): string {
   return `₹${val.toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
@@ -286,7 +361,6 @@ export function AnalyticsConsole({
   const [scSymbols, setScSymbols] = useState<string>(DEFAULT_WATCHLIST);
   const [scExchange, setScExchange] = useState<string>('NSE');
   const [scTimeframe, setScTimeframe] = useState<string>('1day');
-  const [scLookback, setScLookback] = useState<number>(120);
   const [scAsOfDate, setScAsOfDate] = useState<string>('');
   const [scScreenId, setScScreenId] = useState<string>('all_metrics');
   const [scParams, setScParams] = useState<Record<string, number | boolean | string>>({});
@@ -444,7 +518,6 @@ export function AnalyticsConsole({
           universe: scUniverse,
           exchange: scExchange,
           timeframe: scTimeframe,
-          lookback_days: Number(scLookback) || 120,
           as_of_date: scAsOfDate || null,
           screen_id: scScreenId,
           preset: scScreenId,
@@ -794,7 +867,7 @@ export function AnalyticsConsole({
           <div className="grid grid-cols-2 items-end gap-3 sm:grid-cols-4">
             <div>
               <label htmlFor="sc-tf" className="mb-1 block text-xs text-slate-400">
-                Timeframe
+                Timeframe (API: 1m / 1d only)
               </label>
               <select
                 id="sc-tf"
@@ -802,24 +875,20 @@ export function AnalyticsConsole({
                 onChange={(e) => setScTimeframe(e.target.value)}
                 className="min-h-[38px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-1.5 text-xs text-slate-100 focus:border-sky-400 focus:outline-none"
               >
-                <option value="1day">1 Day</option>
-                <option value="30minute">30 Min</option>
+                {(meta?.timeframes || FALLBACK_TIMEFRAMES).map((tf) => (
+                  <option key={tf.id} value={tf.id}>
+                    {tf.label}
+                    {tf.resampled ? ` (from ${tf.base === '1minute' ? '1m' : '1d'})` : ''}
+                  </option>
+                ))}
               </select>
             </div>
 
             <div>
-              <label htmlFor="sc-lookback" className="mb-1 block text-xs text-slate-400">
-                Lookback (Days)
-              </label>
-              <input
-                id="sc-lookback"
-                type="number"
-                min={30}
-                max={1095}
-                value={scLookback}
-                onChange={(e) => setScLookback(Number(e.target.value))}
-                className="min-h-[38px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-1.5 font-mono text-xs text-slate-100 focus:border-sky-400 focus:outline-none"
-              />
+              <span className="mb-1 block text-xs text-slate-400">Indicator Lookback Window</span>
+              <div className="flex min-h-[38px] items-center rounded-lg border border-slate-800 bg-[#0b1120]/80 px-3 font-mono text-[11px] text-slate-300">
+                Auto ({activeScreenMeta?.required_bars ?? 125} bars ≤ As-Of)
+              </div>
             </div>
 
             <div>
@@ -959,9 +1028,14 @@ export function AnalyticsConsole({
                 <span>
                   Matched {scResult.matched_count} of {scResult.evaluated_count} evaluated ({scResult.universe_label} · {scResult.screen_name || scResult.preset_label}) · As Of{' '}
                   <strong className="text-slate-200">{scResult.as_of_date}</strong>
+                  {scResult.from_date ? ` (Auto window: ${scResult.from_date} → ${scResult.as_of_date})` : ''}
                 </span>
                 <span>
-                  Source: {scResult.provider.toUpperCase()} · API Calls: {scResult.api_calls_made} · Cached Days Skipped: {scResult.existing_days_skipped}
+                  Source: {scResult.provider.toUpperCase()}
+                  {scResult.resampled && scResult.base_timeframe
+                    ? ` · ${scResult.timeframe} resampled from ${scResult.base_timeframe}`
+                    : ` · ${scResult.timeframe}`}
+                  {' · '}API Calls: {scResult.api_calls_made} · Cached Days Skipped: {scResult.existing_days_skipped}
                 </span>
               </div>
 
@@ -970,63 +1044,80 @@ export function AnalyticsConsole({
                   No symbols matched &ldquo;{scResult.preset_label}&rdquo; as of {scResult.as_of_date}. Try &ldquo;All Watchlist Metrics&rdquo; or adjust indicator parameters above.
                 </div>
               ) : (
-                <div className="max-h-[360px] overflow-auto rounded-lg border border-slate-800">
-                  <table className="w-full border-collapse text-left font-mono text-xs tabular-nums">
-                    <thead className="sticky top-0 bg-[#0b1120] text-slate-400">
-                      <tr className="border-b border-slate-800">
-                        <th className="px-3 py-2.5 font-semibold">Symbol</th>
-                        <th className="px-3 py-2.5 text-right font-semibold">Close</th>
-                        <th className="px-3 py-2.5 text-right font-semibold">Chg%</th>
-                        <th className="px-3 py-2.5 text-right font-semibold">EMA Fast</th>
-                        <th className="px-3 py-2.5 text-right font-semibold">EMA Slow</th>
-                        <th className="px-3 py-2.5 text-right font-semibold">RSI</th>
-                        <th className="px-3 py-2.5 text-right font-semibold">ATR%</th>
-                        <th className="px-3 py-2.5 text-right font-semibold">Vol Ratio</th>
-                        <th className="px-3 py-2.5 font-semibold">Signal</th>
-                        <th className="px-3 py-2.5 text-right font-semibold">Action</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-slate-800/80 bg-[#111827] text-slate-200">
-                      {scResult.results.map((r) => (
-                        <tr key={`${r.exchange}-${r.symbol}`} className="hover:bg-slate-900/50">
-                          <td className="px-3 py-2 font-semibold text-slate-100">
-                            {r.symbol}
-                            <span className="ml-1.5 text-[10px] font-normal text-slate-500">{r.last_date}</span>
-                          </td>
-                          <td className="px-3 py-2 text-right">{r.close.toFixed(2)}</td>
-                          <td className={`px-3 py-2 text-right ${r.change_pct >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
-                            {r.change_pct >= 0 ? '+' : ''}
-                            {r.change_pct.toFixed(2)}%
-                          </td>
-                          <td className="px-3 py-2 text-right text-slate-300">{r.ema20 !== null && r.ema20 !== undefined ? r.ema20.toFixed(2) : '—'}</td>
-                          <td className="px-3 py-2 text-right text-slate-400">{r.ema50 !== null && r.ema50 !== undefined ? r.ema50.toFixed(2) : '—'}</td>
-                          <td className="px-3 py-2 text-right">{r.rsi14 !== null && r.rsi14 !== undefined ? r.rsi14.toFixed(1) : '—'}</td>
-                          <td className="px-3 py-2 text-right text-slate-400">{r.atr_pct !== null && r.atr_pct !== undefined ? `${r.atr_pct.toFixed(2)}%` : '—'}</td>
-                          <td className="px-3 py-2 text-right">{Number(r.vol_ratio ?? 1).toFixed(2)}x</td>
-                          <td className="px-3 py-2">
-                            <span className={r.score >= 30 ? 'font-semibold text-sky-400' : 'text-slate-400'}>
-                              {r.signal}
-                            </span>
-                          </td>
-                          <td className="px-3 py-2 text-right">
-                            <button
-                              type="button"
-                              onClick={() => {
-                                setBtSymbol(r.symbol);
-                                setBtExchange(r.exchange);
-                                setActiveTab('backtest');
-                                void handleRunBacktest(r.symbol, r.exchange);
-                              }}
-                              className="rounded border border-slate-700 bg-[#0b1120] px-2.5 py-1 font-sans text-[11px] font-semibold text-sky-300 hover:border-sky-400"
-                            >
-                              Backtest →
-                            </button>
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
+                (() => {
+                  const activeCols =
+                    scResult.columns && scResult.columns.length > 0
+                      ? scResult.columns
+                      : DEFAULT_FALLBACK_COLUMNS;
+                  return (
+                    <div className="max-h-[360px] overflow-auto rounded-lg border border-slate-800">
+                      <table className="w-full border-collapse text-left font-mono text-xs tabular-nums">
+                        <thead className="sticky top-0 bg-[#0b1120] text-slate-400">
+                          <tr className="border-b border-slate-800">
+                            <th className="px-3 py-2.5 font-semibold">Symbol</th>
+                            <th className="px-3 py-2.5 text-right font-semibold">Close</th>
+                            <th className="px-3 py-2.5 text-right font-semibold">Chg%</th>
+                            {activeCols.map((col) => (
+                              <th
+                                key={col.key}
+                                className={`px-3 py-2.5 font-semibold ${col.align === 'left' ? 'text-left' : 'text-right'}`}
+                              >
+                                {col.label}
+                              </th>
+                            ))}
+                            <th className="px-3 py-2.5 font-semibold">Signal</th>
+                            <th className="px-3 py-2.5 text-right font-semibold">Action</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-800/80 bg-[#111827] text-slate-200">
+                          {scResult.results.map((r) => (
+                            <tr key={`${r.exchange}-${r.symbol}`} className="hover:bg-slate-900/50">
+                              <td className="px-3 py-2 font-semibold text-slate-100">
+                                {r.symbol}
+                                <span className="ml-1.5 text-[10px] font-normal text-slate-500">{r.last_date}</span>
+                              </td>
+                              <td className="px-3 py-2 text-right">{r.close.toFixed(2)}</td>
+                              <td className={`px-3 py-2 text-right ${r.change_pct >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+                                {r.change_pct >= 0 ? '+' : ''}
+                                {r.change_pct.toFixed(2)}%
+                              </td>
+                              {activeCols.map((col) => {
+                                const cell = formatDynamicCell(r[col.key], col);
+                                return (
+                                  <td
+                                    key={col.key}
+                                    className={`px-3 py-2 ${col.align === 'left' ? 'text-left' : 'text-right'} ${cell.toneClass}`}
+                                  >
+                                    {cell.text}
+                                  </td>
+                                );
+                              })}
+                              <td className="px-3 py-2">
+                                <span className={r.score >= 30 ? 'font-semibold text-sky-400' : 'text-slate-400'}>
+                                  {r.signal}
+                                </span>
+                              </td>
+                              <td className="px-3 py-2 text-right">
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setBtSymbol(r.symbol);
+                                    setBtExchange(r.exchange);
+                                    setActiveTab('backtest');
+                                    void handleRunBacktest(r.symbol, r.exchange);
+                                  }}
+                                  className="rounded border border-slate-700 bg-[#0b1120] px-2.5 py-1 font-sans text-[11px] font-semibold text-sky-300 hover:border-sky-400"
+                                >
+                                  Backtest →
+                                </button>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  );
+                })()
               )}
 
               {scResult.errors && scResult.errors.length > 0 && (
@@ -1106,8 +1197,12 @@ export function AnalyticsConsole({
                 onChange={(e) => setBtTimeframe(e.target.value)}
                 className="min-h-[40px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 text-xs text-slate-100 focus:border-sky-400 focus:outline-none"
               >
-                <option value="1day">1 Day</option>
-                <option value="30minute">30 Min</option>
+                {(meta?.timeframes || FALLBACK_TIMEFRAMES).map((tf) => (
+                  <option key={tf.id} value={tf.id}>
+                    {tf.label}
+                    {tf.resampled ? ` (from ${tf.base === '1minute' ? '1m' : '1d'})` : ''}
+                  </option>
+                ))}
               </select>
             </div>
 

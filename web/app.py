@@ -89,7 +89,7 @@ class ScreenerRequest(BaseModel):
     universe: str = "CUSTOM"
     exchange: str = "NSE"
     timeframe: str = "1day"
-    lookback_days: int = 120
+    lookback_days: Optional[int] = None
     as_of_date: Optional[str] = None
     screen_id: Optional[str] = None
     preset: str = "all_metrics"
@@ -569,6 +569,14 @@ def create_app() -> FastAPI:
     @app.get("/api/analytics/meta")
     def api_analytics_meta() -> dict:
         return hub_service.get_analytics_metadata()
+
+    @app.get("/api/analytics/indicators/verify")
+    def api_analytics_indicators_verify(
+        symbol: Optional[str] = Query(default=None),
+        exchange: str = Query(default="NSE"),
+        timeframe: str = Query(default="1day"),
+    ) -> dict:
+        return hub_service.verify_indicators(symbol=symbol, exchange=exchange, timeframe=timeframe)
 
     @app.post("/api/analytics/reload")
     def api_analytics_reload() -> dict:

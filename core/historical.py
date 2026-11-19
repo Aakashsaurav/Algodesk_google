@@ -56,27 +56,11 @@ def _parquet_engine() -> Optional[Tuple[Any, Any, Any]]:
     except ImportError:
         return None
 
-VALID_TIMEFRAMES = {
-    "1day": {
-        "label": "1 Day",
-        "upstox": "day",
-        "upstox_unit": "days",
-        "upstox_interval": "1",
-        "zerodha": "day",
-        "yahoo": "1d",
-        "max_chunk_days": 365,
-    },
-    "30minute": {
-        "label": "30 Min",
-        "upstox": "30minute",
-        "upstox_unit": "minutes",
-        "upstox_interval": "30",
-        "zerodha": "30minute",
-        "yahoo": "30m",
-        "max_chunk_days": 30,
-    },
+VALID_TIMEFRAMES: Dict[str, Dict[str, Any]] = {
     "1minute": {
         "label": "1 Min",
+        "base": "1minute",
+        "minutes": 1,
         "upstox": "1minute",
         "upstox_unit": "minutes",
         "upstox_interval": "1",
@@ -84,7 +68,192 @@ VALID_TIMEFRAMES = {
         "yahoo": "1m",
         "max_chunk_days": 7,
     },
+    "3minute": {"label": "3 Min", "base": "1minute", "minutes": 3},
+    "5minute": {"label": "5 Min", "base": "1minute", "minutes": 5},
+    "10minute": {"label": "10 Min", "base": "1minute", "minutes": 10},
+    "15minute": {"label": "15 Min", "base": "1minute", "minutes": 15},
+    "30minute": {"label": "30 Min", "base": "1minute", "minutes": 30},
+    "60minute": {"label": "60 Min (1H)", "base": "1minute", "minutes": 60},
+    "75minute": {"label": "75 Min", "base": "1minute", "minutes": 75},
+    "120minute": {"label": "2 Hour", "base": "1minute", "minutes": 120},
+    "1day": {
+        "label": "1 Day",
+        "base": "1day",
+        "minutes": None,
+        "upstox": "day",
+        "upstox_unit": "days",
+        "upstox_interval": "1",
+        "zerodha": "day",
+        "yahoo": "1d",
+        "max_chunk_days": 365,
+    },
+    "1week": {"label": "1 Week", "base": "1day", "minutes": None},
+    "1month": {"label": "1 Month", "base": "1day", "minutes": None},
 }
+
+_TIMEFRAME_ALIASES: Dict[str, str] = {
+    "1m": "1minute",
+    "1min": "1minute",
+    "minute": "1minute",
+    "3m": "3minute",
+    "3min": "3minute",
+    "5m": "5minute",
+    "5min": "5minute",
+    "10m": "10minute",
+    "10min": "10minute",
+    "15m": "15minute",
+    "15min": "15minute",
+    "30m": "30minute",
+    "30min": "30minute",
+    "60m": "60minute",
+    "60min": "60minute",
+    "1h": "60minute",
+    "1hr": "60minute",
+    "1hour": "60minute",
+    "75m": "75minute",
+    "75min": "75minute",
+    "120m": "120minute",
+    "2h": "120minute",
+    "2hour": "120minute",
+    "1d": "1day",
+    "d": "1day",
+    "day": "1day",
+    "daily": "1day",
+    "1w": "1week",
+    "w": "1week",
+    "week": "1week",
+    "weekly": "1week",
+    "1mo": "1month",
+    "mo": "1month",
+    "month": "1month",
+    "monthly": "1month",
+}
+
+
+def normalize_timeframe(raw_timeframe: Optional[str]) -> str:
+    tf = (raw_timeframe or "1day").strip().lower()
+    tf = _TIMEFRAME_ALIASES.get(tf, tf)
+    if tf not in VALID_TIMEFRAMES:
+        raise ValueError(
+            f"Invalid timeframe '{raw_timeframe}'. Choose from: {', '.join(VALID_TIMEFRAMES.keys())}"
+        )
+    return tf
+
+
+def resolve_base_timeframe(raw_timeframe: Optional[str]) -> str:
+    """
+    Canonical download/storage policy:
+    - Any sub-day timeframe (< 1 day) maps to '1minute'
+    - '1day' and any multi-day timeframe (>= 1 day) maps to '1day'
+    External broker/Yahoo APIs are ONLY ever called for '1minute' or '1day'.
+    """
+    tf = normalize_timeframe(raw_timeframe)
+    return str(VALID_TIMEFRAMES[tf]["base"])
+
+
+def resample_ohlcv_rows(
+    rows: List[Dict[str, Any]],
+    timeframe: str,
+    *,
+    exchange: str = "NSE",
+) -> List[Dict[str, Any]]:
+    """
+    Resample canonical '1minute' or '1day' OHLCV+OI rows into any derived timeframe.
+
+    Rules:
+    - Intraday (3m/5m/10m/15m/30m/60m/75m/120m): Anchored to Indian market open
+      (09:15 IST for NSE/BSE/NFO/BFO; 09:00 IST for MCX).
+    - Multi-day (1week, 1month): Grouped by ISO week (Mon-Fri) or calendar month.
+    - Aggregation: open=first, high=max, low=min, close=last, volume=sum, oi=last.
+    """
+    tf = normalize_timeframe(timeframe)
+    base_tf = resolve_base_timeframe(tf)
+    if tf == base_tf or not rows:
+        return list(rows)
+
+    tf_spec = VALID_TIMEFRAMES[tf]
+    tf_minutes = tf_spec.get("minutes")
+    clean_exch = (exchange or "NSE").strip().upper()
+    anchor_minute_of_day = 9 * 60 if clean_exch in {"MCX", "MCX_FO"} else (9 * 60 + 15)
+
+    ordered = sorted(rows, key=lambda r: str(r.get("ts_ist") or ""))
+    buckets: Dict[Any, Dict[str, Any]] = {}
+    bucket_order: List[Any] = []
+
+    for row in ordered:
+        ts_raw = str(row.get("ts_ist") or "")
+        if not ts_raw:
+            continue
+        dt = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=IST_TZ)
+        else:
+            dt = dt.astimezone(IST_TZ)
+
+        if tf_minutes is not None:
+            step = int(tf_minutes)
+            mod = dt.hour * 60 + dt.minute
+            if mod >= anchor_minute_of_day:
+                offset = ((mod - anchor_minute_of_day) // step) * step
+                bucket_mod = anchor_minute_of_day + offset
+            else:
+                bucket_mod = (mod // step) * step
+            b_hr, b_min = divmod(bucket_mod, 60)
+            b_dt = datetime(dt.year, dt.month, dt.day, b_hr, b_min, 0, tzinfo=IST_TZ)
+            b_key: Any = b_dt.isoformat(timespec="seconds")
+            b_ts_ist = str(b_key)
+            b_trade_date = dt.date().isoformat()
+        elif tf == "1week":
+            iso_yr, iso_wk, _ = dt.isocalendar()
+            b_key = (iso_yr, iso_wk)
+            b_ts_ist = ts_raw
+            b_trade_date = dt.date().isoformat()
+        elif tf == "1month":
+            b_key = (dt.year, dt.month)
+            b_ts_ist = ts_raw
+            b_trade_date = dt.date().isoformat()
+        else:
+            b_key = ts_raw
+            b_ts_ist = ts_raw
+            b_trade_date = dt.date().isoformat()
+
+        o_v = float(row["open"])
+        h_v = float(row["high"])
+        l_v = float(row["low"])
+        c_v = float(row["close"])
+        vol_v = int(row.get("volume", 0) or 0)
+        oi_v = int(row.get("oi", 0) or 0)
+        src_v = str(row.get("source") or "")
+
+        existing = buckets.get(b_key)
+        if existing is None:
+            buckets[b_key] = {
+                "ts_ist": b_ts_ist,
+                "trade_date": b_trade_date,
+                "open": o_v,
+                "high": h_v,
+                "low": l_v,
+                "close": c_v,
+                "volume": vol_v,
+                "oi": oi_v,
+                "source": src_v,
+            }
+            bucket_order.append(b_key)
+        else:
+            if h_v > existing["high"]:
+                existing["high"] = h_v
+            if l_v < existing["low"]:
+                existing["low"] = l_v
+            existing["close"] = c_v
+            existing["volume"] += vol_v
+            existing["oi"] = oi_v
+            if tf in {"1week", "1month"}:
+                existing["trade_date"] = b_trade_date
+                existing["ts_ist"] = b_ts_ist
+            if src_v:
+                existing["source"] = src_v
+
+    return [buckets[k] for k in bucket_order]
 
 _YAHOO_SYMBOL_OVERRIDES = {
     "NIFTY": "^NSEI",
@@ -416,7 +585,8 @@ class HistoricalDataManager:
                 f"Contract '{symbol}' ({exchange}) was not found in Upstox instruments. "
                 "Click Sync Upstox Master or select the exact contract from the F&O Finder."
             )
-        tf_meta = VALID_TIMEFRAMES[timeframe]
+        base_tf = resolve_base_timeframe(timeframe)
+        tf_meta = VALID_TIMEFRAMES[base_tf]
         unit = tf_meta["upstox_unit"]
         interval = tf_meta["upstox_interval"]
         encoded_key = urllib.parse.quote(ikey, safe="")
@@ -533,7 +703,8 @@ class HistoricalDataManager:
                 "Click Sync Zerodha Master or select the exact contract from the F&O Finder."
             )
 
-        interval = VALID_TIMEFRAMES[timeframe]["zerodha"]
+        base_tf = resolve_base_timeframe(timeframe)
+        interval = VALID_TIMEFRAMES[base_tf]["zerodha"]
         params = urllib.parse.urlencode(
             {
                 "from": f"{chunk_start.isoformat()} 09:00:00",
@@ -602,7 +773,8 @@ class HistoricalDataManager:
             suffix = ".BO" if exchange == "BSE" else ".NS"
             ticker = f"{clean}{suffix}"
 
-        interval = VALID_TIMEFRAMES[timeframe]["yahoo"]
+        base_tf = resolve_base_timeframe(timeframe)
+        interval = VALID_TIMEFRAMES[base_tf]["yahoo"]
         p1_dt = datetime.combine(chunk_start, time(0, 0), tzinfo=IST_TZ)
         p2_dt = datetime.combine(chunk_end + timedelta(days=1), time(0, 0), tzinfo=IST_TZ)
         params = urllib.parse.urlencode(
@@ -698,9 +870,8 @@ class HistoricalDataManager:
         if not clean_sym:
             raise ValueError("Trading symbol is required.")
         clean_exch = (exchange or "NSE").strip().upper()
-        tf = (timeframe or "1day").strip().lower()
-        if tf not in VALID_TIMEFRAMES:
-            raise ValueError(f"Invalid timeframe '{tf}'. Choose from: {', '.join(VALID_TIMEFRAMES.keys())}")
+        tf = normalize_timeframe(timeframe)
+        base_tf = resolve_base_timeframe(tf)
 
         today_ist = datetime.now(tz=IST_TZ).date()
         end_d = _parse_iso_date(to_date, default=today_ist)
@@ -711,7 +882,7 @@ class HistoricalDataManager:
             raise ValueError(f"from_date ({start_d}) must be on or before to_date ({end_d}).")
 
         eff_provider = (provider or config.ACTIVE_DATA_CONNECTION or "yfinance").strip().lower()
-        covered = self._get_covered_dates(clean_sym, clean_exch, tf, start_d, end_d)
+        covered = self._get_covered_dates(clean_sym, clean_exch, base_tf, start_d, end_d)
 
         # Count weekdays requested vs already cached
         total_weekdays = 0
@@ -725,7 +896,7 @@ class HistoricalDataManager:
             cursor += timedelta(days=1)
 
         missing_gaps = compute_missing_date_ranges(start_d, end_d, covered)
-        max_chunk = int(VALID_TIMEFRAMES[tf]["max_chunk_days"])
+        max_chunk = int(VALID_TIMEFRAMES[base_tf]["max_chunk_days"])
 
         api_calls_made = 0
         rows_inserted = 0
@@ -747,13 +918,13 @@ class HistoricalDataManager:
                     api_calls_made += 1
                     fetched_ranges.append({"from": c_start.isoformat(), "to": c_end.isoformat()})
                     if fetcher is not None:
-                        chunk_rows = fetcher(clean_sym, clean_exch, tf, c_start, c_end)
+                        chunk_rows = fetcher(clean_sym, clean_exch, base_tf, c_start, c_end)
                     else:
                         chunk_rows = self._fetch_chunk_from_provider(
                             eff_provider,
                             clean_sym,
                             clean_exch,
-                            tf,
+                            base_tf,
                             c_start,
                             c_end,
                             instrument_type=instrument_type,
@@ -779,7 +950,7 @@ class HistoricalDataManager:
                 if all_candles:
                     if engine is not None:
                         pd, pa, pq = engine
-                        p_file = self._parquet_file(clean_sym, clean_exch, tf)
+                        p_file = self._parquet_file(clean_sym, clean_exch, base_tf)
                         p_file.parent.mkdir(parents=True, exist_ok=True)
                         new_df = pd.DataFrame(
                             [
@@ -805,7 +976,7 @@ class HistoricalDataManager:
                             legacy_rows = conn.execute(
                                 "SELECT ts_ist, trade_date, open, high, low, close, volume, oi, source "
                                 "FROM candles WHERE symbol = ? AND exchange = ? AND timeframe = ?",
-                                (clean_sym, clean_exch, tf),
+                                (clean_sym, clean_exch, base_tf),
                             ).fetchall()
                             if legacy_rows:
                                 frames.append(pd.DataFrame([dict(r) for r in legacy_rows]))
@@ -836,7 +1007,7 @@ class HistoricalDataManager:
                                 (
                                     clean_sym,
                                     clean_exch,
-                                    tf,
+                                    base_tf,
                                     c["ts_ist"],
                                     c["trade_date"],
                                     float(c["open"]),
@@ -854,7 +1025,7 @@ class HistoricalDataManager:
                         agg_cat = conn.execute(
                             "SELECT COUNT(*) AS cnt, MIN(trade_date) AS s_d, MAX(trade_date) AS e_d "
                             "FROM candles WHERE symbol = ? AND exchange = ? AND timeframe = ?",
-                            (clean_sym, clean_exch, tf),
+                            (clean_sym, clean_exch, base_tf),
                         ).fetchone()
                         if agg_cat and int(agg_cat["cnt"] or 0) > 0:
                             parquet_meta = (int(agg_cat["cnt"]), str(agg_cat["s_d"]), str(agg_cat["e_d"]))
@@ -869,7 +1040,7 @@ class HistoricalDataManager:
                             (
                                 clean_sym,
                                 clean_exch,
-                                tf,
+                                base_tf,
                                 parquet_meta[0],
                                 parquet_meta[1],
                                 parquet_meta[2],
@@ -883,10 +1054,10 @@ class HistoricalDataManager:
                 for d_item in checked_weekdays:
                     d_iso = d_item.isoformat()
                     if d_iso in dates_with_data:
-                        coverage_rows.append((clean_sym, clean_exch, tf, d_iso, "data", now_ist_str))
+                        coverage_rows.append((clean_sym, clean_exch, base_tf, d_iso, "data", now_ist_str))
                     elif d_item < (today_ist - timedelta(days=1)):
                         # Only mark past non-recent weekdays as holiday (never freeze today or yesterday if broker hasn't published EOD yet)
-                        coverage_rows.append((clean_sym, clean_exch, tf, d_iso, "holiday", now_ist_str))
+                        coverage_rows.append((clean_sym, clean_exch, base_tf, d_iso, "holiday", now_ist_str))
 
                 if coverage_rows:
                     conn.executemany(
@@ -908,11 +1079,14 @@ class HistoricalDataManager:
             view="snapshot",
         )
 
+        resampled_note = f" (resampled from canonical {base_tf})" if tf != base_tf else ""
         return {
             "ok": True,
             "symbol": clean_sym,
             "exchange": clean_exch,
             "timeframe": tf,
+            "base_timeframe": base_tf,
+            "resampled": tf != base_tf,
             "provider": eff_provider,
             "requested_range": {"from": start_d.isoformat(), "to": end_d.isoformat()},
             "total_weekdays_in_range": total_weekdays,
@@ -923,14 +1097,56 @@ class HistoricalDataManager:
             "rows_inserted": rows_inserted,
             "cache_hit_only": api_calls_made == 0,
             "message": (
-                f"All {skipped_existing_days} trading days already cached locally — 0 API calls made."
+                f"All {skipped_existing_days} trading days already cached locally in {base_tf} — 0 API calls made{resampled_note}."
                 if api_calls_made == 0
-                else f"Fetched {len(fetched_ranges)} missing gap(s) via {api_calls_made} API call(s); skipped {skipped_existing_days} existing day(s)."
+                else f"Fetched {len(fetched_ranges)} missing {base_tf} gap(s) via {api_calls_made} API call(s); skipped {skipped_existing_days} existing day(s){resampled_note}."
             ),
             "snapshot": snapshot,
         }
 
     # ── Snapshot & Full Data Inspection (0 API calls) ─────────────────────
+
+    def _read_raw_base_rows(
+        self,
+        *,
+        clean_sym: str,
+        clean_exch: str,
+        base_tf: str,
+        from_iso: Optional[str],
+        to_iso: Optional[str],
+    ) -> Tuple[List[Dict[str, Any]], str]:
+        """Read canonical base rows ('1minute' or '1day') from Parquet or SQLite."""
+        p_file = self._parquet_file(clean_sym, clean_exch, base_tf)
+        engine = _parquet_engine()
+        if engine is not None and p_file.exists():
+            _pd, _pa, pq = engine
+            df = pq.read_table(p_file).to_pandas()
+            if from_iso:
+                df = df[df["trade_date"] >= from_iso]
+            if to_iso:
+                df = df[df["trade_date"] <= to_iso]
+            df = df.sort_values("ts_ist").reset_index(drop=True)
+            return df.to_dict(orient="records"), "parquet"
+
+        clauses = ["symbol = ?", "exchange = ?", "timeframe = ?"]
+        params: List[Any] = [clean_sym, clean_exch, base_tf]
+        if from_iso:
+            clauses.append("trade_date >= ?")
+            params.append(from_iso)
+        if to_iso:
+            clauses.append("trade_date <= ?")
+            params.append(to_iso)
+        where_sql = " AND ".join(clauses)
+        with self._connect() as conn:
+            rows = [
+                dict(r)
+                for r in conn.execute(
+                    f"SELECT ts_ist, trade_date, open, high, low, close, volume, oi, source "
+                    f"FROM candles WHERE {where_sql} ORDER BY ts_ist ASC",
+                    params,
+                ).fetchall()
+            ]
+        return rows, "sqlite"
 
     def get_records(
         self,
@@ -946,192 +1162,115 @@ class HistoricalDataManager:
     ) -> Dict[str, Any]:
         clean_sym = _normalize_symbol(symbol)
         clean_exch = (exchange or "NSE").strip().upper()
-        tf = (timeframe or "1day").strip().lower()
+        tf = normalize_timeframe(timeframe)
+        base_tf = resolve_base_timeframe(tf)
         mode = "full" if (view or "").strip().lower() == "full" else "snapshot"
         from_iso = _parse_iso_date(from_date).isoformat() if from_date else None
         to_iso = _parse_iso_date(to_date).isoformat() if to_date else None
 
-        # Hybrid read path: prefer Parquet file if present & pyarrow/pandas installed
-        p_file = self._parquet_file(clean_sym, clean_exch, tf)
-        engine = _parquet_engine()
-        if engine is not None and p_file.exists():
-            _pd, _pa, pq = engine
-            df = pq.read_table(p_file).to_pandas()
-            if from_iso:
-                df = df[df["trade_date"] >= from_iso]
-            if to_iso:
-                df = df[df["trade_date"] <= to_iso]
-            df = df.sort_values("ts_ist").reset_index(drop=True)
-            total_rows = int(len(df))
-            if total_rows == 0:
-                return {
-                    "symbol": clean_sym,
-                    "exchange": clean_exch,
-                    "timeframe": tf,
-                    "view_mode": mode,
-                    "storage_backend": "parquet",
-                    "total_rows": 0,
-                    "returned_rows": 0,
-                    "is_truncated": False,
-                    "summary": {
-                        "start_ts": None,
-                        "end_ts": None,
-                        "min_low": None,
-                        "max_high": None,
-                        "latest_close": None,
-                        "change_pct": None,
-                        "total_volume": 0,
-                        "latest_oi": 0,
-                    },
-                    "rows": [],
-                }
+        # Read canonical base timeframe (1minute or 1day) and strictly filter dates BEFORE resampling
+        raw_rows, storage_backend = self._read_raw_base_rows(
+            clean_sym=clean_sym,
+            clean_exch=clean_exch,
+            base_tf=base_tf,
+            from_iso=from_iso,
+            to_iso=to_iso,
+        )
 
-            first_open = float(df["open"].iloc[0])
-            latest_close = float(df["close"].iloc[-1])
-            latest_oi = int(df["oi"].iloc[-1]) if "oi" in df.columns else 0
-            change_pct = (
-                round(((latest_close - first_open) / first_open) * 100.0, 2)
-                if first_open != 0
-                else None
+        # Fallback: if legacy pre-canonical rows exist stored directly under tf, read them too
+        if not raw_rows and tf != base_tf:
+            legacy_rows, legacy_backend = self._read_raw_base_rows(
+                clean_sym=clean_sym,
+                clean_exch=clean_exch,
+                base_tf=tf,
+                from_iso=from_iso,
+                to_iso=to_iso,
             )
-            if mode == "full":
-                sliced = df.iloc[max(0, int(offset)) : (max(0, int(offset)) + int(limit))] if (limit and limit > 0) else df
+            if legacy_rows:
+                raw_rows = legacy_rows
+                storage_backend = legacy_backend
+                resampled_rows = raw_rows
             else:
-                if total_rows <= 15:
-                    sliced = df
-                else:
-                    sliced = _pd.concat([df.iloc[:5], df.iloc[-10:]], ignore_index=True).drop_duplicates(subset=["ts_ist"])
-            rows_out = sliced.to_dict(orient="records")
+                resampled_rows = []
+        else:
+            resampled_rows = (
+                resample_ohlcv_rows(raw_rows, tf, exchange=clean_exch)
+                if tf != base_tf
+                else raw_rows
+            )
+
+        total_rows = len(resampled_rows)
+        if total_rows == 0:
             return {
                 "symbol": clean_sym,
                 "exchange": clean_exch,
                 "timeframe": tf,
+                "base_timeframe": base_tf,
+                "resampled": tf != base_tf,
                 "view_mode": mode,
-                "storage_backend": "parquet",
-                "total_rows": total_rows,
-                "returned_rows": len(rows_out),
-                "is_truncated": len(rows_out) < total_rows,
+                "storage_backend": storage_backend,
+                "total_rows": 0,
+                "returned_rows": 0,
+                "is_truncated": False,
                 "summary": {
-                    "start_ts": str(df["ts_ist"].iloc[0]),
-                    "end_ts": str(df["ts_ist"].iloc[-1]),
-                    "min_low": round(float(df["low"].min()), 4),
-                    "max_high": round(float(df["high"].max()), 4),
-                    "latest_close": round(latest_close, 4),
-                    "change_pct": change_pct,
-                    "total_volume": int(df["volume"].sum()),
-                    "latest_oi": latest_oi,
+                    "start_ts": None,
+                    "end_ts": None,
+                    "min_low": None,
+                    "max_high": None,
+                    "latest_close": None,
+                    "change_pct": None,
+                    "total_volume": 0,
+                    "latest_oi": 0,
                 },
-                "rows": rows_out,
+                "rows": [],
             }
 
-        clauses = ["symbol = ?", "exchange = ?", "timeframe = ?"]
-        params: List[Any] = [clean_sym, clean_exch, tf]
-        if from_iso:
-            clauses.append("trade_date >= ?")
-            params.append(from_iso)
-        if to_iso:
-            clauses.append("trade_date <= ?")
-            params.append(to_iso)
-
-        where_sql = " AND ".join(clauses)
-
-        with self._connect() as conn:
-            agg = conn.execute(
-                f"""
-                SELECT COUNT(*) AS cnt,
-                       MIN(ts_ist) AS min_ts,
-                       MAX(ts_ist) AS max_ts,
-                       MIN(low) AS min_low,
-                       MAX(high) AS max_high,
-                       SUM(volume) AS total_volume
-                FROM candles
-                WHERE {where_sql}
-                """,
-                params,
-            ).fetchone()
-
-            total_rows = int(agg["cnt"] or 0)
-            first_row = conn.execute(
-                f"SELECT open, close FROM candles WHERE {where_sql} ORDER BY ts_ist ASC LIMIT 1",
-                params,
-            ).fetchone()
-            last_row = conn.execute(
-                f"SELECT close, oi FROM candles WHERE {where_sql} ORDER BY ts_ist DESC LIMIT 1",
-                params,
-            ).fetchone()
-
-            rows_out: List[Dict[str, Any]] = []
-            if total_rows > 0:
-                if mode == "full":
-                    sql = (
-                        f"SELECT ts_ist, trade_date, open, high, low, close, volume, oi, source "
-                        f"FROM candles WHERE {where_sql} ORDER BY ts_ist ASC"
-                    )
-                    q_params = list(params)
-                    if limit is not None and limit > 0:
-                        sql += " LIMIT ? OFFSET ?"
-                        q_params.extend([int(limit), max(0, int(offset))])
-                    rows_out = [dict(r) for r in conn.execute(sql, q_params).fetchall()]
-                else:
-                    if total_rows <= 15:
-                        rows_out = [
-                            dict(r)
-                            for r in conn.execute(
-                                f"SELECT ts_ist, trade_date, open, high, low, close, volume, oi, source "
-                                f"FROM candles WHERE {where_sql} ORDER BY ts_ist ASC",
-                                params,
-                            ).fetchall()
-                        ]
-                    else:
-                        head = [
-                            dict(r)
-                            for r in conn.execute(
-                                f"SELECT ts_ist, trade_date, open, high, low, close, volume, oi, source "
-                                f"FROM candles WHERE {where_sql} ORDER BY ts_ist ASC LIMIT 5",
-                                params,
-                            ).fetchall()
-                        ]
-                        tail = list(
-                            reversed(
-                                [
-                                    dict(r)
-                                    for r in conn.execute(
-                                        f"SELECT ts_ist, trade_date, open, high, low, close, volume, oi, source "
-                                        f"FROM candles WHERE {where_sql} ORDER BY ts_ist DESC LIMIT 10",
-                                        params,
-                                    ).fetchall()
-                                ]
-                            )
-                        )
-                        seen_ts = {r["ts_ist"] for r in head}
-                        rows_out = head + [r for r in tail if r["ts_ist"] not in seen_ts]
-
-        first_open = float(first_row["open"]) if first_row else None
-        latest_close = float(last_row["close"]) if last_row else None
-        latest_oi = int(last_row["oi"] or 0) if last_row else 0
+        first_open = float(resampled_rows[0]["open"])
+        latest_close = float(resampled_rows[-1]["close"])
+        latest_oi = int(resampled_rows[-1].get("oi", 0) or 0)
+        min_low = min(float(r["low"]) for r in resampled_rows)
+        max_high = max(float(r["high"]) for r in resampled_rows)
+        total_vol = sum(int(r.get("volume", 0) or 0) for r in resampled_rows)
         change_pct = (
             round(((latest_close - first_open) / first_open) * 100.0, 2)
-            if (first_open and latest_close is not None and first_open != 0)
+            if first_open != 0
             else None
         )
+
+        if mode == "full":
+            if limit is not None and limit > 0:
+                start_idx = max(0, int(offset))
+                rows_out = resampled_rows[start_idx : start_idx + int(limit)]
+            else:
+                rows_out = resampled_rows
+        else:
+            if total_rows <= 15:
+                rows_out = resampled_rows
+            else:
+                head = resampled_rows[:5]
+                tail = resampled_rows[-10:]
+                seen_ts = {r["ts_ist"] for r in head}
+                rows_out = head + [r for r in tail if r["ts_ist"] not in seen_ts]
 
         return {
             "symbol": clean_sym,
             "exchange": clean_exch,
             "timeframe": tf,
+            "base_timeframe": base_tf,
+            "resampled": tf != base_tf,
             "view_mode": mode,
-            "storage_backend": "sqlite",
+            "storage_backend": storage_backend,
             "total_rows": total_rows,
             "returned_rows": len(rows_out),
             "is_truncated": len(rows_out) < total_rows,
             "summary": {
-                "start_ts": agg["min_ts"],
-                "end_ts": agg["max_ts"],
-                "min_low": round(float(agg["min_low"]), 4) if agg["min_low"] is not None else None,
-                "max_high": round(float(agg["max_high"]), 4) if agg["max_high"] is not None else None,
-                "latest_close": round(latest_close, 4) if latest_close is not None else None,
+                "start_ts": str(resampled_rows[0]["ts_ist"]),
+                "end_ts": str(resampled_rows[-1]["ts_ist"]),
+                "min_low": round(min_low, 4),
+                "max_high": round(max_high, 4),
+                "latest_close": round(latest_close, 4),
                 "change_pct": change_pct,
-                "total_volume": int(agg["total_volume"] or 0),
+                "total_volume": total_vol,
                 "latest_oi": latest_oi,
             },
             "rows": rows_out,
@@ -1178,7 +1317,7 @@ class HistoricalDataManager:
     ) -> List[str]:
         """Return unique cached symbols stored in either Parquet or SQLite."""
         ex_filter = (exchange or "").strip().upper()
-        tf_filter = (timeframe or "").strip().lower()
+        tf_filter = resolve_base_timeframe(timeframe) if timeframe else ""
         syms: Set[str] = set()
         for ds in self.list_catalog():
             if ex_filter and str(ds.get("exchange") or "").upper() != ex_filter:
@@ -1224,4 +1363,7 @@ __all__ = [
     "VALID_TIMEFRAMES",
     "compute_missing_date_ranges",
     "historical_data_manager",
+    "normalize_timeframe",
+    "resample_ohlcv_rows",
+    "resolve_base_timeframe",
 ]

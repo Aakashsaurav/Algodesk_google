@@ -722,9 +722,14 @@
           <div class="field">
             <label for="histTimeframe">Timeframe</label>
             <select id="histTimeframe">
-              <option value="1day">1 Day</option>
-              <option value="30minute">30 Min</option>
-              <option value="1minute">1 Min</option>
+              <option value="1day">1 Day (Canonical)</option>
+              <option value="1week">1 Week (from 1d)</option>
+              <option value="1month">1 Month (from 1d)</option>
+              <option value="1minute">1 Min (Canonical)</option>
+              <option value="5minute">5 Min (from 1m)</option>
+              <option value="15minute">15 Min (from 1m)</option>
+              <option value="30minute">30 Min (from 1m)</option>
+              <option value="60minute">60 Min (from 1m)</option>
             </select>
           </div>
           <div class="field">
@@ -924,8 +929,8 @@
           </div>
         </div>
         <div style="display:grid; grid-template-columns:repeat(4, minmax(0,1fr)); gap:12px; margin-top:12px;">
-          <div class="field"><label for="p5ScTf">Timeframe</label><select id="p5ScTf"><option value="1day">1 Day</option><option value="30minute">30 Min</option></select></div>
-          <div class="field"><label for="p5ScLookback">Lookback (D)</label><input id="p5ScLookback" class="mono" type="number" min="30" max="1095" value="120" /></div>
+          <div class="field"><label for="p5ScTf">Timeframe (API: 1m/1d)</label><select id="p5ScTf"><option value="1day">1 Day</option><option value="1week">1 Week (from 1d)</option><option value="1month">1 Month (from 1d)</option><option value="1minute">1 Min</option><option value="5minute">5 Min (from 1m)</option><option value="15minute">15 Min (from 1m)</option><option value="30minute">30 Min (from 1m)</option><option value="60minute">60 Min (from 1m)</option></select></div>
+          <div class="field"><label>Lookback Window</label><div id="p5ScAutoWin" class="mono" style="min-height:38px;display:flex;align-items:center;padding:0 10px;border:1px solid var(--border);border-radius:8px;background:var(--bg);font-size:11px;color:var(--text-muted);">Auto (from screen indicators)</div></div>
           <div class="field"><label for="p5ScProvider">Data Source</label><select id="p5ScProvider"><option value="auto">Assigned Connection</option><option value="yfinance">Yahoo Finance</option><option value="upstox">Upstox</option><option value="zerodha">Zerodha Kite</option></select></div>
           <div class="field"><label for="p5ScBackend">Indicator Engine</label><select id="p5ScBackend"><option value="auto">Auto (TA-Lib → pandas-ta → Built-in)</option><option value="builtin">Built-in Python O(N)</option></select></div>
         </div>
@@ -962,7 +967,13 @@
             <label for="p5BtTf">Timeframe</label>
             <select id="p5BtTf">
               <option value="1day">1 Day</option>
-              <option value="30minute">30 Min</option>
+              <option value="1week">1 Week (from 1d)</option>
+              <option value="1month">1 Month (from 1d)</option>
+              <option value="1minute">1 Min</option>
+              <option value="5minute">5 Min (from 1m)</option>
+              <option value="15minute">15 Min (from 1m)</option>
+              <option value="30minute">30 Min (from 1m)</option>
+              <option value="60minute">60 Min (from 1m)</option>
             </select>
           </div>
           <div class="field">
@@ -2373,7 +2384,7 @@
       scPreset: document.getElementById('p5ScPreset'),
       scAsOf: document.getElementById('p5ScAsOf'),
       scTf: document.getElementById('p5ScTf'),
-      scLookback: document.getElementById('p5ScLookback'),
+      scAutoWin: document.getElementById('p5ScAutoWin'),
       scProv: document.getElementById('p5ScProvider'),
       scBackend: document.getElementById('p5ScBackend'),
       scParamsBox: document.getElementById('p5ScParamsBox'),
@@ -2448,6 +2459,9 @@
       if (!p5.metaData) return;
       const scObj = (p5.metaData.screens || []).find((s) => s.id === p5.scPreset.value);
       renderParamInputsP5(p5.scParamsBox, scObj ? scObj.params : [], 'p5sc_param');
+      if (p5.scAutoWin && scObj) {
+        p5.scAutoWin.textContent = `Auto (${scObj.required_bars || 125} bars ≤ As-Of)`;
+      }
       const btObj = (p5.metaData.strategy_specs || []).find((s) => s.id === p5.btStrat.value);
       renderParamInputsP5(p5.btParamsBox, btObj ? btObj.params : [], 'p5bt_param');
     }
@@ -2530,7 +2544,6 @@
             universe: p5.scUni.value,
             exchange: 'NSE',
             timeframe: p5.scTf.value,
-            lookback_days: Number(p5.scLookback.value) || 120,
             as_of_date: p5.scAsOf.value || null,
             screen_id: p5.scPreset.value,
             preset: p5.scPreset.value,
@@ -2553,13 +2566,41 @@
           return;
         }
         const r = done.result;
-        p5.scMeta.textContent = `Matched ${r.matched_count}/${r.evaluated_count} (${r.universe_label} · As-Of ${r.as_of_date}) via ${String(r.provider).toUpperCase()} · API Calls: ${r.api_calls_made} · Cached Days Skipped: ${r.existing_days_skipped}`;
+        const tfNote = r.resampled && r.base_timeframe ? `${r.timeframe} (from ${r.base_timeframe})` : r.timeframe;
+        p5.scMeta.textContent = `Matched ${r.matched_count}/${r.evaluated_count} (${r.universe_label} · As-Of ${r.as_of_date}${r.from_date ? ', Auto ' + r.from_date + '→' + r.as_of_date : ''}) · ${tfNote} via ${String(r.provider).toUpperCase()} · API Calls: ${r.api_calls_made} · Cached Days Skipped: ${r.existing_days_skipped}`;
         const rows = r.results || [];
         if (!rows.length) {
           p5.scTable.innerHTML = `<div style="font-size:12px;color:var(--text-muted);padding:10px 0;">No symbols matched as of ${r.as_of_date}.</div>`;
           return;
         }
-        p5.scTable.innerHTML = `<div class="table-wrap"><table class="ohlcv-table mono"><thead><tr><th>Symbol</th><th class="num">Close</th><th class="num">Chg%</th><th class="num">EMA Fast</th><th class="num">EMA Slow</th><th class="num">RSI</th><th class="num">ATR%</th><th class="num">Vol</th><th>Signal</th><th class="num">Action</th></tr></thead><tbody>${rows.map((x) => `<tr><td style="font-weight:600">${x.symbol} <span style="font-size:10px;color:var(--text-muted);font-weight:400">${x.last_date || ''}</span></td><td class="num">${Number(x.close).toFixed(2)}</td><td class="num" style="color:${x.change_pct >= 0 ? '#34d399' : '#f87171'}">${x.change_pct >= 0 ? '+' : ''}${Number(x.change_pct).toFixed(2)}%</td><td class="num">${x.ema20 !== null && x.ema20 !== undefined ? Number(x.ema20).toFixed(2) : '—'}</td><td class="num">${x.ema50 !== null && x.ema50 !== undefined ? Number(x.ema50).toFixed(2) : '—'}</td><td class="num">${x.rsi14 !== null && x.rsi14 !== undefined ? Number(x.rsi14).toFixed(1) : '—'}</td><td class="num">${x.atr_pct !== null && x.atr_pct !== undefined ? Number(x.atr_pct).toFixed(2) + '%' : '—'}</td><td class="num">${Number(x.vol_ratio ?? 1).toFixed(2)}x</td><td style="color:var(--accent);font-weight:600">${x.signal}</td><td class="num"><button type="button" class="quick-btn" data-bt-sym="${x.symbol}" data-bt-ex="${x.exchange}">Backtest &rarr;</button></td></tr>`).join('')}</tbody></table></div>`;
+        const cols = (Array.isArray(r.columns) && r.columns.length) ? r.columns : [
+          { key: 'ema20', label: 'EMA 20', fmt: 'price', decimals: 2, align: 'right' },
+          { key: 'ema50', label: 'EMA 50', fmt: 'price', decimals: 2, align: 'right' },
+          { key: 'rsi14', label: 'RSI (14)', fmt: 'number', decimals: 1, align: 'right' },
+          { key: 'atr_pct', label: 'ATR%', fmt: 'pct', decimals: 2, align: 'right' },
+          { key: 'vol_ratio', label: 'Vol Ratio', fmt: 'ratio', decimals: 2, align: 'right' },
+          { key: 'supertrend', label: 'Supertrend', fmt: 'badge', decimals: 0, align: 'left' },
+        ];
+        const fmtCellP5 = (val, col) => {
+          if (val === null || val === undefined || val === '') return `<td class="${col.align === 'left' ? '' : 'num'}" style="color:var(--text-muted)">—</td>`;
+          if (col.fmt === 'badge') {
+            const s = String(val).toUpperCase();
+            const color = s === 'BULL' ? '#34d399' : (s === 'BEAR' ? '#f87171' : 'var(--text-muted)');
+            return `<td style="color:${color};font-weight:600">${s}</td>`;
+          }
+          if (col.fmt === 'text') return `<td>${String(val)}</td>`;
+          const n = Number(val);
+          if (Number.isNaN(n)) return `<td class="${col.align === 'left' ? '' : 'num'}">${String(val)}</td>`;
+          const dec = Number.isFinite(col.decimals) ? col.decimals : 2;
+          if (col.fmt === 'signed_pct') {
+            return `<td class="num" style="color:${n >= 0 ? '#34d399' : '#f87171'}">${n >= 0 ? '+' : ''}${n.toFixed(dec)}%</td>`;
+          }
+          if (col.fmt === 'pct') return `<td class="num">${n.toFixed(dec)}%</td>`;
+          if (col.fmt === 'ratio') return `<td class="num">${n.toFixed(dec)}x</td>`;
+          return `<td class="num">${n.toFixed(dec)}</td>`;
+        };
+        const headCols = cols.map((c) => `<th class="${c.align === 'left' ? '' : 'num'}">${c.label}</th>`).join('');
+        p5.scTable.innerHTML = `<div class="table-wrap"><table class="ohlcv-table mono"><thead><tr><th>Symbol</th><th class="num">Close</th><th class="num">Chg%</th>${headCols}<th>Signal</th><th class="num">Action</th></tr></thead><tbody>${rows.map((x) => `<tr><td style="font-weight:600">${x.symbol} <span style="font-size:10px;color:var(--text-muted);font-weight:400">${x.last_date || ''}</span></td><td class="num">${Number(x.close).toFixed(2)}</td><td class="num" style="color:${x.change_pct >= 0 ? '#34d399' : '#f87171'}">${x.change_pct >= 0 ? '+' : ''}${Number(x.change_pct).toFixed(2)}%</td>${cols.map((c) => fmtCellP5(x[c.key], c)).join('')}<td style="color:var(--accent);font-weight:600">${x.signal}</td><td class="num"><button type="button" class="quick-btn" data-bt-sym="${x.symbol}" data-bt-ex="${x.exchange}">Backtest &rarr;</button></td></tr>`).join('')}</tbody></table></div>`;
         p5.scTable.querySelectorAll('[data-bt-sym]').forEach((btn) => {
           btn.addEventListener('click', () => {
             p5.btSym.value = btn.getAttribute('data-bt-sym') || 'RELIANCE';

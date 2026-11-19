@@ -310,6 +310,13 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
             self._send_json(200, hub_service.get_analytics_metadata())
             return
 
+        if path == "/api/analytics/indicators/verify":
+            sym = query.get("symbol", [None])[0]
+            exch = query.get("exchange", ["NSE"])[0] or "NSE"
+            tf = query.get("timeframe", ["1day"])[0] or "1day"
+            self._send_json(200, hub_service.verify_indicators(symbol=sym, exchange=exch, timeframe=tf))
+            return
+
         if path == "/api/analytics/jobs":
             limit = int(query.get("limit", ["15"])[0] or 15)
             self._send_json(200, hub_service.list_analytics_jobs(limit=limit))
@@ -534,7 +541,11 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
                         universe=str(body.get("universe", "CUSTOM")),
                         exchange=str(body.get("exchange", "NSE")),
                         timeframe=str(body.get("timeframe", "1day")),
-                        lookback_days=int(body.get("lookback_days", 120) or 120),
+                        lookback_days=(
+                            int(body["lookback_days"])
+                            if body.get("lookback_days") not in (None, "", 0)
+                            else None
+                        ),
                         as_of_date=body.get("as_of_date"),
                         screen_id=body.get("screen_id"),
                         preset=str(body.get("preset", "all_metrics")),

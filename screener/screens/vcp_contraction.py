@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Any, Dict, List
 
 from indicators.toolkit import IndicatorToolkit
-from screener.base import BaseScreen, ParamSpec, ScreenMatch
+from screener.base import BaseScreen, ColumnSpec, ParamSpec, ScreenMatch
 
 
 class VcpContractionScreen(BaseScreen):
@@ -24,6 +24,19 @@ class VcpContractionScreen(BaseScreen):
         ParamSpec("min_dist_50d_high_pct", "Min Dist From 50D High %", "float", -6.5, min_val=-25.0, max_val=0.0, step=0.5),
         ParamSpec("ema_support", "Support EMA Period", "int", 50, min_val=10, max_val=200, step=5),
     ]
+
+    def required_bars(self, params: Dict[str, Any]) -> int:
+        longest = max(50, int(params.get("ema_support", 50)))
+        return max(65, longest * 2 + 25)
+
+    def get_columns(self, params: Dict[str, Any]) -> List[ColumnSpec]:
+        return [
+            ColumnSpec("range_7d_pct", "7D Range%", "pct", 2),
+            ColumnSpec("contraction_ratio", "7D/30D Ratio", "number", 2),
+            ColumnSpec("dist_50d_high_pct", "Dist 50D High%", "signed_pct", 2),
+            ColumnSpec("ema50", f"EMA {int(params.get('ema_support', 50))}", "price", 2),
+            ColumnSpec("vol_ratio", "Vol Ratio", "ratio", 2),
+        ]
 
     def evaluate(
         self,
@@ -64,13 +77,14 @@ class VcpContractionScreen(BaseScreen):
             tags=tags,
             score=score,
             metrics={
+                "range_7d_pct": vcp["range_7d_pct"],
+                "contraction_ratio": vcp["contraction_ratio"],
+                "dist_50d_high_pct": vcp["dist_from_50d_high_pct"],
                 "ema20": round(ema20, 2) if ema20 is not None else None,
                 "ema50": round(ema_sup, 2) if ema_sup is not None else None,
                 "rsi14": round(rsi14, 2) if rsi14 is not None else None,
                 "atr_pct": round(atr_pct_s[-1], 2) if atr_pct_s[-1] is not None else None,
                 "vol_ratio": round(vol_ratio, 2),
-                "contraction_ratio": vcp["contraction_ratio"],
-                "dist_50d_high_pct": vcp["dist_from_50d_high_pct"],
                 "supertrend": "BULL" if st_dirs[-1] == 1 else ("BEAR" if st_dirs[-1] == -1 else "FLAT"),
             },
         )

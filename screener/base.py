@@ -54,6 +54,20 @@ class ParamSpec:
         return str(raw).strip()
 
 
+@dataclass(frozen=True)
+class ColumnSpec:
+    """Declarative result table column rendered dynamically per selected screen."""
+
+    key: str
+    label: str
+    fmt: str = "number"  # "price" | "number" | "pct" | "signed_pct" | "ratio" | "badge" | "text"
+    decimals: int = 2
+    align: str = "right"  # "left" | "right"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
 @dataclass
 class ScreenMatch:
     """Structured evaluation result returned by a `BaseScreen` implementation."""
@@ -78,6 +92,7 @@ class BaseScreen(ABC):
     category: str = "technical"
     min_bars: int = 15
     params: List[ParamSpec] = []
+    columns: List[ColumnSpec] = []
 
     def resolve_params(self, overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         raw = dict(overrides or {})
@@ -86,14 +101,41 @@ class BaseScreen(ABC):
             resolved[spec.name] = spec.coerce(raw.get(spec.name, spec.default))
         return resolved
 
+    def required_bars(self, params: Dict[str, Any]) -> int:
+        """
+        Compute minimum OHLCV bars needed prior to As-Of Date for accurate
+        indicator stabilization (accounts for recursive EMA/Wilder RSI/ATR/ADX warmup).
+        Subclasses can override for exact custom indicator windows.
+        """
+        max_period = int(self.min_bars or 15)
+        for spec in self.params:
+            if spec.type == "int":
+                name_l = spec.name.lower()
+                if any(tok in name_l for tok in ("period", "ema", "sma", "rsi", "atr", "adx", "window", "len", "high", "low", "lookback")):
+                    val = int(params.get(spec.name, spec.default) or 0)
+                    if val > max_period:
+                        max_period = val
+        # Recursive indicators (EMA, Wilder RSI/ATR/ADX) converge reliably after ~3x period warmup
+        return max(int(self.min_bars or 15) + 15, max_period * 3 + 10)
+
+    def get_columns(self, params: Dict[str, Any]) -> List[ColumnSpec]:
+        """
+        Return screen-specific indicator columns for the results table.
+        If empty, ScreenerEngine auto-derives columns from `ScreenMatch.metrics`.
+        """
+        return list(self.columns)
+
     def metadata(self) -> Dict[str, Any]:
+        default_params = self.resolve_params(None)
         return {
             "id": self.id,
             "name": self.name,
             "description": self.description,
             "category": self.category,
             "min_bars": self.min_bars,
+            "required_bars": self.required_bars(default_params),
             "params": [p.to_dict() for p in self.params],
+            "columns": [c.to_dict() for c in self.get_columns(default_params)],
         }
 
     @abstractmethod
@@ -106,4 +148,4 @@ class BaseScreen(ABC):
         """Evaluate OHLCV bars (already sliced <= as_of_date) and return ScreenMatch."""
 
 
-__all__ = ["BaseScreen", "ParamSpec", "ScreenMatch"]
+__all__ = ["BaseScreen", "ColumnSpec", "ParamSpec", "ScreenMatch"]

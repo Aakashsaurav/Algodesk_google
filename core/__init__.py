@@ -7,6 +7,9 @@ from core.historical import (
     VALID_TIMEFRAMES,
     compute_missing_date_ranges,
     historical_data_manager,
+    normalize_timeframe,
+    resample_ohlcv_rows,
+    resolve_base_timeframe,
 )
 from core.instruments import InstrumentIndex, InstrumentRecord, instrument_index
 from core.preflight import (
@@ -52,4 +55,7 @@ __all__ = [
     "historical_data_manager",
     "instrument_index",
     "kill_switch_controller",
+    "normalize_timeframe",
+    "resample_ohlcv_rows",
+    "resolve_base_timeframe",
 ]

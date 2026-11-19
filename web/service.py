@@ -702,9 +702,15 @@ class BrokerHubService:
     # ── Phase 5: Screener, O(N) Backtester, Risk Console & Async Jobs ────
 
     def get_analytics_metadata(self) -> Dict[str, Any]:
+        from core.historical import VALID_TIMEFRAMES
+
         sel = self._store.load()
         screens = screen_registry.list_screens()
         strat_specs = strategy_registry.list_strategies()
+        timeframes = [
+            {"id": k, "label": str(v["label"]), "base": str(v["base"]), "resampled": k != v["base"]}
+            for k, v in VALID_TIMEFRAMES.items()
+        ]
         return {
             "ok": True,
             "selections": sel,
@@ -713,6 +719,7 @@ class BrokerHubService:
             "strategies": {s["id"]: s["name"] for s in strat_specs},
             "strategy_specs": strat_specs,
             "universes": universe_resolver.list_universes(),
+            "timeframes": timeframes,
             "indicator_backends": available_backends(),
             "storage": historical_data_manager.storage_info(),
             "file_errors": {
@@ -722,6 +729,32 @@ class BrokerHubService:
             "screens_dir": str(screen_registry.screens_dir),
             "strategies_dir": str(strategy_registry.strategies_dir),
             "default_watchlist": DEFAULT_WATCHLIST,
+        }
+
+    def verify_indicators(
+        self,
+        *,
+        symbol: Optional[str] = None,
+        exchange: str = "NSE",
+        timeframe: str = "1day",
+    ) -> Dict[str, Any]:
+        from indicators.verify import cross_check_backends, verify_golden_indicators
+
+        candles = None
+        if symbol and symbol.strip():
+            rec = historical_data_manager.get_records(
+                symbol=symbol.strip(),
+                exchange=exchange,
+                timeframe=timeframe,
+                view="full",
+            )
+            candles = rec.get("rows", [])
+        golden = verify_golden_indicators()
+        parity = cross_check_backends(candles)
+        return {
+            "ok": bool(golden["ok"]),
+            "golden_reference": golden,
+            "backend_parity": parity,
         }
 
     def reload_analytics_plugins(self) -> Dict[str, Any]:
@@ -736,7 +769,7 @@ class BrokerHubService:
         universe: str = "CUSTOM",
         exchange: str = "NSE",
         timeframe: str = "1day",
-        lookback_days: int = 120,
+        lookback_days: Optional[int] = None,
         as_of_date: Optional[str] = None,
         screen_id: Optional[str] = None,
         preset: str = "all_metrics",

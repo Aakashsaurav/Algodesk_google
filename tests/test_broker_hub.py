@@ -1085,8 +1085,10 @@ class TestBrokerHubArchitecture(unittest.TestCase):
                     instrument_key="NSE_FO|NEW_100",
                 )
 
-            self.assertTrue(any("/v3/historical-candle/" in u and "/minutes/30/" in u for u in requested_urls))
-            self.assertTrue(any("/v3/historical-candle/intraday/" in u and "/minutes/30" in u for u in requested_urls))
+            # Observation #1: Upstox API must ONLY ever be called with canonical 1minute (never 30minute)
+            self.assertTrue(any("/v3/historical-candle/" in u and "/minutes/1/" in u for u in requested_urls))
+            self.assertTrue(any("/v3/historical-candle/intraday/" in u and "/minutes/1" in u for u in requested_urls))
+            self.assertFalse(any("/minutes/30" in u for u in requested_urls))
             dates_returned = [r["trade_date"] for r in merged]
             self.assertIn(past_d.isoformat(), dates_returned)
             self.assertIn(today_d.isoformat(), dates_returned)
@@ -1833,6 +1835,324 @@ class TestBrokerHubArchitecture(unittest.TestCase):
             started_ev.wait(timeout=2.0)
             cancelled = runner.cancel_job(jb["job_id"])
             self.assertEqual(cancelled["status"], "CANCELLED")
+
+    def test_canonical_1m_1d_download_and_local_ist_resampling(self) -> None:
+        from core.historical import resample_ohlcv_rows, resolve_base_timeframe
+
+        self.assertEqual(resolve_base_timeframe("1minute"), "1minute")
+        self.assertEqual(resolve_base_timeframe("5minute"), "1minute")
+        self.assertEqual(resolve_base_timeframe("15minute"), "1minute")
+        self.assertEqual(resolve_base_timeframe("30minute"), "1minute")
+        self.assertEqual(resolve_base_timeframe("60minute"), "1minute")
+        self.assertEqual(resolve_base_timeframe("75minute"), "1minute")
+        self.assertEqual(resolve_base_timeframe("1day"), "1day")
+        self.assertEqual(resolve_base_timeframe("1week"), "1day")
+        self.assertEqual(resolve_base_timeframe("1month"), "1day")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            mgr = HistoricalDataManager(Path(tmpdir) / "ohlcv.db")
+            seen_tfs: list[str] = []
+
+            def fake_1m_fetcher(sym: str, exch: str, tf: str, c_start: date, c_end: date):
+                seen_tfs.append(tf)
+                rows = []
+                cur = c_start
+                while cur <= c_end:
+                    if cur.weekday() < 5:
+                        # 15 one-minute bars from 09:15 to 09:29 IST
+                        for m in range(15):
+                            hh = 9 + (15 + m) // 60
+                            mm = (15 + m) % 60
+                            base = 100.0 + m
+                            rows.append(
+                                {
+                                    "ts_ist": f"{cur.isoformat()}T{hh:02d}:{mm:02d}:00+05:30",
+                                    "trade_date": cur.isoformat(),
+                                    "open": base,
+                                    "high": base + 2.0,
+                                    "low": base - 1.0,
+                                    "close": base + 0.5,
+                                    "volume": 1000 + m * 10,
+                                    "oi": 5000 + m,
+                                }
+                            )
+                    cur += timedelta(days=1)
+                return rows
+
+            # Request 15minute -> must call fetcher strictly with "1minute"
+            dl = mgr.download(
+                symbol="RELIANCE",
+                exchange="NSE",
+                timeframe="15minute",
+                from_date="2026-10-05",
+                to_date="2026-10-06",
+                provider="yfinance",
+                fetcher=fake_1m_fetcher,
+            )
+            self.assertEqual(seen_tfs, ["1minute"])
+            self.assertEqual(dl["base_timeframe"], "1minute")
+            self.assertTrue(dl["resampled"])
+            self.assertEqual(dl["api_calls_made"], 1)
+
+            # Reading 5minute and 15minute from cache requires 0 extra API calls
+            dl_5m = mgr.download(
+                symbol="RELIANCE",
+                exchange="NSE",
+                timeframe="5minute",
+                from_date="2026-10-05",
+                to_date="2026-10-06",
+                provider="yfinance",
+                fetcher=fake_1m_fetcher,
+            )
+            self.assertEqual(dl_5m["api_calls_made"], 0)
+            self.assertTrue(dl_5m["cache_hit_only"])
+
+            rec_5m = mgr.get_records(symbol="RELIANCE", exchange="NSE", timeframe="5minute", view="full")
+            rec_15m = mgr.get_records(symbol="RELIANCE", exchange="NSE", timeframe="15minute", view="full")
+            # 2 trading days * 15 mins = 6 five-minute bars and 2 fifteen-minute bars
+            self.assertEqual(rec_5m["total_rows"], 6)
+            self.assertEqual(rec_15m["total_rows"], 2)
+            self.assertTrue(rec_15m["resampled"])
+            self.assertEqual(rec_15m["base_timeframe"], "1minute")
+
+            first_15m = rec_15m["rows"][0]
+            self.assertEqual(first_15m["ts_ist"], "2026-10-05T09:15:00+05:30")
+            self.assertEqual(first_15m["open"], 100.0)
+            self.assertEqual(first_15m["high"], 116.0)   # m=14 -> 114 + 2
+            self.assertEqual(first_15m["low"], 99.0)     # m=0 -> 100 - 1
+            self.assertEqual(first_15m["close"], 114.5)  # m=14 -> 114 + 0.5
+            self.assertEqual(first_15m["volume"], sum(1000 + m * 10 for m in range(15)))
+            self.assertEqual(first_15m["oi"], 5014)      # last bar's OI
+
+            # Verify 1day -> 1week & 1month resampling fetches strictly "1day"
+            seen_daily_tfs: list[str] = []
+
+            def fake_1d_fetcher(sym: str, exch: str, tf: str, c_start: date, c_end: date):
+                seen_daily_tfs.append(tf)
+                rows = []
+                cur = c_start
+                i = 0
+                while cur <= c_end:
+                    if cur.weekday() < 5:
+                        rows.append(
+                            {
+                                "ts_ist": f"{cur.isoformat()}T15:30:00+05:30",
+                                "trade_date": cur.isoformat(),
+                                "open": 200.0 + i,
+                                "high": 205.0 + i,
+                                "low": 195.0 + i,
+                                "close": 202.0 + i,
+                                "volume": 10000,
+                                "oi": 0,
+                            }
+                        )
+                        i += 1
+                    cur += timedelta(days=1)
+                return rows
+
+            dl_wk = mgr.download(
+                symbol="TCS",
+                exchange="NSE",
+                timeframe="1week",
+                from_date="2026-10-05",
+                to_date="2026-10-16",
+                provider="yfinance",
+                fetcher=fake_1d_fetcher,
+            )
+            self.assertEqual(seen_daily_tfs, ["1day"])
+            self.assertEqual(dl_wk["base_timeframe"], "1day")
+            self.assertTrue(dl_wk["resampled"])
+
+            rec_wk = mgr.get_records(symbol="TCS", exchange="NSE", timeframe="1week", view="full")
+            self.assertEqual(rec_wk["total_rows"], 2)  # 2 ISO weeks (Oct 5-9, Oct 12-16)
+            self.assertEqual(rec_wk["rows"][0]["volume"], 50000)
+
+            rec_mo = mgr.get_records(symbol="TCS", exchange="NSE", timeframe="1month", view="full")
+            self.assertEqual(rec_mo["total_rows"], 1)  # All in Oct 2026
+            self.assertEqual(rec_mo["rows"][0]["volume"], 100000)
+
+            # Pure resample_ohlcv_rows sanity for MCX 09:00 anchor
+            mcx_rows = [
+                {"ts_ist": "2026-10-05T09:00:00+05:30", "trade_date": "2026-10-05", "open": 10, "high": 12, "low": 9, "close": 11, "volume": 50, "oi": 100},
+                {"ts_ist": "2026-10-05T09:04:00+05:30", "trade_date": "2026-10-05", "open": 11, "high": 15, "low": 10, "close": 14, "volume": 60, "oi": 120},
+                {"ts_ist": "2026-10-05T09:05:00+05:30", "trade_date": "2026-10-05", "open": 14, "high": 16, "low": 13, "close": 15, "volume": 70, "oi": 130},
+            ]
+            mcx_5m = resample_ohlcv_rows(mcx_rows, "5minute", exchange="MCX")
+            self.assertEqual(len(mcx_5m), 2)
+            self.assertEqual(mcx_5m[0]["ts_ist"], "2026-10-05T09:00:00+05:30")
+            self.assertEqual(mcx_5m[0]["volume"], 110)
+
+    def test_indicator_golden_verification_and_http_endpoint(self) -> None:
+        import json as _json
+        import threading
+        from indicators.verify import verify_golden_indicators
+        from web.local_server import _AlgoDeskHTTPServer, _StdlibBrokerHandler
+
+        golden = verify_golden_indicators()
+        self.assertTrue(golden["ok"], f"Golden indicator checks failed: {golden}")
+        self.assertGreaterEqual(golden["total_count"], 7)
+        self.assertEqual(golden["passed_count"], golden["total_count"])
+
+        srv = _AlgoDeskHTTPServer(("127.0.0.1", 0), _StdlibBrokerHandler)
+        port = srv.server_address[1]
+        thread = threading.Thread(target=srv.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/analytics/indicators/verify", timeout=5) as r:
+                body = _json.loads(r.read().decode("utf-8"))
+                self.assertEqual(r.status, 200)
+                self.assertTrue(body["ok"])
+                self.assertTrue(body["golden_reference"]["ok"])
+                self.assertIn("available_backends", body["backend_parity"])
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+    def test_auto_lookback_and_dynamic_per_screen_columns(self) -> None:
+        from screener.engine import ScreenerEngine, compute_auto_lookback_days
+        from screener.registry import ScreenRegistry
+
+        # 1) Auto-lookback scaling by required_bars and timeframe
+        d_short = compute_auto_lookback_days(required_bars=50, timeframe="1day")
+        d_long = compute_auto_lookback_days(required_bars=250, timeframe="1day")
+        self.assertGreater(d_long, d_short)
+        d_1m = compute_auto_lookback_days(required_bars=100, timeframe="1minute")
+        d_15m = compute_auto_lookback_days(required_bars=100, timeframe="15minute")
+        d_1w = compute_auto_lookback_days(required_bars=60, timeframe="1week")
+        self.assertGreater(d_15m, d_1m)
+        self.assertGreater(d_1w, 300)
+
+        # 2) Dynamic columns per screen (all_metrics vs vcp_contraction vs trend_following vs custom screen)
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            hist = HistoricalDataManager(db_path=root / "ohlcv.db")
+
+            rows = []
+            cur = date(2026, 3, 1)
+            end_d = date(2026, 10, 15)
+            px = 500.0
+            i = 0
+            while cur <= end_d:
+                if cur.weekday() < 5:
+                    px += 2.0 + (0.5 if i % 3 == 0 else -0.2)
+                    rows.append(
+                        {
+                            "ts_ist": f"{cur.isoformat()}T15:30:00+05:30",
+                            "trade_date": cur.isoformat(),
+                            "open": px - 1.0,
+                            "high": px + 2.0,
+                            "low": px - 2.0,
+                            "close": px,
+                            "volume": 150000 + i * 500,
+                            "oi": 0,
+                        }
+                    )
+                    i += 1
+                cur += timedelta(days=1)
+
+            hist.download(
+                symbol="DYNCO",
+                exchange="NSE",
+                timeframe="1day",
+                from_date="2026-03-01",
+                to_date="2026-10-15",
+                provider="upstox",
+                fetcher=lambda *args: rows,
+            )
+
+            engine = ScreenerEngine(hist_manager=hist)
+
+            # Default all_metrics keeps the standard watchlist columns with live param labels
+            scan_all = engine.scan(
+                symbols=["DYNCO"],
+                exchange="NSE",
+                timeframe="1day",
+                as_of_date="2026-10-15",
+                screen_id="all_metrics",
+                params={"ema_fast": 15, "ema_slow": 40, "rsi_period": 10},
+                provider="upstox",
+                fetcher=lambda *args: [],
+            )
+            self.assertEqual(scan_all["lookback_mode"], "auto")
+            self.assertGreater(scan_all["lookback_days"], 0)
+            all_keys = [c["key"] for c in scan_all["columns"]]
+            all_labels = [c["label"] for c in scan_all["columns"]]
+            self.assertEqual(all_keys, ["ema20", "ema50", "rsi14", "atr_pct", "vol_ratio", "supertrend"])
+            self.assertIn("EMA 15", all_labels)
+            self.assertIn("EMA 40", all_labels)
+            self.assertIn("RSI (10)", all_labels)
+
+            # VCP screen exposes VCP-specific contraction & breakout columns
+            scan_vcp = engine.scan(
+                symbols=["DYNCO"],
+                exchange="NSE",
+                timeframe="1day",
+                as_of_date="2026-10-15",
+                screen_id="vcp_contraction",
+                provider="upstox",
+                fetcher=lambda *args: [],
+            )
+            vcp_keys = [c["key"] for c in scan_vcp["columns"]]
+            self.assertIn("range_7d_pct", vcp_keys)
+            self.assertIn("contraction_ratio", vcp_keys)
+            self.assertIn("dist_50d_high_pct", vcp_keys)
+            self.assertNotIn("rsi14", vcp_keys)
+
+            # Trend-following screen exposes ADX, +DI, -DI, EMA, Supertrend columns
+            scan_trend = engine.scan(
+                symbols=["DYNCO"],
+                exchange="NSE",
+                timeframe="1day",
+                as_of_date="2026-10-15",
+                screen_id="trend_following",
+                params={"adx_period": 21, "ema_fast": 10, "ema_slow": 30},
+                provider="upstox",
+                fetcher=lambda *args: [],
+            )
+            trend_keys = [c["key"] for c in scan_trend["columns"]]
+            trend_labels = [c["label"] for c in scan_trend["columns"]]
+            self.assertIn("adx", trend_keys)
+            self.assertIn("plus_di", trend_keys)
+            self.assertIn("minus_di", trend_keys)
+            self.assertIn("ADX (21)", trend_labels)
+            self.assertIn("EMA 10", trend_labels)
+
+            # Custom hot-reloaded .py screen WITHOUT get_columns() auto-infers columns from metrics
+            sdir = root / "custom_screens"
+            sdir.mkdir()
+            (sdir / "custom_roc.py").write_text(
+                (
+                    "from screener.base import BaseScreen, ParamSpec, ScreenMatch\n"
+                    "class CustomRocScreen(BaseScreen):\n"
+                    "    id = 'custom_roc'\n"
+                    "    name = 'Custom ROC'\n"
+                    "    params = [ParamSpec('roc_period', 'ROC Period', 'int', 12, min_val=2, max_val=60)]\n"
+                    "    def evaluate(self, candles, params, toolkit):\n"
+                    "        roc_v = toolkit.roc(int(params['roc_period']))[-1]\n"
+                    "        return ScreenMatch(\n"
+                    "            matched=True,\n"
+                    "            signal='ROC_UP',\n"
+                    "            tags=['ROC'],\n"
+                    "            score=30,\n"
+                    "            metrics={'roc_pct': round(roc_v or 0.0, 2), 'custom_ratio': 1.85},\n"
+                    "        )\n"
+                ),
+                encoding="utf-8",
+            )
+            custom_engine = ScreenerEngine(hist_manager=hist, registry=ScreenRegistry(screens_dir=sdir))
+            scan_custom = custom_engine.scan(
+                symbols=["DYNCO"],
+                exchange="NSE",
+                timeframe="1day",
+                as_of_date="2026-10-15",
+                screen_id="custom_roc",
+                provider="upstox",
+                fetcher=lambda *args: [],
+            )
+            custom_keys = [c["key"] for c in scan_custom["columns"]]
+            self.assertIn("roc_pct", custom_keys)
+            self.assertIn("custom_ratio", custom_keys)
+            self.assertEqual(scan_custom["results"][0]["custom_ratio"], 1.85)
 
 
 if __name__ == "__main__":

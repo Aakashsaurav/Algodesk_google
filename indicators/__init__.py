@@ -17,6 +17,8 @@ from indicators.toolkit import (
     rolling_extrema,
 )
 
+from indicators.verify import cross_check_backends, verify_golden_indicators
+
 __all__ = [
     "IndicatorToolkit",
     "available_backends",
@@ -31,5 +33,7 @@ __all__ = [
     "compute_stoch_series",
     "compute_supertrend_series",
     "compute_vcp_metrics",
+    "cross_check_backends",
     "rolling_extrema",
+    "verify_golden_indicators",
 ]

@@ -3,6 +3,7 @@ import type { Request, Response } from 'express';
 import { spawn } from 'node:child_process';
 import type { ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
+import http from 'node:http';
 import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -10,7 +11,22 @@ import { fileURLToPath } from 'node:url';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const PORT = Number(process.env.PORT || 3000);
+function readCliArg(flag: string): string | undefined {
+  const args = process.argv.slice(2);
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === flag && args[i + 1]) {
+      return args[i + 1];
+    }
+    if (arg.startsWith(`${flag}=`)) {
+      return arg.slice(flag.length + 1);
+    }
+  }
+  return undefined;
+}
+
+const PORT = Number(readCliArg('--port') || process.env.PORT || 3000);
+const HOST = readCliArg('--host') || process.env.HOST || '0.0.0.0';
 const BASE_PYTHON_PORT = Number(process.env.PYTHON_HUB_PORT || 8001);
 let activePythonPort = BASE_PYTHON_PORT;
 const IS_PROD = process.env.NODE_ENV === 'production';
@@ -77,6 +93,10 @@ function startPythonHub(port = activePythonPort): void {
 async function waitForPythonHub(retries = 25): Promise<boolean> {
   startPythonHub(activePythonPort);
   for (let i = 0; i < retries; i++) {
+    if (!pythonProc || pythonProc.exitCode !== null || pythonProc.killed) {
+      activePythonPort += 1;
+      startPythonHub(activePythonPort);
+    }
     try {
       const res = await fetch(`${getPythonOrigin()}/api/health`, {
         signal: AbortSignal.timeout(400),
@@ -185,13 +205,37 @@ async function bootstrap(): Promise<void> {
     void proxyToPython(req, res);
   });
 
+  const server = http.createServer(app);
+  let viteServer: { middlewares: express.RequestHandler; close: () => Promise<void> } | null = null;
+
   if (!IS_PROD) {
-    const { createServer: createViteServer } = await import('vite');
-    const vite = await createViteServer({
-      server: { middlewareMode: true },
-      appType: 'spa',
+    const disableHmr = process.env.DISABLE_HMR === 'true';
+    const vitePromise = import('vite').then(({ createServer: createViteServer }) =>
+      createViteServer({
+        server: {
+          middlewareMode: true,
+          hmr: disableHmr ? false : { server },
+          ws: disableHmr ? false : undefined,
+        },
+        appType: 'spa',
+      })
+    );
+    vitePromise
+      .then((vite) => {
+        viteServer = vite;
+      })
+      .catch((err) => {
+        console.error('[vite] failed to initialize dev middleware:', err);
+      });
+
+    app.use(async (req, res, next) => {
+      try {
+        const vite = viteServer ?? (await vitePromise);
+        vite.middlewares(req, res, next);
+      } catch (err) {
+        next(err);
+      }
     });
-    app.use(vite.middlewares);
   } else {
     const distDir = path.resolve(__dirname, 'dist');
     app.use(express.static(distDir));
@@ -200,8 +244,14 @@ async function bootstrap(): Promise<void> {
     });
   }
 
-  const server = app.listen(PORT, '0.0.0.0', () => {
-    console.log(`AlgoDesk server listening on http://0.0.0.0:${PORT}`);
+  server.on('error', (err) => {
+    console.error(`[server] failed to bind http://${HOST}:${PORT}:`, err);
+    process.exit(1);
+  });
+
+  // Bind HTTP port immediately so platform health checks pass without waiting on Vite cold boot.
+  server.listen(PORT, HOST, () => {
+    console.log(`AlgoDesk server listening on http://${HOST}:${PORT}`);
   });
 
   // Tunnel /ws/* WebSocket upgrades directly to the Python broker hub (FastAPI or stdlib WS)
@@ -243,11 +293,31 @@ async function bootstrap(): Promise<void> {
     })();
   });
 
+  let shuttingDown = false;
   const shutdown = () => {
-    if (pythonProc) {
-      pythonProc.kill('SIGTERM');
+    if (shuttingDown) return;
+    shuttingDown = true;
+    const procToKill = pythonProc;
+    if (procToKill) {
+      try {
+        procToKill.kill('SIGTERM');
+      } catch {
+        // ignore
+      }
+      setTimeout(() => {
+        if (procToKill.exitCode === null) {
+          try {
+            procToKill.kill('SIGKILL');
+          } catch {
+            // ignore
+          }
+        }
+      }, 250).unref();
     }
+    void viteServer?.close().catch(() => {});
+    server.closeAllConnections?.();
     server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 600).unref();
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);

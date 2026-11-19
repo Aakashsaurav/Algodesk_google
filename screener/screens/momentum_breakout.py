@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Any, Dict, List
 
 from indicators.toolkit import IndicatorToolkit
-from screener.base import BaseScreen, ParamSpec, ScreenMatch
+from screener.base import BaseScreen, ColumnSpec, ParamSpec, ScreenMatch
 
 
 class MomentumBreakoutScreen(BaseScreen):
@@ -27,6 +27,24 @@ class MomentumBreakoutScreen(BaseScreen):
         ParamSpec("min_vol_ratio", "Min Vol Ratio (vs 20D)", "float", 1.2, min_val=0.5, max_val=10.0, step=0.1),
         ParamSpec("min_day_chg_pct", "Or Min Day Chg %", "float", 1.5, min_val=0.0, max_val=15.0, step=0.25),
     ]
+
+    def required_bars(self, params: Dict[str, Any]) -> int:
+        longest = max(
+            int(params.get("ema_fast", 20)),
+            int(params.get("ema_slow", 50)),
+            int(params.get("rsi_period", 14)),
+            21,
+        )
+        return max(self.min_bars + 15, longest * 2 + 25)
+
+    def get_columns(self, params: Dict[str, Any]) -> List[ColumnSpec]:
+        return [
+            ColumnSpec("ema20", f"EMA {int(params.get('ema_fast', 20))}", "price", 2),
+            ColumnSpec("ema50", f"EMA {int(params.get('ema_slow', 50))}", "price", 2),
+            ColumnSpec("rsi14", f"RSI ({int(params.get('rsi_period', 14))})", "number", 1),
+            ColumnSpec("vol_ratio", "Vol Ratio (20B)", "ratio", 2),
+            ColumnSpec("supertrend", "Supertrend", "badge", 0, "left"),
+        ]
 
     def evaluate(
         self,

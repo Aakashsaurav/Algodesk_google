@@ -1942,9 +1942,14 @@ export default function App() {
                     onChange={(e) => setHistTimeframe(e.target.value)}
                     className="min-h-[42px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 text-sm text-slate-100 focus:border-sky-400 focus:outline-none"
                   >
-                    <option value="1day">1 Day</option>
-                    <option value="30minute">30 Min</option>
-                    <option value="1minute">1 Min</option>
+                    <option value="1day">1 Day (Canonical)</option>
+                    <option value="1week">1 Week (Resampled from 1d)</option>
+                    <option value="1month">1 Month (Resampled from 1d)</option>
+                    <option value="1minute">1 Min (Canonical)</option>
+                    <option value="5minute">5 Min (Resampled from 1m)</option>
+                    <option value="15minute">15 Min (Resampled from 1m)</option>
+                    <option value="30minute">30 Min (Resampled from 1m)</option>
+                    <option value="60minute">60 Min (Resampled from 1m)</option>
                   </select>
                 </div>
 

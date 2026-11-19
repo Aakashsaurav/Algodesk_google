@@ -14,7 +14,12 @@ from typing import Any, Callable, Dict, List, Optional
 
 from backtest.registry import StrategyRegistry, strategy_registry
 from config import IST_TZ, config
-from core.historical import HistoricalDataManager, historical_data_manager
+from core.historical import (
+    HistoricalDataManager,
+    historical_data_manager,
+    normalize_timeframe,
+    resolve_base_timeframe,
+)
 from core.jobs import JobCancelledError
 from indicators.toolkit import IndicatorToolkit, available_backends
 
@@ -91,7 +96,8 @@ class BacktestEngine:
         if not clean_sym:
             raise ValueError("symbol is required for backtesting.")
         clean_exch = (exchange or "NSE").strip().upper()
-        tf = (timeframe or "1day").strip().lower()
+        tf = normalize_timeframe(timeframe)
+        base_tf = resolve_base_timeframe(tf)
 
         strat_inst = self._registry.create(strategy)
         resolved_params = strat_inst.resolve_params(params)
@@ -284,6 +290,8 @@ class BacktestEngine:
             "strategy_label": strat_inst.name,
             "params": resolved_params,
             "timeframe": tf,
+            "base_timeframe": base_tf,
+            "resampled": tf != base_tf,
             "provider": eff_provider,
             "storage_backend": storage_meta["active_mode"],
             "ta_backends": available_backends(),

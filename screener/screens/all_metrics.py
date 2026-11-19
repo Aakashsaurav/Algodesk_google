@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Any, Dict, List
 
 from indicators.toolkit import IndicatorToolkit
-from screener.base import BaseScreen, ParamSpec, ScreenMatch
+from screener.base import BaseScreen, ColumnSpec, ParamSpec, ScreenMatch
 
 
 class AllMetricsScreen(BaseScreen):
@@ -25,6 +25,26 @@ class AllMetricsScreen(BaseScreen):
         ParamSpec("supertrend_period", "Supertrend ATR Period", "int", 10, min_val=3, max_val=50, step=1),
         ParamSpec("supertrend_mult", "Supertrend Multiplier", "float", 3.0, min_val=1.0, max_val=8.0, step=0.5),
     ]
+
+    def required_bars(self, params: Dict[str, Any]) -> int:
+        longest = max(
+            50,
+            int(params.get("ema_fast", 20)),
+            int(params.get("ema_slow", 50)),
+            int(params.get("rsi_period", 14)),
+            int(params.get("supertrend_period", 10)),
+        )
+        return max(65, longest * 2 + 25)
+
+    def get_columns(self, params: Dict[str, Any]) -> List[ColumnSpec]:
+        return [
+            ColumnSpec("ema20", f"EMA {int(params.get('ema_fast', 20))}", "price", 2),
+            ColumnSpec("ema50", f"EMA {int(params.get('ema_slow', 50))}", "price", 2),
+            ColumnSpec("rsi14", f"RSI ({int(params.get('rsi_period', 14))})", "number", 1),
+            ColumnSpec("atr_pct", "ATR%", "pct", 2),
+            ColumnSpec("vol_ratio", "Vol Ratio", "ratio", 2),
+            ColumnSpec("supertrend", "Supertrend", "badge", 0, "left"),
+        ]
 
     def evaluate(
         self,

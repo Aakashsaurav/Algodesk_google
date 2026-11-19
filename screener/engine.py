@@ -8,16 +8,68 @@ across named universes (NIFTY 50, NIFTY F&O, NIFTY 500, etc.) using drop-in
 
 from __future__ import annotations
 
+import math
 import threading
 from datetime import date, datetime, timedelta
 from typing import Any, Callable, Dict, List, Optional
 
 from config import IST_TZ, config
-from core.historical import HistoricalDataManager, _parse_iso_date, historical_data_manager
+from core.historical import (
+    HistoricalDataManager,
+    VALID_TIMEFRAMES,
+    _parse_iso_date,
+    historical_data_manager,
+    normalize_timeframe,
+    resolve_base_timeframe,
+)
 from core.jobs import JobCancelledError
 from indicators.toolkit import IndicatorToolkit, available_backends
+from screener.base import ColumnSpec
 from screener.registry import ScreenRegistry, screen_registry
 from screener.universes import UniverseResolver, universe_resolver
+
+
+def compute_auto_lookback_days(required_bars: int, timeframe: str) -> int:
+    """
+    Convert required indicator bar count into calendar days before As-Of Date,
+    accounting for weekends, NSE holidays (~250 trading days/yr), and NSE
+    intraday session length (375 minutes/day = 09:15–15:30 IST).
+    """
+    tf = normalize_timeframe(timeframe)
+    bars = max(15, int(required_bars or 60))
+    tf_meta = VALID_TIMEFRAMES[tf]
+    tf_minutes = tf_meta.get("minutes")
+
+    if tf_minutes is not None:
+        bars_per_day = max(1, 375 // int(tf_minutes))
+        trading_days = math.ceil(bars / float(bars_per_day)) + 2
+        return max(7, min(365, math.ceil(trading_days * 1.6) + 5))
+    if tf == "1week":
+        return max(90, min(3650, bars * 7 + 28))
+    if tf == "1month":
+        return max(180, min(5475, bars * 32 + 45))
+    # Daily bars (~250 trading days/365 calendar days ≈ 1.46x + holiday buffer)
+    return max(45, min(1825, math.ceil(bars * 1.55) + 15))
+
+
+def _infer_columns_from_metrics(sample_metrics: Dict[str, Any]) -> List[ColumnSpec]:
+    """Auto-generate clean table columns for custom `.py` screens that don't define `get_columns()`."""
+    cols: List[ColumnSpec] = []
+    for k, v in sample_metrics.items():
+        if k in {"symbol", "exchange", "bars", "last_date", "close", "change_pct", "signal", "tags", "score", "matched", "api_calls"}:
+            continue
+        label = k.replace("_", " ").upper() if len(k) <= 6 else k.replace("_", " ").title()
+        if isinstance(v, bool) or isinstance(v, str):
+            fmt = "badge" if k.lower() in {"supertrend", "trend", "bias", "regime", "state"} else "text"
+            cols.append(ColumnSpec(key=k, label=label, fmt=fmt, decimals=0, align="left"))
+        elif k.endswith("_pct") or "pct" in k.lower():
+            fmt = "signed_pct" if ("dist" in k.lower() or "chg" in k.lower() or "ret" in k.lower()) else "pct"
+            cols.append(ColumnSpec(key=k, label=label, fmt=fmt, decimals=2, align="right"))
+        elif "ratio" in k.lower() and "vol" in k.lower():
+            cols.append(ColumnSpec(key=k, label=label, fmt="ratio", decimals=2, align="right"))
+        else:
+            cols.append(ColumnSpec(key=k, label=label, fmt="number", decimals=2, align="right"))
+    return cols
 
 
 class ScreenerEngine:
@@ -70,7 +122,7 @@ class ScreenerEngine:
         universe: str = "CUSTOM",
         exchange: str = "NSE",
         timeframe: str = "1day",
-        lookback_days: int = 120,
+        lookback_days: Optional[int] = None,
         as_of_date: Optional[str] = None,
         screen_id: Optional[str] = None,
         preset: str = "all_metrics",
@@ -85,10 +137,19 @@ class ScreenerEngine:
         screen = self._registry.get(target_screen_id)
         resolved_params = screen.resolve_params(params)
 
-        tf = (timeframe or "1day").strip().lower()
+        tf = normalize_timeframe(timeframe)
+        base_tf = resolve_base_timeframe(tf)
         eff_exch = (exchange or "NSE").strip().upper()
         eff_provider = (provider or config.ACTIVE_DATA_CONNECTION or "yfinance").strip().lower()
-        days = max(30, min(int(lookback_days or 120), 1095))
+
+        req_bars = int(screen.required_bars(resolved_params))
+        auto_days = compute_auto_lookback_days(req_bars, tf)
+        if lookback_days is not None and int(lookback_days) > 0:
+            days = max(auto_days, min(int(lookback_days), 3650))
+            lookback_mode = "manual_min_auto"
+        else:
+            days = auto_days
+            lookback_mode = "auto"
 
         today_ist = datetime.now(tz=IST_TZ).date()
         eff_end_d: date = _parse_iso_date(as_of_date, default=today_ist)
@@ -105,6 +166,9 @@ class ScreenerEngine:
             timeframe=tf,
         )
         clean_symbols: List[str] = uni_bundle["symbols"]
+
+        declared_cols = screen.get_columns(resolved_params)
+        inferred_cols: Optional[List[ColumnSpec]] = None
 
         results: List[Dict[str, Any]] = []
         errors: List[Dict[str, str]] = []
@@ -140,6 +204,8 @@ class ScreenerEngine:
 
                 tk = IndicatorToolkit(rows, backend=backend)
                 match = screen.evaluate(rows, resolved_params, tk)
+                if not declared_cols and inferred_cols is None and match.metrics:
+                    inferred_cols = _infer_columns_from_metrics(match.metrics)
 
                 last = rows[-1]
                 prev = rows[-2] if len(rows) >= 2 else last
@@ -173,6 +239,7 @@ class ScreenerEngine:
         matched_rows = [r for r in results if r["matched"]]
         matched_rows.sort(key=lambda r: (r["score"], abs(r["change_pct"])), reverse=True)
 
+        active_columns = declared_cols or inferred_cols or []
         storage_meta = self._hist.storage_info()
         return {
             "ok": True,
@@ -181,6 +248,7 @@ class ScreenerEngine:
             "preset_label": screen.name,
             "screen_name": screen.name,
             "params": resolved_params,
+            "columns": [c.to_dict() for c in active_columns],
             "universe": uni_bundle["universe"],
             "universe_label": uni_bundle["label"],
             "as_of_date": to_date,
@@ -189,7 +257,11 @@ class ScreenerEngine:
             "provider": eff_provider,
             "exchange": eff_exch,
             "timeframe": tf,
+            "base_timeframe": base_tf,
+            "resampled": tf != base_tf,
+            "required_bars": req_bars,
             "lookback_days": days,
+            "lookback_mode": lookback_mode,
             "storage_backend": storage_meta["active_mode"],
             "ta_backends": available_backends(),
             "scanned_count": len(clean_symbols),
@@ -206,4 +278,4 @@ class ScreenerEngine:
 
 screener_engine = ScreenerEngine()
 
-__all__ = ["ScreenerEngine", "screener_engine"]
+__all__ = ["ScreenerEngine", "compute_auto_lookback_days", "screener_engine"]

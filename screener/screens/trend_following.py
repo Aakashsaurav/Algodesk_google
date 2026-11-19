@@ -9,7 +9,7 @@ from __future__ import annotations
 from typing import Any, Dict, List
 
 from indicators.toolkit import IndicatorToolkit
-from screener.base import BaseScreen, ParamSpec, ScreenMatch
+from screener.base import BaseScreen, ColumnSpec, ParamSpec, ScreenMatch
 
 
 class TrendFollowingScreen(BaseScreen):
@@ -25,6 +25,24 @@ class TrendFollowingScreen(BaseScreen):
         ParamSpec("min_adx", "Min ADX (0 = ignore)", "float", 15.0, min_val=0.0, max_val=60.0, step=1.0),
         ParamSpec("require_supertrend_bull", "Require Supertrend BULL", "bool", True),
     ]
+
+    def required_bars(self, params: Dict[str, Any]) -> int:
+        longest = max(
+            int(params.get("ema_fast", 20)),
+            int(params.get("ema_slow", 50)),
+            int(params.get("adx_period", 14)) * 2,
+        )
+        return max(self.min_bars + 15, longest * 2 + 25)
+
+    def get_columns(self, params: Dict[str, Any]) -> List[ColumnSpec]:
+        return [
+            ColumnSpec("ema20", f"EMA {int(params.get('ema_fast', 20))}", "price", 2),
+            ColumnSpec("ema50", f"EMA {int(params.get('ema_slow', 50))}", "price", 2),
+            ColumnSpec("adx", f"ADX ({int(params.get('adx_period', 14))})", "number", 1),
+            ColumnSpec("plus_di", "+DI", "number", 1),
+            ColumnSpec("minus_di", "-DI", "number", 1),
+            ColumnSpec("supertrend", "Supertrend", "badge", 0, "left"),
+        ]
 
     def evaluate(
         self,
@@ -50,6 +68,8 @@ class TrendFollowingScreen(BaseScreen):
         ema_f_prev5 = ema_f_s[-6] if len(ema_f_s) >= 6 else None
         ema_s = ema_s_s[-1]
         adx_val = adx_data["adx"][-1]
+        plus_di_val = adx_data["plus_di"][-1]
+        minus_di_val = adx_data["minus_di"][-1]
         min_adx = float(params["min_adx"])
         req_st = bool(params["require_supertrend_bull"])
 
@@ -84,9 +104,11 @@ class TrendFollowingScreen(BaseScreen):
             metrics={
                 "ema20": round(ema_f, 2) if ema_f is not None else None,
                 "ema50": round(ema_s, 2) if ema_s is not None else None,
+                "adx": round(adx_val, 2) if adx_val is not None else None,
+                "plus_di": round(plus_di_val, 2) if plus_di_val is not None else None,
+                "minus_di": round(minus_di_val, 2) if minus_di_val is not None else None,
                 "rsi14": round(rsi14, 2) if rsi14 is not None else None,
                 "atr_pct": round(atr_pct_s[-1], 2) if atr_pct_s[-1] is not None else None,
-                "adx": round(adx_val, 2) if adx_val is not None else None,
                 "vol_ratio": round(vol_ratio, 2),
                 "contraction_ratio": vcp["contraction_ratio"],
                 "dist_50d_high_pct": vcp["dist_from_50d_high_pct"],
