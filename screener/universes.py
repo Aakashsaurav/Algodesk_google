@@ -1,8 +1,11 @@
 """
 screener/universes.py
 =====================
-Resolves market universes (NIFTY 50, NIFTY Bank, NIFTY IT, NIFTY F&O from SQLite
-instruments.db, NIFTY 500, Cached Local OHLCV, or Custom comma-separated symbols).
+Resolves market universes strictly from local NSE CSV files maintained by the
+separate `screener.nse_universe_sync` module (`data/universes/*.csv`), SQLite
+broker NFO master, local cached OHLCV symbols, or custom comma-separated input.
+
+Zero hardcoded index constituent lists.
 """
 
 from __future__ import annotations
@@ -12,14 +15,25 @@ from typing import Any, Dict, List, Optional
 
 from core.historical import HistoricalDataManager, historical_data_manager
 from core.instruments import InstrumentIndex, instrument_index
-from screener.universes_data import (
-    DEFAULT_WATCHLIST,
-    NIFTY_50,
-    NIFTY_500,
-    NIFTY_BANK,
-    NIFTY_FNO_FALLBACK,
-    NIFTY_IT,
+from screener.nse_universe_sync import (
+    NSE_UNIVERSE_SOURCES,
+    NseUniverseSync,
+    nse_universe_sync,
 )
+
+# Small convenience starter symbols ONLY when the user runs CUSTOM with empty input
+DEFAULT_WATCHLIST: List[str] = [
+    "RELIANCE",
+    "TCS",
+    "INFY",
+    "HDFCBANK",
+    "ICICIBANK",
+    "SBIN",
+    "BHARTIARTL",
+    "ITC",
+    "LT",
+    "AXISBANK",
+]
 
 
 def _dedup_symbols(raw: List[str]) -> List[str]:
@@ -34,15 +48,23 @@ def _dedup_symbols(raw: List[str]) -> List[str]:
 
 
 class UniverseResolver:
-    """Resolves named equity/derivative universes dynamically."""
+    """Resolves named equity/derivative universes dynamically from NSE CSVs and local DBs."""
 
     def __init__(
         self,
         instr_idx: Optional[InstrumentIndex] = None,
         hist_mgr: Optional[HistoricalDataManager] = None,
+        csv_sync: Optional[NseUniverseSync] = None,
+        auto_sync_missing: bool = True,
     ) -> None:
         self._instr = instr_idx or instrument_index
         self._hist = hist_mgr or historical_data_manager
+        self._csv_sync = csv_sync or nse_universe_sync
+        self._auto_sync_missing = bool(auto_sync_missing)
+
+    @property
+    def csv_sync(self) -> NseUniverseSync:
+        return self._csv_sync
 
     def _fno_underlyings_from_sqlite(self) -> List[str]:
         path = self._instr.db_path
@@ -64,6 +86,14 @@ class UniverseResolver:
                 return [str(r[0]).strip().upper() for r in rows if r and r[0]]
         except sqlite3.Error:
             return []
+
+    def _load_nse_csv_universe(self, uid: str) -> tuple[List[str], Dict[str, Any]]:
+        syms, info = self._csv_sync.read_universe_csv(uid)
+        if not syms and self._auto_sync_missing and uid in NSE_UNIVERSE_SOURCES:
+            sync_res = self._csv_sync.sync_universe(uid)
+            if sync_res.get("ok"):
+                syms, info = self._csv_sync.read_universe_csv(uid)
+        return syms, info
 
     def resolve(
         self,
@@ -89,61 +119,51 @@ class UniverseResolver:
             syms = _dedup_symbols(DEFAULT_WATCHLIST + extras)
             return {
                 "universe": "DEFAULT_WATCHLIST",
-                "label": "Default Watchlist (10)",
+                "label": f"Default Watchlist ({len(DEFAULT_WATCHLIST)})",
                 "symbols": syms,
-                "source_note": "Built-in flagship watchlist",
-            }
-
-        if uid == "NIFTY_50":
-            syms = _dedup_symbols(NIFTY_50 + extras)
-            return {
-                "universe": "NIFTY_50",
-                "label": f"NIFTY 50 ({len(NIFTY_50)})",
-                "symbols": syms,
-                "source_note": "NSE Nifty 50 index constituents",
-            }
-
-        if uid == "NIFTY_BANK":
-            syms = _dedup_symbols(NIFTY_BANK + extras)
-            return {
-                "universe": "NIFTY_BANK",
-                "label": f"NIFTY Bank ({len(NIFTY_BANK)})",
-                "symbols": syms,
-                "source_note": "NSE Nifty Bank index constituents",
-            }
-
-        if uid == "NIFTY_IT":
-            syms = _dedup_symbols(NIFTY_IT + extras)
-            return {
-                "universe": "NIFTY_IT",
-                "label": f"NIFTY IT ({len(NIFTY_IT)})",
-                "symbols": syms,
-                "source_note": "NSE Nifty IT index constituents",
+                "source_note": "Starter flagship watchlist",
             }
 
         if uid == "NIFTY_FNO":
             sqlite_fno = self._fno_underlyings_from_sqlite()
-            base_fno = sqlite_fno if len(sqlite_fno) >= 20 else NIFTY_FNO_FALLBACK
-            source_note = (
-                f"Live SQLite NFO master ({len(sqlite_fno)} underlyings)"
-                if len(sqlite_fno) >= 20
-                else f"Standard NSE F&O stock list ({len(NIFTY_FNO_FALLBACK)} underlyings; sync NFO master for live list)"
-            )
-            syms = _dedup_symbols(base_fno + extras)
+            if len(sqlite_fno) >= 20:
+                syms = _dedup_symbols(sqlite_fno + extras)
+                return {
+                    "universe": "NIFTY_FNO",
+                    "label": f"NIFTY F&O ({len(sqlite_fno)})",
+                    "symbols": syms,
+                    "source_note": f"Live SQLite NFO master ({len(sqlite_fno)} underlyings)",
+                }
+            csv_syms, info = self._load_nse_csv_universe("NIFTY_FNO")
+            if not csv_syms:
+                raise ValueError(
+                    "NIFTY F&O CSV (`fo_mktlots.csv`) is not synced locally and SQLite NFO master is empty. "
+                    "Click 'Sync NSE CSVs' or run `python3 -m screener.nse_universe_sync --universe NIFTY_FNO`."
+                )
+            syms = _dedup_symbols(csv_syms + extras)
             return {
                 "universe": "NIFTY_FNO",
-                "label": f"NIFTY F&O ({len(base_fno)})",
+                "label": f"NIFTY F&O ({len(csv_syms)})",
                 "symbols": syms,
-                "source_note": source_note,
+                "source_note": f"NSE CSV {info.get('filename', 'fo_mktlots.csv')} (updated {info.get('updated_at_ist') or 'local'})",
             }
 
-        if uid == "NIFTY_500":
-            syms = _dedup_symbols(NIFTY_500 + extras)
+        if uid in NSE_UNIVERSE_SOURCES or uid.startswith("CSV_"):
+            csv_syms, info = self._load_nse_csv_universe(uid)
+            src = NSE_UNIVERSE_SOURCES.get(uid)
+            label_base = src.label if src else uid[4:].replace("_", " ").title()
+            if not csv_syms:
+                fname = src.filename if src else f"{uid[4:].lower()}.csv"
+                raise ValueError(
+                    f"Universe CSV '{fname}' for {label_base} is not available in `{self._csv_sync.universes_dir}`. "
+                    f"Click 'Sync NSE CSVs' or run `python3 -m screener.nse_universe_sync --universe {uid}`."
+                )
+            syms = _dedup_symbols(csv_syms + extras)
             return {
-                "universe": "NIFTY_500",
-                "label": f"NIFTY 500 ({len(NIFTY_500)})",
+                "universe": uid,
+                "label": f"{label_base} ({len(csv_syms)})",
                 "symbols": syms,
-                "source_note": "NSE Nifty 500 broad market constituent universe",
+                "source_note": f"NSE CSV {info.get('filename', '')} (updated {info.get('updated_at_ist') or 'local'})",
             }
 
         if uid == "CACHED_SQLITE":
@@ -160,18 +180,52 @@ class UniverseResolver:
 
     def list_universes(self, exchange: str = "NSE", timeframe: str = "1day") -> List[Dict[str, Any]]:
         sqlite_fno = self._fno_underlyings_from_sqlite()
-        fno_count = len(sqlite_fno) if len(sqlite_fno) >= 20 else len(NIFTY_FNO_FALLBACK)
         cached_count = len(self._hist.list_cached_symbols(exchange=exchange, timeframe=timeframe))
-        return [
-            {"id": "DEFAULT_WATCHLIST", "label": f"Default Watchlist ({len(DEFAULT_WATCHLIST)})", "count": len(DEFAULT_WATCHLIST)},
-            {"id": "NIFTY_50", "label": f"NIFTY 50 ({len(NIFTY_50)})", "count": len(NIFTY_50)},
-            {"id": "NIFTY_BANK", "label": f"NIFTY Bank ({len(NIFTY_BANK)})", "count": len(NIFTY_BANK)},
-            {"id": "NIFTY_IT", "label": f"NIFTY IT ({len(NIFTY_IT)})", "count": len(NIFTY_IT)},
-            {"id": "NIFTY_FNO", "label": f"NIFTY F&O ({fno_count})", "count": fno_count},
-            {"id": "NIFTY_500", "label": f"NIFTY 500 ({len(NIFTY_500)})", "count": len(NIFTY_500)},
-            {"id": "CACHED_SQLITE", "label": f"Local Cached ({cached_count})", "count": cached_count},
-            {"id": "CUSTOM", "label": "Custom (Comma-Separated)", "count": 0},
+
+        items: List[Dict[str, Any]] = [
+            {
+                "id": "DEFAULT_WATCHLIST",
+                "label": f"Default Watchlist ({len(DEFAULT_WATCHLIST)})",
+                "count": len(DEFAULT_WATCHLIST),
+                "synced": True,
+                "source": "watchlist",
+            }
         ]
+
+        for entry in self._csv_sync.list_status():
+            uid = entry["id"]
+            if uid == "NIFTY_FNO" and len(sqlite_fno) >= 20:
+                items.append(
+                    {
+                        **entry,
+                        "label": f"NIFTY F&O ({len(sqlite_fno)})",
+                        "count": len(sqlite_fno),
+                        "synced": True,
+                        "source": "sqlite_nfo",
+                    }
+                )
+            else:
+                items.append({**entry, "source": "nse_csv" if not entry.get("custom_csv") else "custom_csv"})
+
+        items.append(
+            {
+                "id": "CACHED_SQLITE",
+                "label": f"Local Cached ({cached_count})",
+                "count": cached_count,
+                "synced": True,
+                "source": "local_ohlcv",
+            }
+        )
+        items.append(
+            {
+                "id": "CUSTOM",
+                "label": "Custom (Comma-Separated)",
+                "count": 0,
+                "synced": True,
+                "source": "custom",
+            }
+        )
+        return items
 
 
 universe_resolver = UniverseResolver()

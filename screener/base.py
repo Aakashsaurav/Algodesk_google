@@ -91,6 +91,9 @@ class BaseScreen(ABC):
     description: str = ""
     category: str = "technical"
     min_bars: int = 15
+    supports_multi_timeframe: bool = False
+    default_timeframes: List[str] = []
+    multi_row: bool = False
     params: List[ParamSpec] = []
     columns: List[ColumnSpec] = []
 
@@ -134,6 +137,9 @@ class BaseScreen(ABC):
             "category": self.category,
             "min_bars": self.min_bars,
             "required_bars": self.required_bars(default_params),
+            "supports_multi_timeframe": bool(self.supports_multi_timeframe),
+            "default_timeframes": list(self.default_timeframes),
+            "multi_row": bool(self.multi_row),
             "params": [p.to_dict() for p in self.params],
             "columns": [c.to_dict() for c in self.get_columns(default_params)],
         }

@@ -2280,6 +2280,248 @@ class TestBrokerHubArchitecture(unittest.TestCase):
                 self.assertEqual(s_res["params"][pkey], 233, f"{sid} clamped {pkey}")
                 self.assertIn("EMA 233", [c["label"] for c in s_res["columns"]])
 
+    def test_nse_universe_csv_sync_and_custom_csv_discovery(self) -> None:
+        from screener.nse_universe_sync import NseUniverseSync
+        from screener.universes import UniverseResolver
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            udir = root / "universes"
+            hist = HistoricalDataManager(root / "hist.db", parquet_dir=root / "parquet")
+            instr = InstrumentIndex(db_path=root / "instruments.db")
+
+            nifty50_csv = "\n".join(
+                [
+                    "Company Name,Industry,Symbol,Series,ISIN Code",
+                    "Reliance Industries Ltd.,Oil Gas,RELIANCE,EQ,INE002A01018",
+                    "TCS Ltd.,IT,TCS,EQ,INE467B01029",
+                    "Infosys Ltd.,IT,INFY,EQ,INE009A01021",
+                    "HDFC Bank Ltd.,Financials,HDFCBANK,EQ,INE040A01034",
+                    "ICICI Bank Ltd.,Financials,ICICIBANK,EQ,INE090A01021",
+                    "Dummy Placeholder,Other,DUMMYREL,EQ,INE000000000",
+                ]
+            )
+            fno_csv = "\n".join(
+                [
+                    "UNDERLYING          ,SYMBOL    ,NOV-26 ,DEC-26 ",
+                    "NIFTY 50            ,NIFTY     ,65     ,65     ",
+                    "NIFTY BANK          ,BANKNIFTY ,30     ,30     ",
+                    "RELIANCE IND        ,RELIANCE  ,500    ,500    ",
+                    "TATA CONSULTANCY    ,TCS       ,175    ,175    ",
+                    "INFOSYS             ,INFY      ,400    ,400    ",
+                    "STATE BANK          ,SBIN      ,750    ,750    ",
+                    "ITC LTD             ,ITC       ,1600   ,1600   ",
+                ]
+            )
+
+            def fake_http(url: str, timeout: float) -> str:
+                if "ind_nifty50list.csv" in url:
+                    return nifty50_csv
+                if "fo_mktlots.csv" in url:
+                    return fno_csv
+                raise RuntimeError(f"Unexpected URL {url}")
+
+            syncer = NseUniverseSync(universes_dir=udir, http_getter=fake_http)
+            uni = UniverseResolver(instr_idx=instr, hist_mgr=hist, csv_sync=syncer, auto_sync_missing=False)
+
+            # Before CSV sync, there are ZERO hardcoded NIFTY 50 symbols -> raises clear error
+            with self.assertRaises(ValueError):
+                uni.resolve("NIFTY_50")
+
+            # Sync NIFTY_50 and NIFTY_FNO via standalone sync module
+            summary = syncer.sync_all(universe_ids=["NIFTY_50", "NIFTY_FNO"])
+            self.assertTrue(summary["ok"])
+            self.assertEqual(summary["synced_count"], 2)
+            self.assertTrue((udir / "ind_nifty50list.csv").exists())
+            self.assertTrue((udir / "fo_mktlots.csv").exists())
+
+            res50 = uni.resolve("NIFTY_50")
+            self.assertEqual(res50["symbols"], ["RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK"])
+            self.assertNotIn("DUMMYREL", res50["symbols"])
+
+            res_fno = uni.resolve("NIFTY_FNO")
+            self.assertEqual(res_fno["symbols"], ["RELIANCE", "TCS", "INFY", "SBIN", "ITC"])
+            self.assertNotIn("NIFTY", res_fno["symbols"])
+            self.assertNotIn("BANKNIFTY", res_fno["symbols"])
+
+            # Drop-in custom CSV placed in data/universes/ is auto-discovered
+            (udir / "my_leaders.csv").write_text("Symbol\nTRENT\nBEL\nHAL\n", encoding="utf-8")
+            listed_ids = {u["id"] for u in uni.list_universes()}
+            self.assertIn("CSV_MY_LEADERS", listed_ids)
+            custom_res = uni.resolve("CSV_MY_LEADERS")
+            self.assertEqual(custom_res["symbols"], ["TRENT", "BEL", "HAL"])
+
+    def test_live_screener_historical_warmup_and_live_ws_tick_updates(self) -> None:
+        from screener.live_engine import LiveScreenerEngine, merge_live_tick_into_candles
+        from screener.registry import ScreenRegistry
+        from screener.universes import UniverseResolver
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            hist = HistoricalDataManager(root / "hist.db", parquet_dir=root / "parquet")
+            instr = InstrumentIndex(db_path=root / "instruments.db")
+            uni = UniverseResolver(instr_idx=instr, hist_mgr=hist, auto_sync_missing=False)
+            live_eng = LiveScreenerEngine(hist_manager=hist, registry=ScreenRegistry(), universes=uni)
+
+            # Seed 260 weekdays of flat-to-slightly-down history ending yesterday so initial baseline
+            # does NOT match momentum_breakout, then a live tick surges price to trigger ENTERED alert.
+            today_d = datetime.now(tz=IST_TZ).date()
+            yesterday_d = today_d - timedelta(days=1)
+            start_d = yesterday_d - timedelta(days=400)
+            hist_calls = 0
+
+            def fake_hist_fetcher(sym: str, exch: str, tf: str, c0: date, c1: date):
+                nonlocal hist_calls
+                hist_calls += 1
+                rows = []
+                cur = c0
+                while cur <= min(c1, yesterday_d):
+                    if cur.weekday() < 5:
+                        day_n = (cur - start_d).days
+                        # Gentle steady base around 1000 so EMA20 ≈ EMA50 ≈ 1000, RSI ≈ 50
+                        px = round(1000.0 + ((day_n % 5) - 2) * 1.5, 2)
+                        rows.append(
+                            {
+                                "ts_ist": f"{cur.isoformat()}T15:30:00+05:30",
+                                "trade_date": cur.isoformat(),
+                                "open": round(px - 1.0, 2),
+                                "high": round(px + 2.0, 2),
+                                "low": round(px - 2.0, 2),
+                                "close": px,
+                                "volume": 100000,
+                                "oi": 0,
+                            }
+                        )
+                    cur += timedelta(days=1)
+                return rows
+
+            tick_step = {"n": 0}
+
+            def fake_live_fetcher(syms):
+                tick_step["n"] += 1
+                now_iso = datetime.now(tz=IST_TZ).isoformat(timespec="seconds")
+                if tick_step["n"] == 1:
+                    # First live tick: modest rise (still below breakout threshold)
+                    return {
+                        "LIVECO": {
+                            "symbol": "LIVECO",
+                            "ltp": 1004.0,
+                            "prev_close": 1000.0,
+                            "open": 1001.0,
+                            "high": 1005.0,
+                            "low": 1000.0,
+                            "volume": 110000,
+                            "source": "upstox",
+                            "ts_ist": now_iso,
+                        }
+                    }
+                # Second live tick: sharp breakout surge + high volume -> flips matched False -> True!
+                return {
+                    "LIVECO": {
+                        "symbol": "LIVECO",
+                        "ltp": 1065.0,
+                        "prev_close": 1000.0,
+                        "open": 1001.0,
+                        "high": 1068.0,
+                        "low": 1000.0,
+                        "volume": 350000,
+                        "source": "upstox",
+                        "ts_ist": now_iso,
+                    }
+                }
+
+            ws_q = live_eng.register_listener()
+            try:
+                live_eng.start(
+                    symbols=["LIVECO"],
+                    universe="CUSTOM",
+                    exchange="NSE",
+                    timeframe="1day",
+                    screen_id="momentum_breakout",
+                    params={"ema_fast": 10, "ema_slow": 25, "rsi_period": 14, "rsi_min": 55.0, "rsi_max": 95.0},
+                    provider="upstox",
+                    backend="builtin",
+                    poll_interval_sec=1.0,
+                    hist_fetcher=fake_hist_fetcher,
+                    live_fetcher=fake_live_fetcher,
+                )
+
+                # Wait up to 5 seconds for historical warmup + at least 2 live tick cycles
+                deadline = time.time() + 5.0
+                while time.time() < deadline:
+                    st = live_eng.status()
+                    if st["phase"] == "streaming" and st["live"]["tick_seq"] >= 2:
+                        break
+                    time.sleep(0.1)
+
+                st = live_eng.status()
+                self.assertEqual(st["phase"], "streaming")
+                self.assertGreaterEqual(st["live"]["tick_seq"], 2)
+                self.assertEqual(st["evaluated_count"], 1)
+                row = st["results"][0]
+                self.assertEqual(row["symbol"], "LIVECO")
+                self.assertTrue(row["is_live"])
+                self.assertAlmostEqual(row["ltp"], 1065.0, places=2)
+                self.assertEqual(row["tick_direction"], "up")
+                self.assertTrue(row["matched"])
+                # Verify ENTERED live transition alert was recorded
+                self.assertTrue(any(a["symbol"] == "LIVECO" and a["transition"] == "ENTERED" for a in st["alerts"]))
+
+                # Verify historical fetcher was ONLY used during initial warmup (not on live ticks)
+                calls_after_stream = hist_calls
+                time.sleep(0.3)
+                self.assertEqual(hist_calls, calls_after_stream)
+
+                # Verify WS listener received warmup and tick events
+                seen_types = set()
+                while True:
+                    try:
+                        ev = ws_q.get_nowait()
+                        seen_types.add(ev.get("type"))
+                    except Exception:
+                        break
+                self.assertIn("live_screen:warmup", seen_types)
+                self.assertIn("live_screen:tick", seen_types)
+            finally:
+                live_eng.stop()
+                live_eng.unregister_listener(ws_q)
+
+            # Verify intraday 5minute candle rollover in merge_live_tick_into_candles
+            base_5m = [
+                {
+                    "ts_ist": "2026-11-19T09:15:00+05:30",
+                    "trade_date": "2026-11-19",
+                    "open": 100.0,
+                    "high": 102.0,
+                    "low": 99.0,
+                    "close": 101.0,
+                    "volume": 1000,
+                    "oi": 0,
+                }
+            ]
+            b1, f1, c1 = merge_live_tick_into_candles(
+                base_5m,
+                None,
+                {"ltp": 103.5, "volume": 1500, "ts_ist": "2026-11-19T09:18:20+05:30"},
+                "5minute",
+            )
+            self.assertEqual(len(c1), 1)
+            self.assertEqual(f1["ts_ist"], "2026-11-19T09:15:00+05:30")
+            self.assertEqual(f1["high"], 103.5)
+            self.assertEqual(f1["close"], 103.5)
+
+            # Tick at 09:20:05 rolls over into new 09:20 candle and commits 09:15 bar to base_bars
+            b2, f2, c2 = merge_live_tick_into_candles(
+                b1,
+                f1,
+                {"ltp": 104.2, "volume": 200, "ts_ist": "2026-11-19T09:20:05+05:30"},
+                "5minute",
+            )
+            self.assertEqual(len(b2), 1)
+            self.assertEqual(len(c2), 2)
+            self.assertEqual(f2["ts_ist"], "2026-11-19T09:20:00+05:30")
+            self.assertEqual(f2["open"], 104.2)
+
 
 if __name__ == "__main__":
     unittest.main()

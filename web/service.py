@@ -40,6 +40,8 @@ from core.preflight import PreflightChecker, kill_switch_controller
 from indicators.toolkit import available_backends
 from risk.limits import risk_limit_manager
 from screener.engine import screener_engine
+from screener.live_engine import live_screener_engine
+from screener.nse_universe_sync import nse_universe_sync
 from screener.registry import screen_registry
 from screener.universes import DEFAULT_WATCHLIST, universe_resolver
 
@@ -728,8 +730,63 @@ class BrokerHubService:
             },
             "screens_dir": str(screen_registry.screens_dir),
             "strategies_dir": str(strategy_registry.strategies_dir),
+            "universes_dir": str(nse_universe_sync.universes_dir),
             "default_watchlist": DEFAULT_WATCHLIST,
         }
+
+    def list_nse_universes(self) -> Dict[str, Any]:
+        return {
+            "ok": True,
+            "universes_dir": str(nse_universe_sync.universes_dir),
+            "universes": universe_resolver.list_universes(),
+        }
+
+    def sync_nse_universes(self, universe_ids: Optional[List[str]] = None) -> Dict[str, Any]:
+        summary = nse_universe_sync.sync_all(universe_ids=universe_ids)
+        return {
+            **summary,
+            "universes": universe_resolver.list_universes(),
+        }
+
+    def start_live_screener(
+        self,
+        *,
+        symbols: Optional[List[str]] = None,
+        universe: str = "CUSTOM",
+        exchange: str = "NSE",
+        timeframe: str = "1day",
+        screen_id: Optional[str] = None,
+        preset: str = "all_metrics",
+        params: Optional[Dict[str, Any]] = None,
+        provider: Optional[str] = None,
+        backend: str = "auto",
+        poll_interval_sec: float = 2.0,
+    ) -> Dict[str, Any]:
+        sel = self._store.load()
+        eff_provider = (provider or sel.get("data_connection") or "yfinance").strip().lower()
+        return live_screener_engine.start(
+            symbols=symbols,
+            universe=(universe or "CUSTOM").strip().upper(),
+            exchange=exchange,
+            timeframe=timeframe,
+            screen_id=screen_id or preset or "all_metrics",
+            params=params,
+            provider=eff_provider,
+            backend=backend,
+            poll_interval_sec=poll_interval_sec,
+        )
+
+    def stop_live_screener(self) -> Dict[str, Any]:
+        return live_screener_engine.stop()
+
+    def get_live_screener_status(self) -> Dict[str, Any]:
+        return live_screener_engine.status()
+
+    def register_live_screener_listener(self):
+        return live_screener_engine.register_listener()
+
+    def unregister_live_screener_listener(self, q) -> None:
+        live_screener_engine.unregister_listener(q)
 
     def verify_indicators(
         self,
@@ -769,6 +826,7 @@ class BrokerHubService:
         universe: str = "CUSTOM",
         exchange: str = "NSE",
         timeframe: str = "1day",
+        timeframes: Optional[List[str]] = None,
         lookback_days: Optional[int] = None,
         as_of_date: Optional[str] = None,
         screen_id: Optional[str] = None,
@@ -789,7 +847,7 @@ class BrokerHubService:
             "as_of_date": as_of_date or "LATEST",
             "provider": eff_provider,
             "exchange": exchange,
-            "timeframe": timeframe,
+            "timeframe": ",".join(timeframes) if timeframes else timeframe,
         }
 
         def _task(progress_cb, cancel_ev):
@@ -798,6 +856,7 @@ class BrokerHubService:
                 universe=eff_universe,
                 exchange=exchange,
                 timeframe=timeframe,
+                timeframes=timeframes,
                 lookback_days=lookback_days,
                 as_of_date=as_of_date,
                 screen_id=target_screen,

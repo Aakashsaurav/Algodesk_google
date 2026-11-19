@@ -267,6 +267,14 @@ class AppConfig:
         return self.DATA_DIR / "parquet"
 
     @property
+    def UNIVERSES_DIR(self) -> Path:
+        rel = os.getenv("ALGODESK_UNIVERSES_DIR", "").strip()
+        if rel:
+            p = Path(rel)
+            return p if p.is_absolute() else (self.BASE_DIR / p)
+        return self.DATA_DIR / "universes"
+
+    @property
     def OHLCV_STORAGE_MODE(self) -> str:
         # 'hybrid' (SQLite coverage ledger + Parquet candles when pyarrow/pandas installed, else SQLite)
         # or 'sqlite' (SQLite only)

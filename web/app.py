@@ -89,6 +89,7 @@ class ScreenerRequest(BaseModel):
     universe: str = "CUSTOM"
     exchange: str = "NSE"
     timeframe: str = "1day"
+    timeframes: Optional[List[str]] = None
     lookback_days: Optional[int] = None
     as_of_date: Optional[str] = None
     screen_id: Optional[str] = None
@@ -97,6 +98,23 @@ class ScreenerRequest(BaseModel):
     provider: Optional[str] = None
     backend: str = "auto"
     async_job: bool = False
+
+
+class UniverseSyncRequest(BaseModel):
+    universes: Optional[List[str]] = None
+
+
+class LiveScreenerStartRequest(BaseModel):
+    symbols: Optional[List[str]] = None
+    universe: str = "CUSTOM"
+    exchange: str = "NSE"
+    timeframe: str = "1day"
+    screen_id: Optional[str] = None
+    preset: str = "all_metrics"
+    params: Optional[Dict[str, Any]] = None
+    provider: Optional[str] = None
+    backend: str = "auto"
+    poll_interval_sec: float = 2.0
 
 
 class BacktestRequest(BaseModel):
@@ -566,9 +584,102 @@ def create_app() -> FastAPI:
     def api_audit_verify(limit: int = Query(default=25)) -> dict:
         return hub_service.verify_audit_chain(limit=limit)
 
+    @app.websocket("/ws/live-screener")
+    async def ws_live_screener(websocket: WebSocket) -> None:
+        await websocket.accept()
+        listener_q = hub_service.register_live_screener_listener()
+
+        async def _sender() -> None:
+            initial = hub_service.get_live_screener_status()
+            await websocket.send_text(json.dumps({"type": "live_screen:state", **initial}))
+            while True:
+                try:
+                    event = listener_q.get_nowait()
+                    await websocket.send_text(json.dumps(event))
+                except queue.Empty:
+                    await asyncio.sleep(0.15)
+
+        async def _receiver() -> None:
+            while True:
+                raw = await websocket.receive_text()
+                try:
+                    cmd = json.loads(raw) if raw.strip() else {}
+                except json.JSONDecodeError:
+                    cmd = {}
+                action = str(cmd.get("action") or "").strip().lower()
+                try:
+                    if action == "start":
+                        res = hub_service.start_live_screener(
+                            symbols=cmd.get("symbols") if isinstance(cmd.get("symbols"), list) else None,
+                            universe=str(cmd.get("universe", "CUSTOM")),
+                            exchange=str(cmd.get("exchange", "NSE")),
+                            timeframe=str(cmd.get("timeframe", "1day")),
+                            screen_id=cmd.get("screen_id"),
+                            preset=str(cmd.get("preset", "all_metrics")),
+                            params=cmd.get("params") if isinstance(cmd.get("params"), dict) else None,
+                            provider=cmd.get("provider"),
+                            backend=str(cmd.get("backend", "auto")),
+                            poll_interval_sec=float(cmd.get("poll_interval_sec", 2.0) or 2.0),
+                        )
+                        await websocket.send_text(json.dumps({"type": "live_screen:state", **res}))
+                    elif action == "stop":
+                        res = hub_service.stop_live_screener()
+                        await websocket.send_text(json.dumps({"type": "live_screen:stopped", **res}))
+                    elif action == "status":
+                        res = hub_service.get_live_screener_status()
+                        await websocket.send_text(json.dumps({"type": "live_screen:state", **res}))
+                except Exception as exc:
+                    await websocket.send_text(json.dumps({"type": "error", "detail": str(exc)}))
+
+        sender_task = asyncio.create_task(_sender())
+        receiver_task = asyncio.create_task(_receiver())
+        try:
+            await asyncio.wait({sender_task, receiver_task}, return_when=asyncio.FIRST_COMPLETED)
+        except WebSocketDisconnect:
+            pass
+        finally:
+            sender_task.cancel()
+            receiver_task.cancel()
+            hub_service.unregister_live_screener_listener(listener_q)
+
     @app.get("/api/analytics/meta")
     def api_analytics_meta() -> dict:
         return hub_service.get_analytics_metadata()
+
+    @app.get("/api/analytics/universes")
+    def api_analytics_universes() -> dict:
+        return hub_service.list_nse_universes()
+
+    @app.post("/api/analytics/universes/sync")
+    def api_analytics_universes_sync(payload: Optional[UniverseSyncRequest] = None) -> dict:
+        return hub_service.sync_nse_universes(universe_ids=payload.universes if payload else None)
+
+    @app.get("/api/analytics/live-screener/status")
+    def api_analytics_live_screener_status() -> dict:
+        return hub_service.get_live_screener_status()
+
+    @app.post("/api/analytics/live-screener/start")
+    def api_analytics_live_screener_start(payload: Optional[LiveScreenerStartRequest] = None) -> dict:
+        req = payload or LiveScreenerStartRequest()
+        try:
+            return hub_service.start_live_screener(
+                symbols=req.symbols,
+                universe=req.universe,
+                exchange=req.exchange,
+                timeframe=req.timeframe,
+                screen_id=req.screen_id,
+                preset=req.preset,
+                params=req.params,
+                provider=req.provider,
+                backend=req.backend,
+                poll_interval_sec=req.poll_interval_sec,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/analytics/live-screener/stop")
+    def api_analytics_live_screener_stop() -> dict:
+        return hub_service.stop_live_screener()
 
     @app.get("/api/analytics/indicators/verify")
     def api_analytics_indicators_verify(
@@ -592,6 +703,7 @@ def create_app() -> FastAPI:
                 universe=req.universe,
                 exchange=req.exchange,
                 timeframe=req.timeframe,
+                timeframes=req.timeframes,
                 lookback_days=req.lookback_days,
                 as_of_date=req.as_of_date,
                 screen_id=req.screen_id,

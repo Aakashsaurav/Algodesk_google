@@ -875,31 +875,28 @@
           <p id="p5RuntimeBadges" class="section-desc" style="margin:0;">Hot-reloaded .py screens &amp; strategies routed through your assigned Data &amp; Trading connections.</p>
         </div>
         <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+          <button id="p5SyncCsvBtn" class="btn" type="button" style="min-height:34px; padding:5px 12px; font-size:12px; border-color:#059669; color:#6ee7b7;">Sync NSE CSVs</button>
           <button id="p5ReloadBtn" class="btn" type="button" style="min-height:34px; padding:5px 12px; font-size:12px;">Reload .py Files</button>
           <div class="p5-tabs">
             <button id="p5TabScreener" class="p5-tab active" type="button">Market Screener</button>
+            <button id="p5TabLiveScreen" class="p5-tab" type="button">Live Screen</button>
             <button id="p5TabBacktest" class="p5-tab" type="button">Strategy Backtester</button>
             <button id="p5TabRisk" class="p5-tab" type="button">Risk Limits</button>
           </div>
         </div>
       </div>
 
+      <div id="p5CsvSyncNote" class="feedback" style="display:none; margin-bottom:10px;"></div>
       <div id="p5PluginErrors" class="feedback err" style="display:none; margin-bottom:12px;"></div>
 
       <!-- Panel 1: Market Screener -->
       <div id="p5PanelScreener" class="panel">
         <div class="p5-grid-sc" style="grid-template-columns:1fr 1.3fr 1fr 0.9fr auto;">
           <div class="field">
-            <label for="p5ScUniverse">Universe / Group</label>
+            <label for="p5ScUniverse">Universe / Group (NSE CSV)</label>
             <select id="p5ScUniverse">
               <option value="CUSTOM" selected>Custom (Comma-Separated)</option>
               <option value="DEFAULT_WATCHLIST">Default Watchlist (10)</option>
-              <option value="NIFTY_50">NIFTY 50</option>
-              <option value="NIFTY_BANK">NIFTY Bank</option>
-              <option value="NIFTY_IT">NIFTY IT</option>
-              <option value="NIFTY_FNO">NIFTY F&amp;O</option>
-              <option value="NIFTY_500">NIFTY 500</option>
-              <option value="CACHED_SQLITE">Local Cached</option>
             </select>
           </div>
           <div class="field">
@@ -942,6 +939,53 @@
         <div id="p5ScParamsBox" style="margin-top:12px;"></div>
         <div id="p5ScMeta" class="mono" style="font-size:12px; color:var(--text-muted); margin-top:10px;">Ready for multi-symbol scan.</div>
         <div id="p5ScTableWrap" style="margin-top:12px;"></div>
+      </div>
+
+      <!-- Panel 1B: Live WebSocket Screen -->
+      <div id="p5PanelLiveScreen" class="panel" style="display:none;">
+        <div class="p5-grid-sc" style="grid-template-columns:1fr 1.25fr 1fr 0.85fr auto;">
+          <div class="field">
+            <label for="p5LsUniverse">Universe (NSE CSV)</label>
+            <select id="p5LsUniverse">
+              <option value="DEFAULT_WATCHLIST" selected>Default Watchlist (10)</option>
+              <option value="CUSTOM">Custom (Comma-Separated)</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="p5LsSymbols">Selected Assets (comma-separated / extra)</label>
+            <input id="p5LsSymbols" class="mono" type="text" placeholder="Optional extra symbols..." />
+          </div>
+          <div class="field">
+            <label for="p5LsPreset">Screen (.py plugin)</label>
+            <select id="p5LsPreset">
+              <option value="all_metrics">All Watchlist Metrics</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="p5LsTfNum">Timeframe</label>
+            <div style="display:flex; gap:6px;">
+              <input id="p5LsTfNum" class="mono" type="number" min="1" max="1440" step="1" value="1" style="width:68px;" />
+              <select id="p5LsTfUnit" style="flex:1;">
+                <option value="minute">minute</option>
+                <option value="day" selected>day</option>
+              </select>
+            </div>
+          </div>
+          <div style="display:flex; gap:8px;">
+            <button id="p5LsStartBtn" class="btn btn-primary" type="button" style="background:#34d399; color:#022c22;">Start Live</button>
+            <button id="p5LsStopBtn" class="btn" type="button" style="display:none; border-color:var(--red); color:#fca5a5;">Stop</button>
+          </div>
+        </div>
+        <div style="display:grid; grid-template-columns:repeat(4, minmax(0,1fr)); gap:12px; margin-top:12px;">
+          <div class="field"><label for="p5LsProvider">Feed Provider</label><select id="p5LsProvider"><option value="auto">Assigned Connection</option><option value="upstox">Upstox</option><option value="zerodha">Zerodha Kite</option><option value="yfinance">Yahoo Finance</option></select></div>
+          <div class="field"><label for="p5LsBackend">Indicator Engine</label><select id="p5LsBackend"><option value="auto">Auto</option><option value="builtin">Built-in Python O(N)</option></select></div>
+          <div class="field"><label for="p5LsInterval">Tick Cadence (sec)</label><input id="p5LsInterval" class="mono" type="number" min="1" max="30" step="1" value="2" /></div>
+          <div class="field" style="justify-content:flex-end;"><label style="display:flex;align-items:center;gap:6px;min-height:38px;"><input id="p5LsMatchedOnly" type="checkbox" /> <span>Matched Only</span></label></div>
+        </div>
+        <div id="p5LsParamsBox" style="margin-top:12px;"></div>
+        <div id="p5LsMeta" class="mono" style="font-size:12px; color:var(--text-muted); margin-top:10px;">Live Screen idle. Warmup runs once on historical data, then inspects live WebSocket ticks.</div>
+        <div id="p5LsAlerts" class="mono" style="font-size:11px; margin-top:8px;"></div>
+        <div id="p5LsTableWrap" style="margin-top:12px;"></div>
       </div>
 
       <!-- Panel 2: Strategy Backtester -->
@@ -2490,6 +2534,8 @@
       if (!p5.metaData) return;
       const scObj = (p5.metaData.screens || []).find((s) => s.id === p5.scPreset.value);
       renderParamInputsP5(p5.scParamsBox, scObj ? scObj.params : [], 'p5sc_param');
+      const lsObj = (p5.metaData.screens || []).find((s) => s.id === document.getElementById('p5LsPreset').value);
+      renderParamInputsP5(document.getElementById('p5LsParamsBox'), lsObj ? lsObj.params : [], 'p5ls_param');
       const btObj = (p5.metaData.strategy_specs || []).find((s) => s.id === p5.btStrat.value);
       renderParamInputsP5(p5.btParamsBox, btObj ? btObj.params : [], 'p5bt_param');
     }
@@ -2508,14 +2554,28 @@
           p5.badges.textContent = `Hot-reloaded .py plugins · Storage: ${stLabel}${taList ? ' · TA: ' + taList : ''}`;
         }
         const curUni = p5.scUni.value;
+        const lsUniEl = document.getElementById('p5LsUniverse');
+        const curLsUni = lsUniEl ? lsUniEl.value : 'DEFAULT_WATCHLIST';
         if (Array.isArray(m.universes) && m.universes.length > 0) {
-          p5.scUni.innerHTML = m.universes.map((u) => `<option value="${u.id}">${u.label}</option>`).join('');
+          const uniHtml = m.universes.map((u) => `<option value="${u.id}">${u.label}</option>`).join('');
+          p5.scUni.innerHTML = uniHtml;
           p5.scUni.value = m.universes.some((u) => u.id === curUni) ? curUni : 'CUSTOM';
+          if (lsUniEl) {
+            lsUniEl.innerHTML = uniHtml;
+            lsUniEl.value = m.universes.some((u) => u.id === curLsUni) ? curLsUni : 'DEFAULT_WATCHLIST';
+          }
         }
         const curSc = p5.scPreset.value;
+        const lsPresetEl = document.getElementById('p5LsPreset');
+        const curLsSc = lsPresetEl ? lsPresetEl.value : 'all_metrics';
         if (Array.isArray(m.screens) && m.screens.length > 0) {
-          p5.scPreset.innerHTML = m.screens.map((s) => `<option value="${s.id}">${s.name}</option>`).join('');
+          const scHtml = m.screens.map((s) => `<option value="${s.id}">${s.name}</option>`).join('');
+          p5.scPreset.innerHTML = scHtml;
           p5.scPreset.value = m.screens.some((s) => s.id === curSc) ? curSc : m.screens[0].id;
+          if (lsPresetEl) {
+            lsPresetEl.innerHTML = scHtml;
+            lsPresetEl.value = m.screens.some((s) => s.id === curLsSc) ? curLsSc : m.screens[0].id;
+          }
         }
         const curBt = p5.btStrat.value;
         if (Array.isArray(m.strategy_specs) && m.strategy_specs.length > 0) {
@@ -2537,13 +2597,108 @@
       } catch {}
     }
 
+    let p5LsWs = null;
+    let p5LsLastState = null;
+
+    function renderLiveScreenP5(st) {
+      if (!st) return;
+      p5LsLastState = st;
+      const metaEl = document.getElementById('p5LsMeta');
+      const alertsEl = document.getElementById('p5LsAlerts');
+      const wrapEl = document.getElementById('p5LsTableWrap');
+      const startBtn = document.getElementById('p5LsStartBtn');
+      const stopBtn = document.getElementById('p5LsStopBtn');
+      if (startBtn && stopBtn) {
+        startBtn.style.display = st.running ? 'none' : 'inline-flex';
+        stopBtn.style.display = st.running ? 'inline-flex' : 'none';
+      }
+      const phase = String(st.phase || 'idle').toUpperCase();
+      const warmupMsg = st.warmup && st.phase === 'warming_up' ? ` · ${st.warmup.message} (${st.warmup.pct}%)` : '';
+      const liveInfo = st.live ? ` · Feed: ${(st.live.active_feed || st.provider || '').toUpperCase()} · Ticks: ${st.live.tick_seq || 0}${st.live.latency_ms != null ? ' · ' + st.live.latency_ms + 'ms' : ''}` : '';
+      if (metaEl) metaEl.textContent = `[${phase}] Matched ${st.matched_count || 0}/${st.evaluated_count || 0}${warmupMsg}${liveInfo}`;
+      if (alertsEl) {
+        const als = st.alerts || [];
+        alertsEl.innerHTML = als.length
+          ? als.slice(0, 8).map((a) => `<span style="display:inline-block;margin:2px 6px 2px 0;padding:2px 6px;border-radius:4px;border:1px solid ${a.transition === 'ENTERED' ? '#059669' : '#d97706'};color:${a.transition === 'ENTERED' ? '#6ee7b7' : '#fcd34d'}">${a.transition} ${a.symbol} @${Number(a.ltp).toFixed(2)}</span>`).join('')
+          : '';
+      }
+      if (!wrapEl) return;
+      const matchedOnly = Boolean(document.getElementById('p5LsMatchedOnly') && document.getElementById('p5LsMatchedOnly').checked);
+      const rows = (st.results || []).filter((r) => !matchedOnly || r.matched);
+      if (!rows.length) {
+        wrapEl.innerHTML = `<div style="font-size:12px;color:var(--text-muted);padding:8px 0;">${st.phase === 'warming_up' ? 'Warming up historical indicators...' : 'Waiting for live matches...'}</div>`;
+        return;
+      }
+      const cols = (Array.isArray(st.columns) && st.columns.length) ? st.columns : [
+        { key: 'ema20', label: 'EMA 20', fmt: 'price', decimals: 2, align: 'right' },
+        { key: 'ema50', label: 'EMA 50', fmt: 'price', decimals: 2, align: 'right' },
+        { key: 'rsi14', label: 'RSI (14)', fmt: 'number', decimals: 1, align: 'right' },
+        { key: 'supertrend', label: 'Supertrend', fmt: 'badge', decimals: 0, align: 'left' },
+      ];
+      const headCols = cols.map((c) => `<th class="${c.align === 'left' ? '' : 'num'}">${c.label}</th>`).join('');
+      const fmtVal = (val, col) => {
+        if (val === null || val === undefined || val === '') return `<td class="${col.align === 'left' ? '' : 'num'}" style="color:var(--text-muted)">—</td>`;
+        if (col.fmt === 'badge') {
+          const s = String(val).toUpperCase();
+          return `<td style="color:${s === 'BULL' ? '#34d399' : (s === 'BEAR' ? '#f87171' : 'var(--text-muted)')};font-weight:600">${s}</td>`;
+        }
+        if (col.fmt === 'text') return `<td>${String(val)}</td>`;
+        const n = Number(val);
+        if (Number.isNaN(n)) return `<td class="${col.align === 'left' ? '' : 'num'}">${String(val)}</td>`;
+        const dec = Number.isFinite(col.decimals) ? col.decimals : 2;
+        if (col.fmt === 'signed_pct') return `<td class="num" style="color:${n >= 0 ? '#34d399' : '#f87171'}">${n >= 0 ? '+' : ''}${n.toFixed(dec)}%</td>`;
+        if (col.fmt === 'pct') return `<td class="num">${n.toFixed(dec)}%</td>`;
+        if (col.fmt === 'ratio') return `<td class="num">${n.toFixed(dec)}x</td>`;
+        return `<td class="num">${n.toFixed(dec)}</td>`;
+      };
+      wrapEl.innerHTML = `<div class="table-wrap"><table class="ohlcv-table mono"><thead><tr><th>Symbol</th><th class="num">Live LTP</th><th class="num">Chg%</th>${headCols}<th>Signal</th></tr></thead><tbody>${rows.map((x) => {
+        const ltp = x.ltp != null ? x.ltp : x.close;
+        const arrow = x.tick_direction === 'up' ? '▲ ' : (x.tick_direction === 'down' ? '▼ ' : '');
+        const ltpCol = x.tick_direction === 'up' ? '#34d399' : (x.tick_direction === 'down' ? '#f87171' : 'inherit');
+        return `<tr><td style="font-weight:600">${x.symbol}</td><td class="num" style="color:${ltpCol};font-weight:600">${arrow}${Number(ltp).toFixed(2)}</td><td class="num" style="color:${x.change_pct >= 0 ? '#34d399' : '#f87171'}">${x.change_pct >= 0 ? '+' : ''}${Number(x.change_pct).toFixed(2)}%</td>${cols.map((c) => fmtVal(x[c.key], c)).join('')}<td style="color:${x.matched ? '#34d399' : 'var(--text-muted)'};font-weight:600">${x.signal}</td></tr>`;
+      }).join('')}</tbody></table></div>`;
+    }
+
+    function connectLiveScreenWsP5() {
+      if (p5LsWs && (p5LsWs.readyState === WebSocket.OPEN || p5LsWs.readyState === WebSocket.CONNECTING)) return;
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+      p5LsWs = new WebSocket(`${proto}//${location.host}/ws/live-screener`);
+      p5LsWs.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(ev.data || '{}');
+          if (msg.type === 'live_screen:state' || msg.type === 'live_screen:stopped') {
+            renderLiveScreenP5(msg);
+          } else if (msg.type === 'live_screen:warmup') {
+            renderLiveScreenP5({ ...(p5LsLastState || {}), ...msg, phase: 'warming_up', running: true });
+          } else if (msg.type === 'live_screen:tick') {
+            renderLiveScreenP5({
+              ...(p5LsLastState || {}),
+              ...msg,
+              live: {
+                active_feed: msg.active_feed,
+                tick_seq: msg.tick_seq,
+                ticks_processed: msg.ticks_processed,
+                latency_ms: msg.latency_ms,
+                last_tick_ist: msg.last_tick_ist,
+              },
+            });
+          }
+        } catch {}
+      };
+    }
+
     function switchP5Tab(tab) {
       p5.tabSc.classList.toggle('active', tab === 'screener');
+      const tabLs = document.getElementById('p5TabLiveScreen');
+      const panLs = document.getElementById('p5PanelLiveScreen');
+      if (tabLs) tabLs.classList.toggle('active', tab === 'live_screen');
       p5.tabBt.classList.toggle('active', tab === 'backtest');
       p5.tabRk.classList.toggle('active', tab === 'risk');
       p5.panSc.style.display = tab === 'screener' ? 'block' : 'none';
+      if (panLs) panLs.style.display = tab === 'live_screen' ? 'block' : 'none';
       p5.panBt.style.display = tab === 'backtest' ? 'block' : 'none';
       p5.panRk.style.display = tab === 'risk' ? 'block' : 'none';
+      if (tab === 'live_screen') connectLiveScreenWsP5();
       if (tab === 'risk') loadRiskStatusP5();
     }
 
@@ -2768,12 +2923,64 @@
       }
     }
 
+    document.getElementById('p5SyncCsvBtn').addEventListener('click', async () => {
+      const btn = document.getElementById('p5SyncCsvBtn');
+      const note = document.getElementById('p5CsvSyncNote');
+      btn.disabled = true;
+      btn.textContent = 'Syncing NSE CSVs…';
+      try {
+        const res = await fetch('/api/analytics/universes/sync', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+        const body = await res.json();
+        note.style.display = 'block';
+        note.className = body.failed_count ? 'feedback err' : 'feedback ok';
+        note.textContent = `Synced ${body.synced_count || 0} NSE CSV universe file(s) at ${body.updated_at_ist || ''}.`;
+        await loadAnalyticsMetaP5(false);
+      } catch (err) {
+        note.style.display = 'block';
+        note.className = 'feedback err';
+        note.textContent = err.message || 'NSE CSV sync failed.';
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Sync NSE CSVs';
+      }
+    });
     p5.reloadBtn.addEventListener('click', () => loadAnalyticsMetaP5(true));
     p5.scUni.addEventListener('change', () => {
       if (p5.scUni.value !== 'CUSTOM') p5.scSym.value = '';
       else if (!p5.scSym.value.trim()) p5.scSym.value = 'RELIANCE, TCS, INFY, HDFCBANK, ICICIBANK, SBIN, BHARTIARTL, ITC, LT, AXISBANK';
     });
     p5.scPreset.addEventListener('change', syncActiveParamsP5);
+    document.getElementById('p5LsPreset').addEventListener('change', syncActiveParamsP5);
+    document.getElementById('p5LsMatchedOnly').addEventListener('change', () => renderLiveScreenP5(p5LsLastState));
+    document.getElementById('p5LsStartBtn').addEventListener('click', async () => {
+      connectLiveScreenWsP5();
+      const syms = document.getElementById('p5LsSymbols').value.split(/[,\s]+/).map((s) => s.trim().toUpperCase()).filter(Boolean);
+      const tfNum = Math.max(1, parseInt(document.getElementById('p5LsTfNum').value, 10) || 1);
+      const tfUnit = document.getElementById('p5LsTfUnit').value === 'minute' ? 'minute' : 'day';
+      const prov = document.getElementById('p5LsProvider').value;
+      const res = await fetch('/api/analytics/live-screener/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          symbols: syms.length ? syms : null,
+          universe: document.getElementById('p5LsUniverse').value,
+          exchange: 'NSE',
+          timeframe: `${tfNum}${tfUnit}`,
+          screen_id: document.getElementById('p5LsPreset').value,
+          params: readParamValuesP5(document.getElementById('p5LsParamsBox')),
+          provider: prov === 'auto' ? null : prov,
+          backend: document.getElementById('p5LsBackend').value || 'auto',
+          poll_interval_sec: Math.max(1, Number(document.getElementById('p5LsInterval').value) || 2),
+        }),
+      });
+      const body = await res.json();
+      if (res.ok) renderLiveScreenP5(body);
+      else document.getElementById('p5LsMeta').textContent = body.detail || 'Failed to start Live Screen';
+    });
+    document.getElementById('p5LsStopBtn').addEventListener('click', async () => {
+      const res = await fetch('/api/analytics/live-screener/stop', { method: 'POST' });
+      if (res.ok) renderLiveScreenP5(await res.json());
+    });
     p5.btStrat.addEventListener('change', syncActiveParamsP5);
     p5.scCancelBtn.addEventListener('click', () => {
       if (p5.scJobId) fetch(`/api/analytics/jobs/${encodeURIComponent(p5.scJobId)}/cancel`, { method: 'POST' });
@@ -2782,6 +2989,7 @@
       if (p5.btJobId) fetch(`/api/analytics/jobs/${encodeURIComponent(p5.btJobId)}/cancel`, { method: 'POST' });
     });
     p5.tabSc.addEventListener('click', () => switchP5Tab('screener'));
+    document.getElementById('p5TabLiveScreen').addEventListener('click', () => switchP5Tab('live_screen'));
     p5.tabBt.addEventListener('click', () => switchP5Tab('backtest'));
     p5.tabRk.addEventListener('click', () => switchP5Tab('risk'));
     p5.scBtn.addEventListener('click', runScreenerP5);

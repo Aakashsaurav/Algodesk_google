@@ -20,12 +20,15 @@ from core.historical import (
     historical_data_manager,
     normalize_timeframe,
     parse_timeframe,
+    resample_ohlcv_rows,
     resolve_base_timeframe,
 )
 from core.jobs import JobCancelledError
 from indicators.toolkit import IndicatorToolkit, available_backends
 from screener.base import ColumnSpec
+from screener.nse_universe_sync import nse_universe_sync
 from screener.registry import ScreenRegistry, screen_registry
+from screener.sr_engine import filter_complete_weekly_candles, short_tf_label, slice_candles_as_of
 from screener.universes import UniverseResolver, universe_resolver
 
 
@@ -83,6 +86,17 @@ class ScreenerEngine:
         self._registry = registry or screen_registry
         self._universes = universes or universe_resolver
 
+    def _resolve_fno_eligible_set(self) -> set[str]:
+        """Resolve NSE F&O eligible underlying symbols from local CSV/SQLite without network calls."""
+        fno_syms: set[str] = set()
+        try:
+            csv_syms, _ = nse_universe_sync.read_universe_csv("NIFTY_FNO")
+            for s in csv_syms:
+                fno_syms.add(str(s).strip().upper())
+        except Exception:
+            pass
+        return fno_syms
+
     def _load_candles(
         self,
         *,
@@ -115,6 +129,287 @@ class ScreenerEngine:
         )
         return records.get("rows", []), dl_meta
 
+    def _scan_multi_timeframe(
+        self,
+        *,
+        screen: Any,
+        resolved_params: Dict[str, Any],
+        clean_symbols: List[str],
+        uni_bundle: Dict[str, Any],
+        eff_exch: str,
+        target_tfs: List[str],
+        eff_end_d: date,
+        today_ist: date,
+        eff_provider: str,
+        lookback_days: Optional[int],
+        fetcher: Optional[Callable[..., List[Dict[str, Any]]]],
+        progress_cb: Optional[Callable[[int, int, str], None]],
+        cancel_event: Optional[threading.Event],
+    ) -> Dict[str, Any]:
+        """
+        Multi-timeframe orchestration layer reusing canonical base series:
+        - Fetches `1minute` base data ONCE per symbol for 5m / 15m / 1h.
+        - Fetches `1day` base data ONCE per symbol for 1d / 1w.
+        - Derives all higher timeframes in-memory via `resample_ohlcv_rows`
+          and strictly excludes incomplete weekly candles for point-in-time accuracy.
+        - Reports missing `(symbol, timeframe, reason)` explicitly without
+          fabricating candles or silently substituting daily data for intraday.
+        """
+        to_date = eff_end_d.isoformat()
+        intraday_tfs = [t for t in target_tfs if resolve_base_timeframe(t) == "1minute"]
+        daily_tfs = [t for t in target_tfs if resolve_base_timeframe(t) == "1day"]
+
+        def _req_bars_for(tf_name: str) -> int:
+            if hasattr(screen, "required_bars_for_timeframe"):
+                return int(screen.required_bars_for_timeframe(tf_name, resolved_params))
+            return int(screen.required_bars(resolved_params))
+
+        intra_days = 0
+        if intraday_tfs:
+            intra_days = max(compute_auto_lookback_days(_req_bars_for(t), t) for t in intraday_tfs)
+            if lookback_days is not None and int(lookback_days) > 0:
+                intra_days = max(intra_days, min(int(lookback_days), 180))
+        daily_days = 0
+        if daily_tfs:
+            daily_days = max(compute_auto_lookback_days(_req_bars_for(t), t) for t in daily_tfs)
+            if lookback_days is not None and int(lookback_days) > 0:
+                daily_days = max(daily_days, min(int(lookback_days), 3650))
+
+        intra_from_date = (eff_end_d - timedelta(days=intra_days)).isoformat() if intra_days > 0 else to_date
+        daily_from_date = (eff_end_d - timedelta(days=daily_days)).isoformat() if daily_days > 0 else to_date
+        overall_from_date = min(
+            [d for d in (intra_from_date if intraday_tfs else None, daily_from_date if daily_tfs else None) if d]
+            or [to_date]
+        )
+
+        fno_set = self._resolve_fno_eligible_set()
+        declared_cols = screen.get_columns(resolved_params)
+
+        all_rows: List[Dict[str, Any]] = []
+        missing_data: List[Dict[str, str]] = []
+        errors: List[Dict[str, str]] = []
+        evaluated_symbols = 0
+        total_api_calls = 0
+        total_cached_skipped = 0
+
+        total = len(clean_symbols)
+        for idx, sym in enumerate(clean_symbols):
+            if cancel_event is not None and cancel_event.is_set():
+                raise JobCancelledError(f"Screener cancelled at {idx}/{total} ({sym}).")
+            if progress_cb:
+                progress_cb(
+                    idx,
+                    total,
+                    f"Scanning {sym} ({idx + 1}/{total}) across {len(target_tfs)} TFs as of {to_date}...",
+                )
+
+            sym_api_calls = 0
+            sym_norm = sym.strip().upper()
+            candles_by_tf: Dict[str, List[Dict[str, Any]]] = {}
+            sym_missing: List[Dict[str, str]] = []
+
+            # 1) Intraday base fetch: download & read `1minute` ONCE per symbol
+            if intraday_tfs:
+                raw_1m: List[Dict[str, Any]] = []
+                intra_err = ""
+                try:
+                    dl_1m = self._hist.download(
+                        symbol=sym,
+                        exchange=eff_exch,
+                        timeframe="1minute",
+                        from_date=intra_from_date,
+                        to_date=to_date,
+                        provider=eff_provider,
+                        fetcher=fetcher,
+                    )
+                    sym_norm = dl_1m["symbol"]
+                    sym_api_calls += int(dl_1m.get("api_calls_made", 0))
+                    total_api_calls += int(dl_1m.get("api_calls_made", 0))
+                    total_cached_skipped += int(dl_1m.get("existing_days_skipped", 0))
+                    rec_1m = self._hist.get_records(
+                        symbol=dl_1m["symbol"],
+                        exchange=dl_1m["exchange"],
+                        timeframe="1minute",
+                        from_date=None,
+                        to_date=to_date,
+                        view="full",
+                    )
+                    raw_1m = slice_candles_as_of(rec_1m.get("rows", []), to_date)
+                except JobCancelledError:
+                    raise
+                except Exception as exc:
+                    intra_err = str(exc)
+
+                if raw_1m:
+                    for itf in intraday_tfs:
+                        resampled = raw_1m if itf == "1minute" else resample_ohlcv_rows(raw_1m, itf, exchange=eff_exch)
+                        candles_by_tf[itf] = resampled
+                else:
+                    reason = intra_err or f"No 1minute intraday data available from {eff_provider.upper()} up to {to_date}"
+                    for itf in intraday_tfs:
+                        sym_missing.append(
+                            {
+                                "symbol": sym_norm,
+                                "exchange": eff_exch,
+                                "timeframe": short_tf_label(itf),
+                                "canonical_timeframe": itf,
+                                "reason": reason,
+                            }
+                        )
+
+            # 2) Daily/Weekly base fetch: download & read `1day` ONCE per symbol
+            if daily_tfs:
+                raw_1d: List[Dict[str, Any]] = []
+                daily_err = ""
+                try:
+                    dl_1d = self._hist.download(
+                        symbol=sym,
+                        exchange=eff_exch,
+                        timeframe="1day",
+                        from_date=daily_from_date,
+                        to_date=to_date,
+                        provider=eff_provider,
+                        fetcher=fetcher,
+                    )
+                    sym_norm = dl_1d["symbol"]
+                    sym_api_calls += int(dl_1d.get("api_calls_made", 0))
+                    total_api_calls += int(dl_1d.get("api_calls_made", 0))
+                    total_cached_skipped += int(dl_1d.get("existing_days_skipped", 0))
+                    rec_1d = self._hist.get_records(
+                        symbol=dl_1d["symbol"],
+                        exchange=dl_1d["exchange"],
+                        timeframe="1day",
+                        from_date=None,
+                        to_date=to_date,
+                        view="full",
+                    )
+                    raw_1d = slice_candles_as_of(rec_1d.get("rows", []), to_date)
+                except JobCancelledError:
+                    raise
+                except Exception as exc:
+                    daily_err = str(exc)
+
+                if raw_1d:
+                    for dtf in daily_tfs:
+                        if dtf == "1day":
+                            candles_by_tf[dtf] = raw_1d
+                        elif dtf == "1week":
+                            candles_by_tf[dtf] = filter_complete_weekly_candles(raw_1d, as_of_date=to_date, exchange=eff_exch)
+                        else:
+                            candles_by_tf[dtf] = resample_ohlcv_rows(raw_1d, dtf, exchange=eff_exch)
+                else:
+                    reason = daily_err or f"No 1day data available from {eff_provider.upper()} up to {to_date}"
+                    for dtf in daily_tfs:
+                        sym_missing.append(
+                            {
+                                "symbol": sym_norm,
+                                "exchange": eff_exch,
+                                "timeframe": short_tf_label(dtf),
+                                "canonical_timeframe": dtf,
+                                "reason": reason,
+                            }
+                        )
+
+            missing_data.extend(sym_missing)
+
+            if not candles_by_tf:
+                errors.append(
+                    {
+                        "symbol": sym_norm,
+                        "error": sym_missing[0]["reason"] if sym_missing else f"No historical candles available up to {to_date}.",
+                    }
+                )
+                continue
+
+            try:
+                eval_out = screen.evaluate_multi_timeframe(
+                    symbol=sym_norm,
+                    exchange=eff_exch,
+                    candles_by_tf=candles_by_tf,
+                    params=resolved_params,
+                    as_of_date=to_date,
+                    fno_eligible=(sym_norm in fno_set),
+                    api_calls=sym_api_calls,
+                )
+                if eval_out.get("evaluated_timeframes"):
+                    evaluated_symbols += 1
+                if eval_out.get("missing_data"):
+                    missing_data.extend(eval_out["missing_data"])
+                if eval_out.get("rows"):
+                    all_rows.extend(eval_out["rows"])
+            except JobCancelledError:
+                raise
+            except Exception as exc:
+                errors.append({"symbol": sym_norm, "error": str(exc)})
+
+        if progress_cb:
+            progress_cb(
+                total,
+                total,
+                f"Multi-TF scan completed ({evaluated_symbols}/{total} symbols, {len(all_rows)} S&R events).",
+            )
+
+        all_rows.sort(
+            key=lambda r: (
+                1 if r.get("classification") == "Major" else 0,
+                float(r.get("strength", 0.0)),
+                -abs(float(r.get("distance_pct", 0.0))),
+            ),
+            reverse=True,
+        )
+
+        major_count = sum(1 for r in all_rows if r.get("classification") == "Major")
+        minor_count = sum(1 for r in all_rows if r.get("classification") == "Minor")
+        short_tfs = [short_tf_label(t) for t in target_tfs]
+        storage_meta = self._hist.storage_info()
+
+        return {
+            "ok": True,
+            "screen_id": screen.id,
+            "preset": screen.id,
+            "preset_label": screen.name,
+            "screen_name": screen.name,
+            "multi_timeframe": True,
+            "multi_row": True,
+            "params": resolved_params,
+            "columns": [c.to_dict() for c in declared_cols],
+            "universe": uni_bundle["universe"],
+            "universe_label": uni_bundle["label"],
+            "as_of_date": to_date,
+            "from_date": overall_from_date,
+            "is_historical_as_of": eff_end_d < today_ist,
+            "provider": eff_provider,
+            "exchange": eff_exch,
+            "timeframe": ",".join(short_tfs),
+            "timeframes": short_tfs,
+            "canonical_timeframes": target_tfs,
+            "base_timeframe": "1minute+1day" if (intraday_tfs and daily_tfs) else ("1minute" if intraday_tfs else "1day"),
+            "resampled": True,
+            "required_bars": int(screen.required_bars(resolved_params)),
+            "lookback_days": max(daily_days, intra_days),
+            "lookback_mode": "manual_min_auto" if lookback_days else "auto",
+            "storage_backend": storage_meta["active_mode"],
+            "ta_backends": available_backends(),
+            "scanned_count": len(clean_symbols),
+            "evaluated_count": evaluated_symbols,
+            "matched_count": len(all_rows),
+            "events_found": len(all_rows),
+            "major_count": major_count,
+            "minor_count": minor_count,
+            "missing_data_count": len(missing_data),
+            "missing_data": missing_data,
+            "price_adjustment_note": (
+                "Split-adjusted historical OHLCV preserved without dividend total-return distortion; "
+                "incomplete weekly candles excluded as of as_of_date."
+            ),
+            "api_calls_made": total_api_calls,
+            "existing_days_skipped": total_cached_skipped,
+            "generated_at_ist": datetime.now(tz=IST_TZ).isoformat(timespec="seconds"),
+            "results": all_rows,
+            "all_evaluated_count": evaluated_symbols,
+            "errors": errors,
+        }
+
     def scan(
         self,
         *,
@@ -122,6 +417,7 @@ class ScreenerEngine:
         universe: str = "CUSTOM",
         exchange: str = "NSE",
         timeframe: str = "1day",
+        timeframes: Optional[List[str]] = None,
         lookback_days: Optional[int] = None,
         as_of_date: Optional[str] = None,
         screen_id: Optional[str] = None,
@@ -137,10 +433,52 @@ class ScreenerEngine:
         screen = self._registry.get(target_screen_id)
         resolved_params = screen.resolve_params(params)
 
-        tf = normalize_timeframe(timeframe)
-        base_tf = resolve_base_timeframe(tf)
         eff_exch = (exchange or "NSE").strip().upper()
         eff_provider = (provider or config.ACTIVE_DATA_CONNECTION or "yfinance").strip().lower()
+
+        today_ist = datetime.now(tz=IST_TZ).date()
+        eff_end_d: date = _parse_iso_date(as_of_date, default=today_ist)
+        if eff_end_d > today_ist:
+            eff_end_d = today_ist
+
+        # Backward-compatible Multi-Timeframe orchestration path
+        if bool(getattr(screen, "supports_multi_timeframe", False)) and hasattr(screen, "evaluate_multi_timeframe"):
+            raw_tfs = timeframes if (timeframes and len(timeframes) > 0) else (
+                list(getattr(screen, "default_timeframes", []) or []) or [timeframe]
+            )
+            norm_tfs: List[str] = []
+            seen_tfs: set[str] = set()
+            for t in raw_tfs:
+                nt = normalize_timeframe(str(t))
+                if nt not in seen_tfs:
+                    seen_tfs.add(nt)
+                    norm_tfs.append(nt)
+
+            uni_bundle = self._universes.resolve(
+                universe=universe,
+                custom_symbols=symbols,
+                exchange=eff_exch,
+                timeframe=norm_tfs[0] if norm_tfs else "1day",
+            )
+            return self._scan_multi_timeframe(
+                screen=screen,
+                resolved_params=resolved_params,
+                clean_symbols=uni_bundle["symbols"],
+                uni_bundle=uni_bundle,
+                eff_exch=eff_exch,
+                target_tfs=norm_tfs,
+                eff_end_d=eff_end_d,
+                today_ist=today_ist,
+                eff_provider=eff_provider,
+                lookback_days=lookback_days,
+                fetcher=fetcher,
+                progress_cb=progress_cb,
+                cancel_event=cancel_event,
+            )
+
+        # Standard Single-Timeframe path (100% preserved for all existing screens)
+        tf = normalize_timeframe(timeframe)
+        base_tf = resolve_base_timeframe(tf)
 
         req_bars = int(screen.required_bars(resolved_params))
         auto_days = compute_auto_lookback_days(req_bars, tf)
@@ -151,10 +489,6 @@ class ScreenerEngine:
             days = auto_days
             lookback_mode = "auto"
 
-        today_ist = datetime.now(tz=IST_TZ).date()
-        eff_end_d: date = _parse_iso_date(as_of_date, default=today_ist)
-        if eff_end_d > today_ist:
-            eff_end_d = today_ist
         eff_start_d = eff_end_d - timedelta(days=days)
         from_date = eff_start_d.isoformat()
         to_date = eff_end_d.isoformat()

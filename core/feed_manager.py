@@ -1230,6 +1230,108 @@ class HotStandbyFeedManager:
         self._broadcast(res)
         return res
 
+    def fetch_live_quotes_for(
+        self,
+        symbols: List[Any],
+        *,
+        exchange: str = "NSE",
+        provider: Optional[str] = None,
+        batch_size: int = 40,
+    ) -> Dict[str, Any]:
+        """
+        Fetch live quotes for an arbitrary list of symbols using the active
+        hot-standby provider chain WITHOUT modifying the user's persisted
+        Live Terminal watchlist. Batches large lists automatically.
+        """
+        subs: List[Dict[str, str]] = []
+        seen: set[str] = set()
+        default_exch = (exchange or "NSE").strip().upper()
+        for item in symbols or []:
+            if isinstance(item, dict):
+                sym = str(item.get("symbol") or "").strip().upper()
+                exch = str(item.get("exchange") or default_exch).strip().upper()
+                itype = str(item.get("instrument_type") or "EQUITY").strip().upper()
+                ikey = str(item.get("instrument_key") or "").strip()
+            else:
+                sym = str(item or "").strip().upper()
+                exch = default_exch
+                itype = "EQUITY"
+                ikey = ""
+            if not sym:
+                continue
+            key = f"{exch}:{sym}"
+            if key in seen:
+                continue
+            seen.add(key)
+            subs.append(
+                {
+                    "symbol": sym,
+                    "exchange": exch,
+                    "instrument_type": itype,
+                    "instrument_key": ikey,
+                }
+            )
+
+        if not subs:
+            return {
+                "ok": True,
+                "active_feed": self._active_feed_id,
+                "latency_ms": 0.0,
+                "quotes": {},
+                "ts_ist": datetime.now(tz=IST_TZ).isoformat(timespec="seconds"),
+            }
+
+        with self._lock:
+            pref = (provider or "").strip().lower()
+            start_fid = pref if pref in self._fetchers else self._primary_id
+            chain = self._ordered_chain(start_fid)
+            if self._forced_failover and len(chain) > 1 and not pref:
+                candidates = [c for c in chain if c != self._primary_id]
+            else:
+                candidates = list(chain)
+
+        step = max(1, int(batch_size or 40))
+        last_err = ""
+
+        for fid in candidates:
+            fetcher = self._fetchers.get(fid)
+            if fetcher is None:
+                continue
+            started = time.perf_counter()
+            merged_quotes: Dict[str, Dict[str, Any]] = {}
+            is_builtin = fetcher in _DEFAULT_FETCHERS.values()
+            try:
+                for i in range(0, len(subs), step):
+                    chunk = subs[i : i + step]
+                    arg = chunk if is_builtin else [s["symbol"] for s in chunk]
+                    chunk_res = fetcher(arg) or {}
+                    for k, q in chunk_res.items():
+                        q_sym = str(q.get("symbol") or k).strip().upper()
+                        if q_sym:
+                            merged_quotes[q_sym] = {**q, "symbol": q_sym, "source": q.get("source") or fid}
+                if not merged_quotes:
+                    raise RuntimeError(f"{fid} returned empty quote snapshot")
+                elapsed_ms = round((time.perf_counter() - started) * 1000.0, 1)
+                return {
+                    "ok": True,
+                    "active_feed": fid,
+                    "latency_ms": elapsed_ms,
+                    "quotes": merged_quotes,
+                    "ts_ist": datetime.now(tz=IST_TZ).isoformat(timespec="seconds"),
+                }
+            except Exception as exc:
+                last_err = f"{fid}: {exc}"
+                logger.debug("fetch_live_quotes_for failed on %s: %s", fid, exc)
+
+        return {
+            "ok": False,
+            "active_feed": self._active_feed_id,
+            "latency_ms": None,
+            "quotes": {},
+            "error": last_err or "All live feeds unavailable.",
+            "ts_ist": datetime.now(tz=IST_TZ).isoformat(timespec="seconds"),
+        }
+
     def trigger_failover(self, reason: str = "Operator failover drill / primary drop") -> Dict[str, Any]:
         with self._lock:
             chain = self._ordered_chain(self._primary_id)

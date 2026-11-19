@@ -301,6 +301,83 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
                 hub_service.unregister_live_listener(listener_q)
             return
 
+        if path == "/ws/live-screener":
+            if not perform_handshake(self):
+                self._send_json(400, {"detail": "Expected WebSocket Upgrade header"})
+                return
+            self.close_connection = True
+            listener_q = hub_service.register_live_screener_listener()
+            send_lock = threading.Lock()
+            stop_event = threading.Event()
+            sock: socket.socket = self.connection
+
+            def _lsc_writer() -> None:
+                try:
+                    initial = hub_service.get_live_screener_status()
+                    send_ws_text(sock, json.dumps({"type": "live_screen:state", **initial}), send_lock)
+                    while not stop_event.is_set():
+                        try:
+                            ev = listener_q.get(timeout=1.0)
+                            send_ws_text(sock, json.dumps(ev), send_lock)
+                        except queue.Empty:
+                            continue
+                except OSError:
+                    stop_event.set()
+
+            writer_thread = threading.Thread(target=_lsc_writer, daemon=True)
+            writer_thread.start()
+            try:
+                sock.settimeout(1.0)
+                while not stop_event.is_set():
+                    try:
+                        frame = read_ws_frame(sock)
+                    except socket.timeout:
+                        continue
+                    if frame is None:
+                        break
+                    opcode, raw_payload = frame
+                    if opcode == OPCODE_CLOSE:
+                        send_ws_close(sock, send_lock)
+                        break
+                    if opcode == OPCODE_PING:
+                        send_ws_pong(sock, raw_payload, send_lock)
+                        continue
+                    if opcode == OPCODE_TEXT:
+                        try:
+                            cmd = json.loads(raw_payload.decode("utf-8"))
+                        except Exception:
+                            cmd = {}
+                        action = str(cmd.get("action") or "").strip().lower()
+                        try:
+                            if action == "start":
+                                res = hub_service.start_live_screener(
+                                    symbols=cmd.get("symbols") if isinstance(cmd.get("symbols"), list) else None,
+                                    universe=str(cmd.get("universe", "CUSTOM")),
+                                    exchange=str(cmd.get("exchange", "NSE")),
+                                    timeframe=str(cmd.get("timeframe", "1day")),
+                                    screen_id=cmd.get("screen_id"),
+                                    preset=str(cmd.get("preset", "all_metrics")),
+                                    params=cmd.get("params") if isinstance(cmd.get("params"), dict) else None,
+                                    provider=cmd.get("provider"),
+                                    backend=str(cmd.get("backend", "auto")),
+                                    poll_interval_sec=float(cmd.get("poll_interval_sec", 2.0) or 2.0),
+                                )
+                                send_ws_text(sock, json.dumps({"type": "live_screen:state", **res}), send_lock)
+                            elif action == "stop":
+                                res = hub_service.stop_live_screener()
+                                send_ws_text(sock, json.dumps({"type": "live_screen:stopped", **res}), send_lock)
+                            elif action == "status":
+                                res = hub_service.get_live_screener_status()
+                                send_ws_text(sock, json.dumps({"type": "live_screen:state", **res}), send_lock)
+                        except Exception as exc:
+                            send_ws_text(sock, json.dumps({"type": "error", "detail": str(exc)}), send_lock)
+            except OSError:
+                pass
+            finally:
+                stop_event.set()
+                hub_service.unregister_live_screener_listener(listener_q)
+            return
+
         if path == "/api/audit/verify":
             limit = int(query.get("limit", ["25"])[0] or 25)
             self._send_json(200, hub_service.verify_audit_chain(limit=limit))
@@ -308,6 +385,14 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
 
         if path == "/api/analytics/meta":
             self._send_json(200, hub_service.get_analytics_metadata())
+            return
+
+        if path == "/api/analytics/universes":
+            self._send_json(200, hub_service.list_nse_universes())
+            return
+
+        if path == "/api/analytics/live-screener/status":
+            self._send_json(200, hub_service.get_live_screener_status())
             return
 
         if path == "/api/analytics/indicators/verify":
@@ -530,6 +615,33 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
                     self._send_json(404, {"detail": str(exc)})
                 return
 
+            if path == "/api/analytics/universes/sync":
+                u_ids = body.get("universes") if isinstance(body.get("universes"), list) else None
+                self._send_json(200, hub_service.sync_nse_universes(universe_ids=u_ids))
+                return
+
+            if path == "/api/analytics/live-screener/start":
+                self._send_json(
+                    200,
+                    hub_service.start_live_screener(
+                        symbols=body.get("symbols") if isinstance(body.get("symbols"), list) else None,
+                        universe=str(body.get("universe", "CUSTOM")),
+                        exchange=str(body.get("exchange", "NSE")),
+                        timeframe=str(body.get("timeframe", "1day")),
+                        screen_id=body.get("screen_id"),
+                        preset=str(body.get("preset", "all_metrics")),
+                        params=body.get("params") if isinstance(body.get("params"), dict) else None,
+                        provider=body.get("provider"),
+                        backend=str(body.get("backend", "auto")),
+                        poll_interval_sec=float(body.get("poll_interval_sec", 2.0) or 2.0),
+                    ),
+                )
+                return
+
+            if path == "/api/analytics/live-screener/stop":
+                self._send_json(200, hub_service.stop_live_screener())
+                return
+
             if path == "/api/analytics/screener":
                 query = parse_qs(parsed.query)
                 async_q = query.get("async_job", [None])[0]
@@ -541,6 +653,7 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
                         universe=str(body.get("universe", "CUSTOM")),
                         exchange=str(body.get("exchange", "NSE")),
                         timeframe=str(body.get("timeframe", "1day")),
+                        timeframes=body.get("timeframes") if isinstance(body.get("timeframes"), list) else None,
                         lookback_days=(
                             int(body["lookback_days"])
                             if body.get("lookback_days") not in (None, "", 0)
