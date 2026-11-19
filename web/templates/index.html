@@ -720,17 +720,14 @@
             </select>
           </div>
           <div class="field">
-            <label for="histTimeframe">Timeframe</label>
-            <select id="histTimeframe">
-              <option value="1day">1 Day (Canonical)</option>
-              <option value="1week">1 Week (from 1d)</option>
-              <option value="1month">1 Month (from 1d)</option>
-              <option value="1minute">1 Min (Canonical)</option>
-              <option value="5minute">5 Min (from 1m)</option>
-              <option value="15minute">15 Min (from 1m)</option>
-              <option value="30minute">30 Min (from 1m)</option>
-              <option value="60minute">60 Min (from 1m)</option>
-            </select>
+            <label for="histTimeframeNum">Timeframe</label>
+            <div style="display:flex; gap:6px;">
+              <input id="histTimeframeNum" class="mono" type="number" min="1" max="1440" step="1" value="1" style="width:72px;" />
+              <select id="histTimeframeUnit" style="flex:1;">
+                <option value="minute">minute</option>
+                <option value="day" selected>day</option>
+              </select>
+            </div>
           </div>
           <div class="field">
             <label for="histFrom">From Date</label>
@@ -928,9 +925,17 @@
             <button id="p5ScCancelBtn" class="btn" type="button" style="display:none; border-color:var(--red); color:#fca5a5;">Cancel</button>
           </div>
         </div>
-        <div style="display:grid; grid-template-columns:repeat(4, minmax(0,1fr)); gap:12px; margin-top:12px;">
-          <div class="field"><label for="p5ScTf">Timeframe (API: 1m/1d)</label><select id="p5ScTf"><option value="1day">1 Day</option><option value="1week">1 Week (from 1d)</option><option value="1month">1 Month (from 1d)</option><option value="1minute">1 Min</option><option value="5minute">5 Min (from 1m)</option><option value="15minute">15 Min (from 1m)</option><option value="30minute">30 Min (from 1m)</option><option value="60minute">60 Min (from 1m)</option></select></div>
-          <div class="field"><label>Lookback Window</label><div id="p5ScAutoWin" class="mono" style="min-height:38px;display:flex;align-items:center;padding:0 10px;border:1px solid var(--border);border-radius:8px;background:var(--bg);font-size:11px;color:var(--text-muted);">Auto (from screen indicators)</div></div>
+        <div style="display:grid; grid-template-columns:repeat(3, minmax(0,1fr)); gap:12px; margin-top:12px;">
+          <div class="field">
+            <label for="p5ScTfNum">Timeframe (API: 1m/1d)</label>
+            <div style="display:flex; gap:6px;">
+              <input id="p5ScTfNum" class="mono" type="number" min="1" max="1440" step="1" value="1" style="width:72px;" />
+              <select id="p5ScTfUnit" style="flex:1;">
+                <option value="minute">minute</option>
+                <option value="day" selected>day</option>
+              </select>
+            </div>
+          </div>
           <div class="field"><label for="p5ScProvider">Data Source</label><select id="p5ScProvider"><option value="auto">Assigned Connection</option><option value="yfinance">Yahoo Finance</option><option value="upstox">Upstox</option><option value="zerodha">Zerodha Kite</option></select></div>
           <div class="field"><label for="p5ScBackend">Indicator Engine</label><select id="p5ScBackend"><option value="auto">Auto (TA-Lib → pandas-ta → Built-in)</option><option value="builtin">Built-in Python O(N)</option></select></div>
         </div>
@@ -964,17 +969,14 @@
             </select>
           </div>
           <div class="field">
-            <label for="p5BtTf">Timeframe</label>
-            <select id="p5BtTf">
-              <option value="1day">1 Day</option>
-              <option value="1week">1 Week (from 1d)</option>
-              <option value="1month">1 Month (from 1d)</option>
-              <option value="1minute">1 Min</option>
-              <option value="5minute">5 Min (from 1m)</option>
-              <option value="15minute">15 Min (from 1m)</option>
-              <option value="30minute">30 Min (from 1m)</option>
-              <option value="60minute">60 Min (from 1m)</option>
-            </select>
+            <label for="p5BtTfNum">Timeframe</label>
+            <div style="display:flex; gap:6px;">
+              <input id="p5BtTfNum" class="mono" type="number" min="1" max="1440" step="1" value="1" style="width:68px;" />
+              <select id="p5BtTfUnit" style="flex:1;">
+                <option value="minute">minute</option>
+                <option value="day" selected>day</option>
+              </select>
+            </div>
           </div>
           <div class="field">
             <label for="p5BtFrom">From</label>
@@ -1710,7 +1712,25 @@
       fnoContractsRow: document.getElementById('fnoContractsRow'),
       sym: document.getElementById('histSymbol'),
       exch: document.getElementById('histExchange'),
-      tf: document.getElementById('histTimeframe'),
+      tf: {
+        get value() {
+          const n = Math.max(1, Number.parseInt(document.getElementById('histTimeframeNum').value, 10) || 1);
+          const u = document.getElementById('histTimeframeUnit').value === 'minute' ? 'minute' : 'day';
+          return `${n}${u}`;
+        },
+        set value(raw) {
+          const m = String(raw || '1day').trim().toLowerCase().match(/^(\d+)\s*(minute|min|m|day|d|week|w|month|mo)/);
+          const numEl = document.getElementById('histTimeframeNum');
+          const unitEl = document.getElementById('histTimeframeUnit');
+          if (!m) { numEl.value = '1'; unitEl.value = 'day'; return; }
+          const n = Math.max(1, Number.parseInt(m[1], 10) || 1);
+          const u = m[2];
+          if (u.startsWith('m') && u !== 'mo' && u !== 'month') { numEl.value = String(n); unitEl.value = 'minute'; }
+          else if (u.startsWith('w')) { numEl.value = String(n * 7); unitEl.value = 'day'; }
+          else if (u === 'mo' || u === 'month') { numEl.value = String(n * 30); unitEl.value = 'day'; }
+          else { numEl.value = String(n); unitEl.value = 'day'; }
+        },
+      },
       from: document.getElementById('histFrom'),
       to: document.getElementById('histTo'),
       prov: document.getElementById('histProvider'),
@@ -2383,8 +2403,13 @@
       scSym: document.getElementById('p5ScSymbols'),
       scPreset: document.getElementById('p5ScPreset'),
       scAsOf: document.getElementById('p5ScAsOf'),
-      scTf: document.getElementById('p5ScTf'),
-      scAutoWin: document.getElementById('p5ScAutoWin'),
+      scTf: {
+        get value() {
+          const n = Math.max(1, Number.parseInt(document.getElementById('p5ScTfNum').value, 10) || 1);
+          const u = document.getElementById('p5ScTfUnit').value === 'minute' ? 'minute' : 'day';
+          return `${n}${u}`;
+        },
+      },
       scProv: document.getElementById('p5ScProvider'),
       scBackend: document.getElementById('p5ScBackend'),
       scParamsBox: document.getElementById('p5ScParamsBox'),
@@ -2395,7 +2420,13 @@
       btSym: document.getElementById('p5BtSymbol'),
       btExch: document.getElementById('p5BtExch'),
       btStrat: document.getElementById('p5BtStrategy'),
-      btTf: document.getElementById('p5BtTf'),
+      btTf: {
+        get value() {
+          const n = Math.max(1, Number.parseInt(document.getElementById('p5BtTfNum').value, 10) || 1);
+          const u = document.getElementById('p5BtTfUnit').value === 'minute' ? 'minute' : 'day';
+          return `${n}${u}`;
+        },
+      },
       btFrom: document.getElementById('p5BtFrom'),
       btTo: document.getElementById('p5BtTo'),
       btCap: document.getElementById('p5BtCap'),
@@ -2459,9 +2490,6 @@
       if (!p5.metaData) return;
       const scObj = (p5.metaData.screens || []).find((s) => s.id === p5.scPreset.value);
       renderParamInputsP5(p5.scParamsBox, scObj ? scObj.params : [], 'p5sc_param');
-      if (p5.scAutoWin && scObj) {
-        p5.scAutoWin.textContent = `Auto (${scObj.required_bars || 125} bars ≤ As-Of)`;
-      }
       const btObj = (p5.metaData.strategy_specs || []).find((s) => s.id === p5.btStrat.value);
       renderParamInputsP5(p5.btParamsBox, btObj ? btObj.params : [], 'p5bt_param');
     }
@@ -2480,19 +2508,19 @@
           p5.badges.textContent = `Hot-reloaded .py plugins · Storage: ${stLabel}${taList ? ' · TA: ' + taList : ''}`;
         }
         const curUni = p5.scUni.value;
-        if (Array.isArray(m.universes)) {
+        if (Array.isArray(m.universes) && m.universes.length > 0) {
           p5.scUni.innerHTML = m.universes.map((u) => `<option value="${u.id}">${u.label}</option>`).join('');
           p5.scUni.value = m.universes.some((u) => u.id === curUni) ? curUni : 'CUSTOM';
         }
         const curSc = p5.scPreset.value;
-        if (Array.isArray(m.screens)) {
+        if (Array.isArray(m.screens) && m.screens.length > 0) {
           p5.scPreset.innerHTML = m.screens.map((s) => `<option value="${s.id}">${s.name}</option>`).join('');
-          p5.scPreset.value = m.screens.some((s) => s.id === curSc) ? curSc : (m.screens[0] ? m.screens[0].id : 'all_metrics');
+          p5.scPreset.value = m.screens.some((s) => s.id === curSc) ? curSc : m.screens[0].id;
         }
         const curBt = p5.btStrat.value;
-        if (Array.isArray(m.strategy_specs)) {
+        if (Array.isArray(m.strategy_specs) && m.strategy_specs.length > 0) {
           p5.btStrat.innerHTML = m.strategy_specs.map((s) => `<option value="${s.id}">${s.name}</option>`).join('');
-          p5.btStrat.value = m.strategy_specs.some((s) => s.id === curBt) ? curBt : 'ema_crossover';
+          p5.btStrat.value = m.strategy_specs.some((s) => s.id === curBt) ? curBt : m.strategy_specs[0].id;
         }
         const errs = [
           ...Object.entries((m.file_errors && m.file_errors.screens) || {}).map(([f, msg]) => `[Screen ${f}] ${String(msg).split('\n')[0]}`),

@@ -8,6 +8,7 @@ on save without restarting the server.
 
 from __future__ import annotations
 
+import importlib
 import importlib.util
 import inspect
 import logging
@@ -17,7 +18,7 @@ import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from screener.base import BaseScreen
+import screener.base as _screener_base_mod
 
 logger = logging.getLogger(__name__)
 
@@ -31,11 +32,34 @@ class ScreenRegistry:
 
     def __init__(self, screens_dir: Optional[Path] = None) -> None:
         self._dir = screens_dir or (Path(__file__).resolve().parent / "screens")
+        self._base_file = Path(__file__).resolve().parent / "base.py"
+        self._base_mtime: Optional[int] = self._safe_mtime(self._base_file)
         self._lock = threading.RLock()
         self._mtimes: Dict[Path, int] = {}
-        self._screens: Dict[str, BaseScreen] = {}
+        self._screens: Dict[str, Any] = {}
         self._file_to_ids: Dict[Path, List[str]] = {}
         self._errors: Dict[str, str] = {}
+
+    @staticmethod
+    def _safe_mtime(p: Path) -> Optional[int]:
+        try:
+            return p.stat().st_mtime_ns
+        except OSError:
+            return None
+
+    def _sync_base_module_locked(self) -> bool:
+        """Reload `screener.base` if modified on disk while server is running."""
+        global _screener_base_mod
+        cur_mtime = self._safe_mtime(self._base_file)
+        missing_col = not hasattr(_screener_base_mod, "ColumnSpec")
+        if cur_mtime is not None and (cur_mtime != self._base_mtime or missing_col):
+            try:
+                _screener_base_mod = importlib.reload(_screener_base_mod)
+                self._base_mtime = cur_mtime
+                return True
+            except Exception as exc:
+                logger.warning("Failed reloading screener.base: %s", exc)
+        return False
 
     @property
     def screens_dir(self) -> Path:
@@ -45,6 +69,10 @@ class ScreenRegistry:
         """Scan directory and reload only new/modified/removed `.py` files."""
         with self._lock:
             changed = False
+            if self._sync_base_module_locked():
+                force = True
+                changed = True
+
             if not self._dir.exists():
                 self._screens.clear()
                 self._mtimes.clear()
@@ -86,6 +114,7 @@ class ScreenRegistry:
         self._errors.pop(fpath.name, None)
         self._mtimes[fpath] = mtime
 
+        base_cls = getattr(_screener_base_mod, "BaseScreen")
         mod_name = f"algodesk_screen_{fpath.stem}_{mtime}"
         try:
             spec = importlib.util.spec_from_file_location(mod_name, str(fpath))
@@ -97,7 +126,7 @@ class ScreenRegistry:
 
             discovered_ids: List[str] = []
             for _attr_name, obj in inspect.getmembers(mod):
-                if inspect.isclass(obj) and issubclass(obj, BaseScreen) and obj is not BaseScreen:
+                if inspect.isclass(obj) and issubclass(obj, base_cls) and obj is not base_cls:
                     if inspect.isabstract(obj):
                         continue
                     instance = obj()

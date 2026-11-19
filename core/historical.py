@@ -130,25 +130,70 @@ _TIMEFRAME_ALIASES: Dict[str, str] = {
 }
 
 
-def normalize_timeframe(raw_timeframe: Optional[str]) -> str:
-    tf = (raw_timeframe or "1day").strip().lower()
-    tf = _TIMEFRAME_ALIASES.get(tf, tf)
-    if tf not in VALID_TIMEFRAMES:
+import re
+
+_TIMEFRAME_PATTERN = re.compile(
+    r"^\s*(\d+)\s*(m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|wk|week|weeks|mo|mon|month|months)\s*$"
+)
+
+
+def parse_timeframe(raw_timeframe: Optional[str]) -> Tuple[int, str]:
+    """
+    Parse any user timeframe into `(count, canonical_unit)` where `canonical_unit`
+    is one of `'minute'`, `'day'`, `'week'`, `'month'`.
+    Supports arbitrary positive integers like `1minute`, `2minute`, `7minute`,
+    `75minute`, `1day`, `2day`, `5day`, `30day`, as well as shorthand (`5m`, `2d`, `1h`).
+    """
+    raw = (raw_timeframe or "1day").strip().lower()
+    raw = _TIMEFRAME_ALIASES.get(raw, raw)
+    m = _TIMEFRAME_PATTERN.match(raw)
+    if not m:
         raise ValueError(
-            f"Invalid timeframe '{raw_timeframe}'. Choose from: {', '.join(VALID_TIMEFRAMES.keys())}"
+            f"Invalid timeframe '{raw_timeframe}'. Use a positive integer with 'minute' or 'day' (e.g. 1minute, 5minute, 1day, 3day)."
         )
-    return tf
+    count = int(m.group(1))
+    unit_tok = m.group(2)
+    if count < 1:
+        raise ValueError(f"Timeframe interval must be >= 1, got '{raw_timeframe}'.")
+
+    if unit_tok in {"m", "min", "mins", "minute", "minutes"}:
+        if count > 1440:
+            raise ValueError(f"Minute timeframe cannot exceed 1440 minutes (got {count}).")
+        return count, "minute"
+    if unit_tok in {"h", "hr", "hrs", "hour", "hours"}:
+        mins = count * 60
+        if mins > 1440:
+            raise ValueError(f"Hour timeframe cannot exceed 24 hours (got {count}h).")
+        return mins, "minute"
+    if unit_tok in {"d", "day", "days"}:
+        if count > 365:
+            raise ValueError(f"Day timeframe cannot exceed 365 days (got {count}).")
+        return count, "day"
+    if unit_tok in {"w", "wk", "week", "weeks"}:
+        if count == 1:
+            return 1, "week"
+        return count * 7, "day"
+    if unit_tok in {"mo", "mon", "month", "months"}:
+        if count == 1:
+            return 1, "month"
+        return count * 30, "day"
+    raise ValueError(f"Unsupported timeframe unit in '{raw_timeframe}'.")
+
+
+def normalize_timeframe(raw_timeframe: Optional[str]) -> str:
+    count, unit = parse_timeframe(raw_timeframe)
+    return f"{count}{unit}"
 
 
 def resolve_base_timeframe(raw_timeframe: Optional[str]) -> str:
     """
     Canonical download/storage policy:
-    - Any sub-day timeframe (< 1 day) maps to '1minute'
-    - '1day' and any multi-day timeframe (>= 1 day) maps to '1day'
+    - Any sub-day timeframe (unit == 'minute') maps to '1minute'
+    - '1day' and any multi-day timeframe (unit in {'day', 'week', 'month'}) maps to '1day'
     External broker/Yahoo APIs are ONLY ever called for '1minute' or '1day'.
     """
-    tf = normalize_timeframe(raw_timeframe)
-    return str(VALID_TIMEFRAMES[tf]["base"])
+    _count, unit = parse_timeframe(raw_timeframe)
+    return "1minute" if unit == "minute" else "1day"
 
 
 def resample_ohlcv_rows(
@@ -161,18 +206,18 @@ def resample_ohlcv_rows(
     Resample canonical '1minute' or '1day' OHLCV+OI rows into any derived timeframe.
 
     Rules:
-    - Intraday (3m/5m/10m/15m/30m/60m/75m/120m): Anchored to Indian market open
+    - Intraday (`<N>minute` for any N >= 2): Anchored to Indian market open
       (09:15 IST for NSE/BSE/NFO/BFO; 09:00 IST for MCX).
-    - Multi-day (1week, 1month): Grouped by ISO week (Mon-Fri) or calendar month.
+    - Multi-day (`<N>day` for any N >= 2): Grouped into consecutive N-trading-day candles.
+    - Calendar (`1week`, `1month`): Grouped by ISO week (Mon-Fri) or calendar month.
     - Aggregation: open=first, high=max, low=min, close=last, volume=sum, oi=last.
     """
-    tf = normalize_timeframe(timeframe)
-    base_tf = resolve_base_timeframe(tf)
+    count, unit = parse_timeframe(timeframe)
+    tf = f"{count}{unit}"
+    base_tf = "1minute" if unit == "minute" else "1day"
     if tf == base_tf or not rows:
         return list(rows)
 
-    tf_spec = VALID_TIMEFRAMES[tf]
-    tf_minutes = tf_spec.get("minutes")
     clean_exch = (exchange or "NSE").strip().upper()
     anchor_minute_of_day = 9 * 60 if clean_exch in {"MCX", "MCX_FO"} else (9 * 60 + 15)
 
@@ -180,7 +225,7 @@ def resample_ohlcv_rows(
     buckets: Dict[Any, Dict[str, Any]] = {}
     bucket_order: List[Any] = []
 
-    for row in ordered:
+    for row_idx, row in enumerate(ordered):
         ts_raw = str(row.get("ts_ist") or "")
         if not ts_raw:
             continue
@@ -190,18 +235,23 @@ def resample_ohlcv_rows(
         else:
             dt = dt.astimezone(IST_TZ)
 
-        if tf_minutes is not None:
-            step = int(tf_minutes)
+        if unit == "minute":
+            step = count
             mod = dt.hour * 60 + dt.minute
             if mod >= anchor_minute_of_day:
                 offset = ((mod - anchor_minute_of_day) // step) * step
                 bucket_mod = anchor_minute_of_day + offset
             else:
                 bucket_mod = (mod // step) * step
-            b_hr, b_min = divmod(bucket_mod, 60)
+            b_hr, b_min = divmod(min(bucket_mod, 23 * 60 + 59), 60)
             b_dt = datetime(dt.year, dt.month, dt.day, b_hr, b_min, 0, tzinfo=IST_TZ)
             b_key: Any = b_dt.isoformat(timespec="seconds")
             b_ts_ist = str(b_key)
+            b_trade_date = dt.date().isoformat()
+        elif unit == "day":
+            # Group every `count` consecutive trading-day sessions chronologically
+            b_key = row_idx // count
+            b_ts_ist = ts_raw
             b_trade_date = dt.date().isoformat()
         elif tf == "1week":
             iso_yr, iso_wk, _ = dt.isocalendar()
@@ -247,7 +297,7 @@ def resample_ohlcv_rows(
             existing["close"] = c_v
             existing["volume"] += vol_v
             existing["oi"] = oi_v
-            if tf in {"1week", "1month"}:
+            if unit in {"day", "week", "month"}:
                 existing["trade_date"] = b_trade_date
                 existing["ts_ist"] = b_ts_ist
             if src_v:

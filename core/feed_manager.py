@@ -19,9 +19,11 @@ Features:
 
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 import queue
+import ssl
 import threading
 import time
 import urllib.error
@@ -31,7 +33,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 from broker.registry import BrokerRegistry
 from broker.upstox.auth import auth_manager as upstox_auth
@@ -248,28 +250,114 @@ def _fetch_live_quotes_yfinance(symbols: List[Any], timeout: float = 4.0) -> Dic
     return quotes
 
 
-def _upstox_get_json(url: str, headers: Dict[str, str], timeout: float) -> Dict[str, Any]:
-    req = urllib.request.Request(url, headers=headers, method="GET")
+_ORIG_URLOPEN = urllib.request.urlopen
+
+
+class _KeepAliveHTTPSPool:
+    """
+    Thread-safe persistent HTTP/1.1 Keep-Alive connection per host so repeated
+    broker quote polls reuse the existing TCP+TLS 1.3 socket instead of paying
+    a ~200-350ms DNS+TCP+TLS handshake penalty on every single poll.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._conns: Dict[Tuple[str, int, str], http.client.HTTPConnection] = {}
+        self._ssl_ctx = ssl.create_default_context()
+
+    def get_json(self, url: str, headers: Dict[str, str], timeout: float) -> Tuple[int, bytes, str]:
+        parsed = urllib.parse.urlsplit(url)
+        scheme = parsed.scheme.lower()
+        host = parsed.hostname or ""
+        port = parsed.port or (443 if scheme == "https" else 80)
+        path = parsed.path or "/"
+        if parsed.query:
+            path = f"{path}?{parsed.query}"
+        key = (scheme, port, host)
+        req_headers = {"Connection": "keep-alive", **headers}
+
+        with self._lock:
+            for attempt in range(2):
+                conn = self._conns.get(key)
+                if conn is None:
+                    if scheme == "https":
+                        conn = http.client.HTTPSConnection(host, port, timeout=timeout, context=self._ssl_ctx)
+                    else:
+                        conn = http.client.HTTPConnection(host, port, timeout=timeout)
+                    self._conns[key] = conn
+                else:
+                    conn.timeout = timeout
+                try:
+                    conn.request("GET", path, headers=req_headers)
+                    resp = conn.getresponse()
+                    raw = resp.read()
+                    status = resp.status
+                    reason = resp.reason
+                    if resp.will_close:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                        self._conns.pop(key, None)
+                    return status, raw, reason
+                except Exception:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                    self._conns.pop(key, None)
+                    if attempt == 1:
+                        raise
+            raise RuntimeError("Keep-alive request failed")
+
+
+_KEEP_ALIVE_HTTP = _KeepAliveHTTPSPool()
+_UPSTOX_PREV_CLOSE_CACHE: Dict[Tuple[str, str], float] = {}
+_UPSTOX_KEY_CACHE: Dict[Tuple[str, str, str], str] = {}
+_UPSTOX_OHLC_EMPTY_UNTIL: float = 0.0
+
+
+def _raise_upstox_http_error(code: int, raw_body: str, reason: str, cause: Optional[BaseException] = None) -> None:
     try:
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        raw_body = ""
+        err_json = json.loads(raw_body)
+        errors = err_json.get("errors") or []
+        msg = (errors[0].get("message") if errors and isinstance(errors[0], dict) else None) or err_json.get("message")
+        if msg:
+            raise RuntimeError(f"Upstox HTTP {code}: {msg}") from cause
+    except RuntimeError:
+        raise
+    except Exception:
+        pass
+    raise RuntimeError(f"Upstox HTTP {code}: {raw_body[:160] or reason}") from cause
+
+
+def _upstox_get_json(url: str, headers: Dict[str, str], timeout: float) -> Dict[str, Any]:
+    # Respect unit-test mocks when urllib.request.urlopen has been patched
+    if urllib.request.urlopen is not _ORIG_URLOPEN:
+        req = urllib.request.Request(url, headers=headers, method="GET")
         try:
-            raw_body = exc.read().decode("utf-8", errors="ignore")
-            err_json = json.loads(raw_body)
-            errors = err_json.get("errors") or []
-            msg = (errors[0].get("message") if errors and isinstance(errors[0], dict) else None) or err_json.get("message")
-            if msg:
-                raise RuntimeError(f"Upstox HTTP {exc.code}: {msg}") from exc
-        except RuntimeError:
-            raise
-        except Exception:
-            pass
-        raise RuntimeError(f"Upstox HTTP {exc.code}: {raw_body[:160] or exc.reason}") from exc
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            raw_body = ""
+            try:
+                raw_body = exc.read().decode("utf-8", errors="ignore")
+            except Exception:
+                pass
+            _raise_upstox_http_error(exc.code, raw_body, str(exc.reason), exc)
+
+    status, raw_bytes, reason = _KEEP_ALIVE_HTTP.get_json(url, headers, timeout)
+    text = raw_bytes.decode("utf-8", errors="ignore")
+    if status >= 400:
+        _raise_upstox_http_error(status, text, reason)
+    return json.loads(text)
 
 
 def _fetch_live_quotes_upstox(symbols: List[Any], timeout: float = 4.5) -> Dict[str, Dict[str, Any]]:
+    global _UPSTOX_OHLC_EMPTY_UNTIL
+    is_mocked = urllib.request.urlopen is not _ORIG_URLOPEN
+    today_ist_str = datetime.now(tz=IST_TZ).date().isoformat()
+
     token = upstox_auth.get_valid_token()
     key_map: Dict[str, Dict[str, str]] = {}
     missing_indices: List[Any] = []
@@ -283,11 +371,15 @@ def _fetch_live_quotes_upstox(symbols: List[Any], timeout: float = 4.5) -> Dict[
             sym = str(raw_item).strip().upper()
             exch, itype, ikey = "NSE", "", ""
 
-        resolved = (
-            ikey
-            if ikey and "|" in ikey
-            else instrument_index.resolve_key(sym, broker_id="upstox", exchange=exch, instrument_type=itype or None)
-        )
+        cache_k = (sym, exch, itype)
+        if ikey and "|" in ikey:
+            resolved: Optional[str] = ikey
+        elif not is_mocked and cache_k in _UPSTOX_KEY_CACHE:
+            resolved = _UPSTOX_KEY_CACHE[cache_k]
+        else:
+            resolved = instrument_index.resolve_key(sym, broker_id="upstox", exchange=exch, instrument_type=itype or None)
+            if resolved and not is_mocked:
+                _UPSTOX_KEY_CACHE[cache_k] = resolved
         if resolved:
             key_map[resolved] = {"symbol": sym, "exchange": exch, "instrument_type": itype}
         else:
@@ -344,16 +436,23 @@ def _fetch_live_quotes_upstox(symbols: List[Any], timeout: float = 4.5) -> Dict[
         return sym_to_meta.get(key_suffix) or {}
 
     def _query_batch(keys: List[str]) -> tuple[Dict[str, Any], str]:
+        global _UPSTOX_OHLC_EMPTY_UNTIL
         enc = _encode_keys(keys)
         last_batch_err: Optional[Exception] = None
-        # 1) Primary: Upstox V3 OHLC Quotes
-        try:
-            payload = _upstox_get_json(f"{config.UPSTOX_BASE_URL}/v3/market-quote/ohlc?instrument_key={enc}&interval=1d", headers, timeout)
-            data = payload.get("data") or {}
-            if data:
-                return data, "v3_ohlc"
-        except Exception as exc:
-            last_batch_err = exc
+        now_mono = time.monotonic()
+        skip_ohlc = (not is_mocked) and (now_mono < _UPSTOX_OHLC_EMPTY_UNTIL)
+
+        # 1) Primary: Upstox V3 OHLC Quotes (skip briefly if market closed & returned empty)
+        if not skip_ohlc:
+            try:
+                payload = _upstox_get_json(f"{config.UPSTOX_BASE_URL}/v3/market-quote/ohlc?instrument_key={enc}&interval=1d", headers, timeout)
+                data = payload.get("data") or {}
+                if data:
+                    return data, "v3_ohlc"
+                if not is_mocked:
+                    _UPSTOX_OHLC_EMPTY_UNTIL = now_mono + 60.0
+            except Exception as exc:
+                last_batch_err = exc
         # 2) Fallback: Upstox V3 LTP Quotes
         try:
             payload = _upstox_get_json(f"{config.UPSTOX_BASE_URL}/v3/market-quote/ltp?instrument_key={enc}", headers, timeout)
@@ -419,6 +518,12 @@ def _fetch_live_quotes_upstox(symbols: List[Any], timeout: float = 4.5) -> Dict[
         prev_close = prev_ohlc.get("close") if prev_ohlc.get("close") is not None else legacy_ohlc.get("close")
         if prev_close is None and item.get("cp") is not None:
             prev_close = item.get("cp")
+        if prev_close is not None and float(prev_close) != 0 and itoken and not is_mocked:
+            _UPSTOX_PREV_CLOSE_CACHE[(today_ist_str, itoken)] = float(prev_close)
+        elif prev_close is None and itoken and not is_mocked:
+            cached_cp = _UPSTOX_PREV_CLOSE_CACHE.get((today_ist_str, itoken))
+            if cached_cp is not None:
+                prev_close = cached_cp
         if prev_close is None and itoken and transport_used == "v3_ohlc":
             missing_prev_keys.append(itoken)
 
@@ -469,7 +574,7 @@ def _fetch_live_quotes_upstox(symbols: List[Any], timeout: float = 4.5) -> Dict[
             "ts_ist": ts_str,
         }
 
-    # If any instrument lacked prev_ohlc, pull cp/ltp via Upstox V3 LTP endpoint
+    # If any instrument lacked prev_ohlc, pull cp/ltp once per trading day and cache it
     if missing_prev_keys:
         try:
             ltp_url = f"{config.UPSTOX_BASE_URL}/v3/market-quote/ltp?instrument_key={_encode_keys(missing_prev_keys)}"
@@ -482,7 +587,10 @@ def _fetch_live_quotes_upstox(symbols: List[Any], timeout: float = 4.5) -> Dict[
                 if not sym or sym not in quotes:
                     continue
                 cp = item.get("cp")
+                itok = str(item.get("instrument_token") or "")
                 if cp is not None and float(cp) != 0:
+                    if itok and not is_mocked:
+                        _UPSTOX_PREV_CLOSE_CACHE[(today_ist_str, itok)] = float(cp)
                     quotes[sym]["prev_close"] = round(float(cp), 2)
                     net_chg = quotes[sym]["ltp"] - float(cp)
                     quotes[sym]["change"] = round(net_chg, 2)

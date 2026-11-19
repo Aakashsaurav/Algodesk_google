@@ -7,6 +7,7 @@ Auto-discovers and hot-reloads drop-in `.py` strategy files from
 
 from __future__ import annotations
 
+import importlib
 import importlib.util
 import inspect
 import logging
@@ -16,7 +17,7 @@ import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Type
 
-from backtest.base import BacktestStrategy
+import backtest.base as _backtest_base_mod
 
 logger = logging.getLogger(__name__)
 
@@ -26,12 +27,33 @@ class StrategyRegistry:
 
     def __init__(self, strategies_dir: Optional[Path] = None) -> None:
         self._dir = strategies_dir or (Path(__file__).resolve().parent / "strategies")
+        self._base_file = Path(__file__).resolve().parent / "base.py"
+        self._base_mtime: Optional[int] = self._safe_mtime(self._base_file)
         self._lock = threading.RLock()
         self._mtimes: Dict[Path, int] = {}
-        self._classes: Dict[str, Type[BacktestStrategy]] = {}
-        self._prototypes: Dict[str, BacktestStrategy] = {}
+        self._classes: Dict[str, Type[Any]] = {}
+        self._prototypes: Dict[str, Any] = {}
         self._file_to_ids: Dict[Path, List[str]] = {}
         self._errors: Dict[str, str] = {}
+
+    @staticmethod
+    def _safe_mtime(p: Path) -> Optional[int]:
+        try:
+            return p.stat().st_mtime_ns
+        except OSError:
+            return None
+
+    def _sync_base_module_locked(self) -> bool:
+        global _backtest_base_mod
+        cur_mtime = self._safe_mtime(self._base_file)
+        if cur_mtime is not None and cur_mtime != self._base_mtime:
+            try:
+                _backtest_base_mod = importlib.reload(_backtest_base_mod)
+                self._base_mtime = cur_mtime
+                return True
+            except Exception as exc:
+                logger.warning("Failed reloading backtest.base: %s", exc)
+        return False
 
     @property
     def strategies_dir(self) -> Path:
@@ -40,6 +62,10 @@ class StrategyRegistry:
     def refresh_if_changed(self, force: bool = False) -> bool:
         with self._lock:
             changed = False
+            if self._sync_base_module_locked():
+                force = True
+                changed = True
+
             if not self._dir.exists():
                 self._classes.clear()
                 self._prototypes.clear()
@@ -80,6 +106,7 @@ class StrategyRegistry:
         self._errors.pop(fpath.name, None)
         self._mtimes[fpath] = mtime
 
+        base_cls = getattr(_backtest_base_mod, "BacktestStrategy")
         mod_name = f"algodesk_strategy_{fpath.stem}_{mtime}"
         try:
             spec = importlib.util.spec_from_file_location(mod_name, str(fpath))
@@ -91,7 +118,7 @@ class StrategyRegistry:
 
             discovered_ids: List[str] = []
             for _attr, obj in inspect.getmembers(mod):
-                if inspect.isclass(obj) and issubclass(obj, BacktestStrategy) and obj is not BacktestStrategy:
+                if inspect.isclass(obj) and issubclass(obj, base_cls) and obj is not base_cls:
                     if inspect.isabstract(obj):
                         continue
                     inst = obj()

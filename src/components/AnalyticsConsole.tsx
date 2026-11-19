@@ -224,16 +224,26 @@ interface AnalyticsConsoleProps {
 
 const DEFAULT_WATCHLIST = 'RELIANCE, TCS, INFY, HDFCBANK, ICICIBANK, SBIN, BHARTIARTL, ITC, LT, AXISBANK';
 
-const FALLBACK_TIMEFRAMES: TimeframeMeta[] = [
-  { id: '1day', label: '1 Day', base: '1day', resampled: false },
-  { id: '1week', label: '1 Week', base: '1day', resampled: true },
-  { id: '1month', label: '1 Month', base: '1day', resampled: true },
-  { id: '1minute', label: '1 Min', base: '1minute', resampled: false },
-  { id: '5minute', label: '5 Min', base: '1minute', resampled: true },
-  { id: '15minute', label: '15 Min', base: '1minute', resampled: true },
-  { id: '30minute', label: '30 Min', base: '1minute', resampled: true },
-  { id: '60minute', label: '60 Min (1H)', base: '1minute', resampled: true },
+const FALLBACK_SCREENS: ScreenMeta[] = [
+  { id: 'all_metrics', name: 'All Watchlist Metrics', description: '', category: '', min_bars: 15, params: [] },
+  { id: 'momentum_breakout', name: 'Momentum Breakout', description: '', category: '', min_bars: 50, params: [] },
+  { id: 'vcp_contraction', name: 'VCP Contraction', description: '', category: '', min_bars: 30, params: [] },
+  { id: 'oversold_rebound', name: 'Oversold Mean Reversion', description: '', category: '', min_bars: 20, params: [] },
+  { id: 'trend_following', name: 'Uptrend Alignment (EMA + ADX)', description: '', category: '', min_bars: 50, params: [] },
 ];
+
+const FALLBACK_STRATEGIES: StrategyMeta[] = [
+  { id: 'ema_crossover', name: 'EMA 20 / 50 Crossover', description: '', params: [] },
+  { id: 'rsi_mean_reversion', name: 'Wilder RSI (14) Mean Reversion', description: '', params: [] },
+  { id: 'vcp_breakout', name: 'VCP Range Breakout', description: '', params: [] },
+  { id: 'supertrend_atr', name: 'Supertrend (10, ATR 3.0x)', description: '', params: [] },
+];
+
+function buildTimeframeString(numRaw: string, unit: 'minute' | 'day'): string {
+  const parsed = Number.parseInt(numRaw, 10);
+  const count = Number.isFinite(parsed) && parsed >= 1 ? Math.min(unit === 'minute' ? 1440 : 365, parsed) : 1;
+  return `${count}${unit}`;
+}
 
 const DEFAULT_FALLBACK_COLUMNS: ColumnSpec[] = [
   { key: 'ema20', label: 'EMA 20', fmt: 'price', decimals: 2, align: 'right' },
@@ -360,7 +370,9 @@ export function AnalyticsConsole({
   const [scUniverse, setScUniverse] = useState<string>('CUSTOM');
   const [scSymbols, setScSymbols] = useState<string>(DEFAULT_WATCHLIST);
   const [scExchange, setScExchange] = useState<string>('NSE');
-  const [scTimeframe, setScTimeframe] = useState<string>('1day');
+  const [scTfNum, setScTfNum] = useState<string>('1');
+  const [scTfUnit, setScTfUnit] = useState<'minute' | 'day'>('day');
+  const scTimeframe = buildTimeframeString(scTfNum, scTfUnit);
   const [scAsOfDate, setScAsOfDate] = useState<string>('');
   const [scScreenId, setScScreenId] = useState<string>('all_metrics');
   const [scParams, setScParams] = useState<Record<string, number | boolean | string>>({});
@@ -378,7 +390,9 @@ export function AnalyticsConsole({
   const [btExchange, setBtExchange] = useState<string>('NSE');
   const [btStrategy, setBtStrategy] = useState<string>('ema_crossover');
   const [btParams, setBtParams] = useState<Record<string, number | boolean | string>>({});
-  const [btTimeframe, setBtTimeframe] = useState<string>('1day');
+  const [btTfNum, setBtTfNum] = useState<string>('1');
+  const [btTfUnit, setBtTfUnit] = useState<'minute' | 'day'>('day');
+  const btTimeframe = buildTimeframeString(btTfNum, btTfUnit);
   const [btFrom, setBtFrom] = useState<string>(yearAgoIso);
   const [btTo, setBtTo] = useState<string>(todayIso);
   const [btCapital, setBtCapital] = useState<number>(500000);
@@ -801,13 +815,7 @@ export function AnalyticsConsole({
                 onChange={(e) => setScScreenId(e.target.value)}
                 className="min-h-[40px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 text-xs text-slate-100 focus:border-sky-400 focus:outline-none"
               >
-                {(meta?.screens || [
-                  { id: 'all_metrics', name: 'All Watchlist Metrics', description: '', category: '', min_bars: 15, params: [] },
-                  { id: 'momentum_breakout', name: 'Momentum Breakout', description: '', category: '', min_bars: 50, params: [] },
-                  { id: 'vcp_contraction', name: 'VCP Contraction', description: '', category: '', min_bars: 30, params: [] },
-                  { id: 'oversold_rebound', name: 'Oversold Mean Reversion', description: '', category: '', min_bars: 20, params: [] },
-                  { id: 'trend_following', name: 'Uptrend Alignment (EMA + ADX)', description: '', category: '', min_bars: 50, params: [] },
-                ]).map((s) => (
+                {(meta?.screens && meta.screens.length > 0 ? meta.screens : FALLBACK_SCREENS).map((s) => (
                   <option key={s.id} value={s.id}>
                     {s.name}
                   </option>
@@ -864,30 +872,37 @@ export function AnalyticsConsole({
             </div>
           </div>
 
-          <div className="grid grid-cols-2 items-end gap-3 sm:grid-cols-4">
+          <div className="grid grid-cols-1 items-end gap-3 sm:grid-cols-3">
             <div>
-              <label htmlFor="sc-tf" className="mb-1 block text-xs text-slate-400">
+              <label htmlFor="sc-tf-num" className="mb-1 block text-xs text-slate-400">
                 Timeframe (API: 1m / 1d only)
               </label>
-              <select
-                id="sc-tf"
-                value={scTimeframe}
-                onChange={(e) => setScTimeframe(e.target.value)}
-                className="min-h-[38px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-1.5 text-xs text-slate-100 focus:border-sky-400 focus:outline-none"
-              >
-                {(meta?.timeframes || FALLBACK_TIMEFRAMES).map((tf) => (
-                  <option key={tf.id} value={tf.id}>
-                    {tf.label}
-                    {tf.resampled ? ` (from ${tf.base === '1minute' ? '1m' : '1d'})` : ''}
-                  </option>
-                ))}
-              </select>
-            </div>
-
-            <div>
-              <span className="mb-1 block text-xs text-slate-400">Indicator Lookback Window</span>
-              <div className="flex min-h-[38px] items-center rounded-lg border border-slate-800 bg-[#0b1120]/80 px-3 font-mono text-[11px] text-slate-300">
-                Auto ({activeScreenMeta?.required_bars ?? 125} bars ≤ As-Of)
+              <div className="flex gap-1.5">
+                <input
+                  id="sc-tf-num"
+                  type="number"
+                  min={1}
+                  max={scTfUnit === 'minute' ? 1440 : 365}
+                  step={1}
+                  value={scTfNum}
+                  onChange={(e) => setScTfNum(e.target.value)}
+                  onBlur={() => {
+                    const n = Number.parseInt(scTfNum, 10);
+                    setScTfNum(String(Number.isFinite(n) && n >= 1 ? n : 1));
+                  }}
+                  aria-label="Screener timeframe interval"
+                  className="min-h-[38px] w-20 rounded-lg border border-slate-700 bg-[#0b1120] px-2.5 py-1.5 font-mono text-xs text-slate-100 focus:border-sky-400 focus:outline-none"
+                />
+                <select
+                  id="sc-tf-unit"
+                  value={scTfUnit}
+                  onChange={(e) => setScTfUnit(e.target.value === 'minute' ? 'minute' : 'day')}
+                  aria-label="Screener timeframe unit"
+                  className="min-h-[38px] flex-1 rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-1.5 text-xs text-slate-100 focus:border-sky-400 focus:outline-none"
+                >
+                  <option value="minute">minute</option>
+                  <option value="day">day</option>
+                </select>
               </div>
             </div>
 
@@ -1174,12 +1189,7 @@ export function AnalyticsConsole({
                 onChange={(e) => setBtStrategy(e.target.value)}
                 className="min-h-[40px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 text-xs text-slate-100 focus:border-sky-400 focus:outline-none"
               >
-                {(meta?.strategy_specs || [
-                  { id: 'ema_crossover', name: 'EMA 20 / 50 Crossover', description: '', params: [] },
-                  { id: 'rsi_mean_reversion', name: 'Wilder RSI (14) Mean Reversion', description: '', params: [] },
-                  { id: 'vcp_breakout', name: 'VCP Range Breakout', description: '', params: [] },
-                  { id: 'supertrend_atr', name: 'Supertrend (10, ATR 3.0x)', description: '', params: [] },
-                ]).map((s) => (
+                {(meta?.strategy_specs && meta.strategy_specs.length > 0 ? meta.strategy_specs : FALLBACK_STRATEGIES).map((s) => (
                   <option key={s.id} value={s.id}>
                     {s.name}
                   </option>
@@ -1188,22 +1198,36 @@ export function AnalyticsConsole({
             </div>
 
             <div>
-              <label htmlFor="bt-tf" className="mb-1.5 block text-xs font-semibold text-slate-300">
+              <label htmlFor="bt-tf-num" className="mb-1.5 block text-xs font-semibold text-slate-300">
                 Timeframe
               </label>
-              <select
-                id="bt-tf"
-                value={btTimeframe}
-                onChange={(e) => setBtTimeframe(e.target.value)}
-                className="min-h-[40px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 text-xs text-slate-100 focus:border-sky-400 focus:outline-none"
-              >
-                {(meta?.timeframes || FALLBACK_TIMEFRAMES).map((tf) => (
-                  <option key={tf.id} value={tf.id}>
-                    {tf.label}
-                    {tf.resampled ? ` (from ${tf.base === '1minute' ? '1m' : '1d'})` : ''}
-                  </option>
-                ))}
-              </select>
+              <div className="flex gap-1.5">
+                <input
+                  id="bt-tf-num"
+                  type="number"
+                  min={1}
+                  max={btTfUnit === 'minute' ? 1440 : 365}
+                  step={1}
+                  value={btTfNum}
+                  onChange={(e) => setBtTfNum(e.target.value)}
+                  onBlur={() => {
+                    const n = Number.parseInt(btTfNum, 10);
+                    setBtTfNum(String(Number.isFinite(n) && n >= 1 ? n : 1));
+                  }}
+                  aria-label="Backtest timeframe interval"
+                  className="min-h-[40px] w-16 rounded-lg border border-slate-700 bg-[#0b1120] px-2 py-2 font-mono text-xs text-slate-100 focus:border-sky-400 focus:outline-none"
+                />
+                <select
+                  id="bt-tf-unit"
+                  value={btTfUnit}
+                  onChange={(e) => setBtTfUnit(e.target.value === 'minute' ? 'minute' : 'day')}
+                  aria-label="Backtest timeframe unit"
+                  className="min-h-[40px] flex-1 rounded-lg border border-slate-700 bg-[#0b1120] px-2 py-2 text-xs text-slate-100 focus:border-sky-400 focus:outline-none"
+                >
+                  <option value="minute">minute</option>
+                  <option value="day">day</option>
+                </select>
+              </div>
             </div>
 
             <div>

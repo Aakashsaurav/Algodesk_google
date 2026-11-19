@@ -400,7 +400,32 @@ export default function App() {
   const [histExchange, setHistExchange] = useState('NSE');
   const [histContractType, setHistContractType] = useState('');
   const [histInstrumentKey, setHistInstrumentKey] = useState('');
-  const [histTimeframe, setHistTimeframe] = useState('1day');
+  const [histTfNum, setHistTfNum] = useState('1');
+  const [histTfUnit, setHistTfUnit] = useState<'minute' | 'day'>('day');
+  const histTimeframe = `${Math.max(1, Number.parseInt(histTfNum, 10) || 1)}${histTfUnit}`;
+  const setHistTimeframe = useCallback((rawTf: string) => {
+    const m = String(rawTf || '1day').trim().toLowerCase().match(/^(\d+)\s*(minute|min|m|day|d|week|w|month|mo)/);
+    if (!m) {
+      setHistTfNum('1');
+      setHistTfUnit('day');
+      return;
+    }
+    const n = Math.max(1, Number.parseInt(m[1], 10) || 1);
+    const u = m[2];
+    if (u.startsWith('m') && u !== 'mo' && u !== 'month') {
+      setHistTfNum(String(n));
+      setHistTfUnit('minute');
+    } else if (u.startsWith('w')) {
+      setHistTfNum(String(n * 7));
+      setHistTfUnit('day');
+    } else if (u === 'mo' || u === 'month') {
+      setHistTfNum(String(n * 30));
+      setHistTfUnit('day');
+    } else {
+      setHistTfNum(String(n));
+      setHistTfUnit('day');
+    }
+  }, []);
   const [histFrom, setHistFrom] = useState(thirtyDaysAgoIso);
   const [histTo, setHistTo] = useState(todayIso);
   const [histProvider, setHistProvider] = useState('auto');
@@ -1933,24 +1958,36 @@ export default function App() {
                 </div>
 
                 <div>
-                  <label htmlFor="hist-tf" className="mb-1.5 block text-[13px] font-semibold text-slate-200">
+                  <label htmlFor="hist-tf-num" className="mb-1.5 block text-[13px] font-semibold text-slate-200">
                     Timeframe
                   </label>
-                  <select
-                    id="hist-tf"
-                    value={histTimeframe}
-                    onChange={(e) => setHistTimeframe(e.target.value)}
-                    className="min-h-[42px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 text-sm text-slate-100 focus:border-sky-400 focus:outline-none"
-                  >
-                    <option value="1day">1 Day (Canonical)</option>
-                    <option value="1week">1 Week (Resampled from 1d)</option>
-                    <option value="1month">1 Month (Resampled from 1d)</option>
-                    <option value="1minute">1 Min (Canonical)</option>
-                    <option value="5minute">5 Min (Resampled from 1m)</option>
-                    <option value="15minute">15 Min (Resampled from 1m)</option>
-                    <option value="30minute">30 Min (Resampled from 1m)</option>
-                    <option value="60minute">60 Min (Resampled from 1m)</option>
-                  </select>
+                  <div className="flex gap-1.5">
+                    <input
+                      id="hist-tf-num"
+                      type="number"
+                      min={1}
+                      max={histTfUnit === 'minute' ? 1440 : 365}
+                      step={1}
+                      value={histTfNum}
+                      onChange={(e) => setHistTfNum(e.target.value)}
+                      onBlur={() => {
+                        const n = Number.parseInt(histTfNum, 10);
+                        setHistTfNum(String(Number.isFinite(n) && n >= 1 ? n : 1));
+                      }}
+                      aria-label="Historical timeframe interval"
+                      className="min-h-[42px] w-20 rounded-lg border border-slate-700 bg-[#0b1120] px-2.5 py-2 font-mono text-sm text-slate-100 focus:border-sky-400 focus:outline-none"
+                    />
+                    <select
+                      id="hist-tf-unit"
+                      value={histTfUnit}
+                      onChange={(e) => setHistTfUnit(e.target.value === 'minute' ? 'minute' : 'day')}
+                      aria-label="Historical timeframe unit"
+                      className="min-h-[42px] flex-1 rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 text-sm text-slate-100 focus:border-sky-400 focus:outline-none"
+                    >
+                      <option value="minute">minute</option>
+                      <option value="day">day</option>
+                    </select>
+                  </div>
                 </div>
 
                 <div>

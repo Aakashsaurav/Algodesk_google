@@ -1971,6 +1971,30 @@ class TestBrokerHubArchitecture(unittest.TestCase):
             self.assertEqual(rec_mo["total_rows"], 1)  # All in Oct 2026
             self.assertEqual(rec_mo["rows"][0]["volume"], 100000)
 
+            # Arbitrary positive integer minute & day timeframes (e.g. 7minute, 3day, 5day) -> 0 extra API calls
+            self.assertEqual(resolve_base_timeframe("2minute"), "1minute")
+            self.assertEqual(resolve_base_timeframe("7minute"), "1minute")
+            self.assertEqual(resolve_base_timeframe("3day"), "1day")
+            self.assertEqual(resolve_base_timeframe("5day"), "1day")
+
+            rec_7m = mgr.get_records(symbol="RELIANCE", exchange="NSE", timeframe="7minute", view="full")
+            # 15 mins per day -> buckets [09:15..09:21], [09:22..09:28], [09:29] = 3 bars/day * 2 days = 6 bars
+            self.assertEqual(rec_7m["total_rows"], 6)
+            self.assertEqual(rec_7m["base_timeframe"], "1minute")
+            self.assertTrue(rec_7m["resampled"])
+
+            rec_3d = mgr.get_records(symbol="TCS", exchange="NSE", timeframe="3day", view="full")
+            # 10 trading days -> 4 three-day bars (3+3+3+1)
+            self.assertEqual(rec_3d["total_rows"], 4)
+            self.assertEqual(rec_3d["rows"][0]["volume"], 30000)
+            self.assertEqual(rec_3d["rows"][-1]["volume"], 10000)
+            self.assertEqual(rec_3d["base_timeframe"], "1day")
+            self.assertTrue(rec_3d["resampled"])
+
+            rec_5d = mgr.get_records(symbol="TCS", exchange="NSE", timeframe="5day", view="full")
+            self.assertEqual(rec_5d["total_rows"], 2)
+            self.assertEqual(rec_5d["rows"][0]["volume"], 50000)
+
             # Pure resample_ohlcv_rows sanity for MCX 09:00 anchor
             mcx_rows = [
                 {"ts_ist": "2026-10-05T09:00:00+05:30", "trade_date": "2026-10-05", "open": 10, "high": 12, "low": 9, "close": 11, "volume": 50, "oi": 100},

@@ -16,10 +16,10 @@ from typing import Any, Callable, Dict, List, Optional
 from config import IST_TZ, config
 from core.historical import (
     HistoricalDataManager,
-    VALID_TIMEFRAMES,
     _parse_iso_date,
     historical_data_manager,
     normalize_timeframe,
+    parse_timeframe,
     resolve_base_timeframe,
 )
 from core.jobs import JobCancelledError
@@ -35,21 +35,19 @@ def compute_auto_lookback_days(required_bars: int, timeframe: str) -> int:
     accounting for weekends, NSE holidays (~250 trading days/yr), and NSE
     intraday session length (375 minutes/day = 09:15–15:30 IST).
     """
-    tf = normalize_timeframe(timeframe)
+    count, unit = parse_timeframe(timeframe)
     bars = max(15, int(required_bars or 60))
-    tf_meta = VALID_TIMEFRAMES[tf]
-    tf_minutes = tf_meta.get("minutes")
 
-    if tf_minutes is not None:
-        bars_per_day = max(1, 375 // int(tf_minutes))
+    if unit == "minute":
+        bars_per_day = max(1, 375 // count)
         trading_days = math.ceil(bars / float(bars_per_day)) + 2
         return max(7, min(365, math.ceil(trading_days * 1.6) + 5))
-    if tf == "1week":
-        return max(90, min(3650, bars * 7 + 28))
-    if tf == "1month":
-        return max(180, min(5475, bars * 32 + 45))
-    # Daily bars (~250 trading days/365 calendar days ≈ 1.46x + holiday buffer)
-    return max(45, min(1825, math.ceil(bars * 1.55) + 15))
+    if unit == "week":
+        return max(90, min(3650, bars * 7 * count + 28))
+    if unit == "month":
+        return max(180, min(5475, bars * 32 * count + 45))
+    # Daily / N-day bars (~250 trading days/365 calendar days ≈ 1.46x + holiday buffer)
+    return max(45, min(3650, math.ceil(bars * count * 1.55) + 15))
 
 
 def _infer_columns_from_metrics(sample_metrics: Dict[str, Any]) -> List[ColumnSpec]:

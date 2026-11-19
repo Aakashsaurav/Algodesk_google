@@ -8,6 +8,7 @@ from core.historical import (
     compute_missing_date_ranges,
     historical_data_manager,
     normalize_timeframe,
+    parse_timeframe,
     resample_ohlcv_rows,
     resolve_base_timeframe,
 )
@@ -56,6 +57,7 @@ __all__ = [
     "instrument_index",
     "kill_switch_controller",
     "normalize_timeframe",
+    "parse_timeframe",
     "resample_ohlcv_rows",
     "resolve_base_timeframe",
 ]
