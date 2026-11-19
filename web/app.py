@@ -13,7 +13,7 @@ import html
 import json
 import queue
 from pathlib import Path
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, Response, StreamingResponse
@@ -86,11 +86,16 @@ class LiveSubscriptionRequest(BaseModel):
 
 class ScreenerRequest(BaseModel):
     symbols: Optional[List[str]] = None
+    universe: str = "CUSTOM"
     exchange: str = "NSE"
     timeframe: str = "1day"
     lookback_days: int = 120
-    preset: str = "all"
+    as_of_date: Optional[str] = None
+    screen_id: Optional[str] = None
+    preset: str = "all_metrics"
+    params: Optional[Dict[str, Any]] = None
     provider: Optional[str] = None
+    backend: str = "auto"
     async_job: bool = False
 
 
@@ -98,6 +103,7 @@ class BacktestRequest(BaseModel):
     symbol: str
     exchange: str = "NSE"
     strategy: str = "ema_crossover"
+    params: Optional[Dict[str, Any]] = None
     timeframe: str = "1day"
     from_date: Optional[str] = None
     to_date: Optional[str] = None
@@ -107,6 +113,7 @@ class BacktestRequest(BaseModel):
     stop_loss_pct: float = 5.0
     take_profit_pct: float = 12.0
     provider: Optional[str] = None
+    backend: str = "auto"
     instrument_type: Optional[str] = None
     instrument_key: Optional[str] = None
     async_job: bool = False
@@ -563,6 +570,10 @@ def create_app() -> FastAPI:
     def api_analytics_meta() -> dict:
         return hub_service.get_analytics_metadata()
 
+    @app.post("/api/analytics/reload")
+    def api_analytics_reload() -> dict:
+        return hub_service.reload_analytics_plugins()
+
     @app.post("/api/analytics/screener")
     def api_analytics_screener(payload: Optional[ScreenerRequest] = None, async_job: Optional[bool] = Query(default=None)) -> dict:
         req = payload or ScreenerRequest()
@@ -570,11 +581,16 @@ def create_app() -> FastAPI:
         try:
             return hub_service.run_screener(
                 symbols=req.symbols,
+                universe=req.universe,
                 exchange=req.exchange,
                 timeframe=req.timeframe,
                 lookback_days=req.lookback_days,
+                as_of_date=req.as_of_date,
+                screen_id=req.screen_id,
                 preset=req.preset,
+                params=req.params,
                 provider=req.provider,
+                backend=req.backend,
                 async_job=is_async,
             )
         except Exception as exc:
@@ -588,6 +604,7 @@ def create_app() -> FastAPI:
                 symbol=payload.symbol,
                 exchange=payload.exchange,
                 strategy=payload.strategy,
+                params=payload.params,
                 timeframe=payload.timeframe,
                 from_date=payload.from_date,
                 to_date=payload.to_date,
@@ -597,6 +614,7 @@ def create_app() -> FastAPI:
                 stop_loss_pct=payload.stop_loss_pct,
                 take_profit_pct=payload.take_profit_pct,
                 provider=payload.provider,
+                backend=payload.backend,
                 instrument_type=payload.instrument_type,
                 instrument_key=payload.instrument_key,
                 async_job=is_async,
@@ -612,6 +630,13 @@ def create_app() -> FastAPI:
     def api_analytics_job(job_id: str) -> dict:
         try:
             return hub_service.get_analytics_job(job_id)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/api/analytics/jobs/{job_id}/cancel")
+    def api_analytics_job_cancel(job_id: str) -> dict:
+        try:
+            return hub_service.cancel_analytics_job(job_id)
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
 

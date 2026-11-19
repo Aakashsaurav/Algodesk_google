@@ -1,5 +1,69 @@
-import { useCallback, useEffect, useState } from 'react';
-import { Activity, AlertCircle, BarChart3, Check, Play, ShieldAlert, ShieldCheck, Sliders } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import {
+  Activity,
+  AlertCircle,
+  BarChart3,
+  Check,
+  Play,
+  RefreshCw,
+  ShieldAlert,
+  ShieldCheck,
+  Sliders,
+  XCircle,
+} from 'lucide-react';
+
+interface ParamSpec {
+  name: string;
+  label: string;
+  type: 'int' | 'float' | 'bool' | 'str';
+  default: number | boolean | string;
+  min_val?: number | null;
+  max_val?: number | null;
+  step?: number | null;
+  description?: string;
+}
+
+interface ScreenMeta {
+  id: string;
+  name: string;
+  description: string;
+  category: string;
+  min_bars: number;
+  params: ParamSpec[];
+}
+
+interface StrategyMeta {
+  id: string;
+  name: string;
+  description: string;
+  params: ParamSpec[];
+}
+
+interface UniverseMeta {
+  id: string;
+  label: string;
+  count: number;
+}
+
+interface AnalyticsMetaPayload {
+  ok: boolean;
+  screens: ScreenMeta[];
+  strategy_specs: StrategyMeta[];
+  universes: UniverseMeta[];
+  indicator_backends: Record<string, boolean>;
+  storage: {
+    configured_mode: string;
+    active_mode: string;
+    parquet_available: boolean;
+    parquet_dir: string;
+    parquet_files: number;
+  };
+  file_errors: {
+    screens: Record<string, string>;
+    strategies: Record<string, string>;
+  };
+  default_watchlist: string[];
+}
 
 interface ScreenerRow {
   symbol: string;
@@ -24,11 +88,18 @@ interface ScreenerRow {
 }
 
 interface ScreenerResultPayload {
+  screen_id: string;
+  screen_name?: string;
   preset: string;
   preset_label: string;
+  universe: string;
+  universe_label: string;
+  as_of_date: string;
+  is_historical_as_of?: boolean;
   provider: string;
   exchange: string;
   timeframe: string;
+  storage_backend?: string;
   scanned_count: number;
   evaluated_count: number;
   matched_count: number;
@@ -63,6 +134,7 @@ interface BacktestResultPayload {
   strategy_label: string;
   timeframe: string;
   provider: string;
+  storage_backend?: string;
   from_date: string;
   to_date: string;
   bars_evaluated: number;
@@ -120,7 +192,7 @@ interface RiskEvaluationPayload {
 interface AsyncJobStatus {
   job_id: string;
   job_type: string;
-  status: 'QUEUED' | 'RUNNING' | 'COMPLETED' | 'FAILED';
+  status: 'QUEUED' | 'RUNNING' | 'COMPLETED' | 'FAILED' | 'CANCELLED';
   progress_pct: number;
   progress_message: string;
   result?: unknown;
@@ -205,13 +277,21 @@ export function AnalyticsConsole({
 }: AnalyticsConsoleProps) {
   const [activeTab, setActiveTab] = useState<'screener' | 'backtest' | 'risk'>('screener');
 
+  // Dynamic Plugin & Environment Metadata
+  const [meta, setMeta] = useState<AnalyticsMetaPayload | null>(null);
+  const [metaLoading, setMetaLoading] = useState<boolean>(false);
+
   // Screener state
+  const [scUniverse, setScUniverse] = useState<string>('CUSTOM');
   const [scSymbols, setScSymbols] = useState<string>(DEFAULT_WATCHLIST);
   const [scExchange, setScExchange] = useState<string>('NSE');
   const [scTimeframe, setScTimeframe] = useState<string>('1day');
   const [scLookback, setScLookback] = useState<number>(120);
-  const [scPreset, setScPreset] = useState<string>('all');
+  const [scAsOfDate, setScAsOfDate] = useState<string>('');
+  const [scScreenId, setScScreenId] = useState<string>('all_metrics');
+  const [scParams, setScParams] = useState<Record<string, number | boolean | string>>({});
   const [scProvider, setScProvider] = useState<string>('auto');
+  const [scBackend, setScBackend] = useState<string>('auto');
   const [scJob, setScJob] = useState<AsyncJobStatus | null>(null);
   const [scBusy, setScBusy] = useState<boolean>(false);
   const [scError, setScError] = useState<string>('');
@@ -223,6 +303,7 @@ export function AnalyticsConsole({
   const [btSymbol, setBtSymbol] = useState<string>('RELIANCE');
   const [btExchange, setBtExchange] = useState<string>('NSE');
   const [btStrategy, setBtStrategy] = useState<string>('ema_crossover');
+  const [btParams, setBtParams] = useState<Record<string, number | boolean | string>>({});
   const [btTimeframe, setBtTimeframe] = useState<string>('1day');
   const [btFrom, setBtFrom] = useState<string>(yearAgoIso);
   const [btTo, setBtTo] = useState<string>(todayIso);
@@ -245,6 +326,54 @@ export function AnalyticsConsole({
   const [limMaxPos, setLimMaxPos] = useState<string>('5');
   const [limMaxExp, setLimMaxExp] = useState<string>('400000');
   const [limAutoKill, setLimAutoKill] = useState<boolean>(true);
+
+  const fetchAnalyticsMeta = useCallback(async (forceReload = false) => {
+    setMetaLoading(true);
+    try {
+      const res = await fetch(forceReload ? '/api/analytics/reload' : '/api/analytics/meta', {
+        method: forceReload ? 'POST' : 'GET',
+      });
+      if (!res.ok) return;
+      const body = (await res.json()) as AnalyticsMetaPayload;
+      setMeta(body);
+    } catch {
+      // keep existing UI options on transient failure
+    } finally {
+      setMetaLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void fetchAnalyticsMeta(false);
+  }, [fetchAnalyticsMeta]);
+
+  const activeScreenMeta = useMemo(
+    () => meta?.screens?.find((s) => s.id === scScreenId) ?? null,
+    [meta, scScreenId]
+  );
+
+  const activeStrategyMeta = useMemo(
+    () => meta?.strategy_specs?.find((s) => s.id === btStrategy) ?? null,
+    [meta, btStrategy]
+  );
+
+  useEffect(() => {
+    if (!activeScreenMeta) return;
+    const defaults: Record<string, number | boolean | string> = {};
+    for (const p of activeScreenMeta.params || []) {
+      defaults[p.name] = p.default;
+    }
+    setScParams(defaults);
+  }, [activeScreenMeta]);
+
+  useEffect(() => {
+    if (!activeStrategyMeta) return;
+    const defaults: Record<string, number | boolean | string> = {};
+    for (const p of activeStrategyMeta.params || []) {
+      defaults[p.name] = p.default;
+    }
+    setBtParams(defaults);
+  }, [activeStrategyMeta]);
 
   const loadRiskStatus = useCallback(async () => {
     setRiskBusy(true);
@@ -276,19 +405,27 @@ export function AnalyticsConsole({
     jobId: string,
     onProgress: (job: AsyncJobStatus) => void
   ): Promise<AsyncJobStatus> {
-    for (let attempt = 0; attempt < 180; attempt += 1) {
+    for (let attempt = 0; attempt < 1500; attempt += 1) {
       const res = await fetch(`/api/analytics/jobs/${encodeURIComponent(jobId)}`);
       const body = (await res.json().catch(() => ({}))) as { job?: AsyncJobStatus; detail?: string };
       if (!res.ok || !body.job) {
         throw new Error(body.detail || 'Could not query background job status.');
       }
       onProgress(body.job);
-      if (body.job.status === 'COMPLETED' || body.job.status === 'FAILED') {
+      if (body.job.status === 'COMPLETED' || body.job.status === 'FAILED' || body.job.status === 'CANCELLED') {
         return body.job;
       }
       await new Promise((resolve) => window.setTimeout(resolve, 450));
     }
     throw new Error('Background analytics task timed out while polling.');
+  }
+
+  async function handleCancelJob(jobId: string) {
+    try {
+      await fetch(`/api/analytics/jobs/${encodeURIComponent(jobId)}/cancel`, { method: 'POST' });
+    } catch {
+      // ignore cancel errors
+    }
   }
 
   async function handleRunScreener() {
@@ -304,11 +441,16 @@ export function AnalyticsConsole({
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           symbols: syms.length > 0 ? syms : null,
+          universe: scUniverse,
           exchange: scExchange,
           timeframe: scTimeframe,
           lookback_days: Number(scLookback) || 120,
-          preset: scPreset,
+          as_of_date: scAsOfDate || null,
+          screen_id: scScreenId,
+          preset: scScreenId,
+          params: scParams,
           provider: scProvider === 'auto' ? null : scProvider,
+          backend: scBackend,
           async_job: true,
         }),
       });
@@ -323,6 +465,10 @@ export function AnalyticsConsole({
       const doneJob = await pollJobUntilDone(body.job.job_id, (j) => setScJob(j));
       if (doneJob.status === 'FAILED') {
         throw new Error(doneJob.error || doneJob.progress_message || 'Screener scan failed.');
+      }
+      if (doneJob.status === 'CANCELLED') {
+        setScError(doneJob.progress_message || 'Screener scan cancelled.');
+        return;
       }
       setScResult(doneJob.result as ScreenerResultPayload);
     } catch (err) {
@@ -349,6 +495,7 @@ export function AnalyticsConsole({
           symbol: sym,
           exchange: exch,
           strategy: btStrategy,
+          params: btParams,
           timeframe: btTimeframe,
           from_date: btFrom,
           to_date: btTo,
@@ -356,6 +503,7 @@ export function AnalyticsConsole({
           stop_loss_pct: Number(btSl) || 0,
           take_profit_pct: Number(btTp) || 0,
           provider: btProvider === 'auto' ? null : btProvider,
+          backend: scBackend,
           async_job: true,
         }),
       });
@@ -370,6 +518,10 @@ export function AnalyticsConsole({
       const doneJob = await pollJobUntilDone(body.job.job_id, (j) => setBtJob(j));
       if (doneJob.status === 'FAILED') {
         throw new Error(doneJob.error || doneJob.progress_message || 'Backtest failed.');
+      }
+      if (doneJob.status === 'CANCELLED') {
+        setBtError(doneJob.progress_message || 'Backtest cancelled.');
+        return;
       }
       setBtResult(doneJob.result as BacktestResultPayload);
     } catch (err) {
@@ -420,6 +572,17 @@ export function AnalyticsConsole({
     }
   }
 
+  const pluginErrorEntries = [
+    ...Object.entries(meta?.file_errors?.screens || {}).map(([f, msg]) => ({ kind: 'Screen', f, msg })),
+    ...Object.entries(meta?.file_errors?.strategies || {}).map(([f, msg]) => ({ kind: 'Strategy', f, msg })),
+  ];
+
+  const storageLabel = meta?.storage?.parquet_available ? 'HYBRID PARQUET' : 'SQLITE FALLBACK';
+  const activeTaLibs = Object.entries(meta?.indicator_backends || {})
+    .filter(([, ok]) => ok)
+    .map(([name]) => name)
+    .join(', ');
+
   return (
     <section id="analytics-console" className="space-y-4">
       <div className="flex flex-wrap items-end justify-between gap-4">
@@ -428,91 +591,216 @@ export function AnalyticsConsole({
             Phase 05 — Screener, Backtester &amp; Portfolio Risk Console
           </h2>
           <p className="text-sm text-slate-400">
-            Pure O(N) asynchronous screener and strategy backtester routed via <span className="font-mono text-slate-200">{activeDataConnection.toUpperCase()}</span> with gap-only SQLite caching, plus live <span className="font-mono text-slate-200">{activeTradingBroker.toUpperCase()}</span> exposure limits.
+            Hot-reloaded <span className="font-mono text-slate-200">.py</span> screens &amp; strategies via{' '}
+            <span className="font-mono text-slate-200">{activeDataConnection.toUpperCase()}</span> · Storage:{' '}
+            <span className="font-mono text-sky-300">{storageLabel}</span>
+            {activeTaLibs ? ` · TA: ${activeTaLibs}` : ''} · Risk Guard:{' '}
+            <span className="font-mono text-slate-200">{activeTradingBroker.toUpperCase()}</span>
           </p>
         </div>
 
-        <div className="inline-flex rounded-lg border border-slate-800 bg-[#111827] p-1">
+        <div className="flex flex-wrap items-center gap-2">
           <button
             type="button"
-            onClick={() => setActiveTab('screener')}
-            className={`inline-flex items-center gap-1.5 rounded-md px-3.5 py-1.5 text-xs font-semibold transition-colors ${
-              activeTab === 'screener' ? 'bg-sky-400 text-sky-950' : 'text-slate-300 hover:text-slate-100'
-            }`}
+            onClick={() => void fetchAnalyticsMeta(true)}
+            disabled={metaLoading}
+            className="inline-flex min-h-[34px] items-center gap-1.5 rounded-lg border border-slate-700 bg-[#111827] px-3 py-1.5 text-xs font-semibold text-slate-300 transition-colors hover:border-sky-400 hover:text-slate-100 disabled:opacity-50"
+            title="Re-scan screener/screens/*.py and backtest/strategies/*.py"
           >
-            <Activity className="h-3.5 w-3.5" />
-            <span>Market Screener</span>
+            <RefreshCw className={`h-3.5 w-3.5 ${metaLoading ? 'animate-spin' : ''}`} />
+            <span>Reload .py Files</span>
           </button>
-          <button
-            type="button"
-            onClick={() => setActiveTab('backtest')}
-            className={`inline-flex items-center gap-1.5 rounded-md px-3.5 py-1.5 text-xs font-semibold transition-colors ${
-              activeTab === 'backtest' ? 'bg-sky-400 text-sky-950' : 'text-slate-300 hover:text-slate-100'
-            }`}
-          >
-            <BarChart3 className="h-3.5 w-3.5" />
-            <span>Strategy Backtester</span>
-          </button>
-          <button
-            type="button"
-            onClick={() => {
-              setActiveTab('risk');
-              void loadRiskStatus();
-            }}
-            className={`inline-flex items-center gap-1.5 rounded-md px-3.5 py-1.5 text-xs font-semibold transition-colors ${
-              activeTab === 'risk' ? 'bg-sky-400 text-sky-950' : 'text-slate-300 hover:text-slate-100'
-            }`}
-          >
-            <Sliders className="h-3.5 w-3.5" />
-            <span>Risk Limits</span>
-          </button>
+
+          <div className="inline-flex rounded-lg border border-slate-800 bg-[#111827] p-1">
+            <button
+              type="button"
+              onClick={() => setActiveTab('screener')}
+              className={`inline-flex items-center gap-1.5 rounded-md px-3.5 py-1.5 text-xs font-semibold transition-colors ${
+                activeTab === 'screener' ? 'bg-sky-400 text-sky-950' : 'text-slate-300 hover:text-slate-100'
+              }`}
+            >
+              <Activity className="h-3.5 w-3.5" />
+              <span>Market Screener</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setActiveTab('backtest')}
+              className={`inline-flex items-center gap-1.5 rounded-md px-3.5 py-1.5 text-xs font-semibold transition-colors ${
+                activeTab === 'backtest' ? 'bg-sky-400 text-sky-950' : 'text-slate-300 hover:text-slate-100'
+              }`}
+            >
+              <BarChart3 className="h-3.5 w-3.5" />
+              <span>Strategy Backtester</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setActiveTab('risk');
+                void loadRiskStatus();
+              }}
+              className={`inline-flex items-center gap-1.5 rounded-md px-3.5 py-1.5 text-xs font-semibold transition-colors ${
+                activeTab === 'risk' ? 'bg-sky-400 text-sky-950' : 'text-slate-300 hover:text-slate-100'
+              }`}
+            >
+              <Sliders className="h-3.5 w-3.5" />
+              <span>Risk Limits</span>
+            </button>
+          </div>
         </div>
       </div>
 
+      {pluginErrorEntries.length > 0 && (
+        <div className="rounded-lg border border-amber-800/70 bg-amber-950/40 p-3 text-xs text-amber-200">
+          {pluginErrorEntries.map((item) => (
+            <div key={`${item.kind}-${item.f}`} className="font-mono">
+              [{item.kind} Plugin Error in {item.f}]: {item.msg.split('\n')[0]}
+            </div>
+          ))}
+        </div>
+      )}
+
       {/* TAB 1: MARKET SCREENER */}
       {activeTab === 'screener' && (
-        <div className="space-y-5 rounded-xl border border-slate-800 bg-[#111827] p-6">
-          <div className="grid grid-cols-1 items-end gap-4 md:grid-cols-[1.6fr_0.75fr_0.8fr_0.75fr_1fr_auto]">
+        <div className="space-y-4 rounded-xl border border-slate-800 bg-[#111827] p-6">
+          <div className="grid grid-cols-1 items-end gap-3 md:grid-cols-2 lg:grid-cols-[0.95fr_1.4fr_1.05fr_0.85fr_auto]">
+            <div>
+              <label htmlFor="sc-universe" className="mb-1.5 block text-xs font-semibold text-slate-300">
+                Symbol Group / Universe
+              </label>
+              <select
+                id="sc-universe"
+                value={scUniverse}
+                onChange={(e) => {
+                  const val = e.target.value;
+                  setScUniverse(val);
+                  if (val === 'CUSTOM' && !scSymbols.trim()) {
+                    setScSymbols(DEFAULT_WATCHLIST);
+                  } else if (val !== 'CUSTOM') {
+                    setScSymbols('');
+                  }
+                }}
+                className="min-h-[40px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 text-xs text-slate-100 focus:border-sky-400 focus:outline-none"
+              >
+                {(meta?.universes || [
+                  { id: 'DEFAULT_WATCHLIST', label: 'Default Watchlist (10)', count: 10 },
+                  { id: 'NIFTY_50', label: 'NIFTY 50', count: 50 },
+                  { id: 'NIFTY_BANK', label: 'NIFTY Bank', count: 12 },
+                  { id: 'NIFTY_IT', label: 'NIFTY IT', count: 10 },
+                  { id: 'NIFTY_FNO', label: 'NIFTY F&O', count: 185 },
+                  { id: 'NIFTY_500', label: 'NIFTY 500', count: 380 },
+                  { id: 'CACHED_SQLITE', label: 'Local Cached', count: 0 },
+                  { id: 'CUSTOM', label: 'Custom (Comma-Separated)', count: 0 },
+                ]).map((u) => (
+                  <option key={u.id} value={u.id}>
+                    {u.label}
+                  </option>
+                ))}
+              </select>
+            </div>
+
             <div>
               <label htmlFor="sc-symbols" className="mb-1.5 block text-xs font-semibold text-slate-300">
-                Watchlist Symbols (comma-separated)
+                {scUniverse === 'CUSTOM'
+                  ? 'Watchlist Symbols (comma-separated)'
+                  : `Extra Symbols (appended to ${scUniverse})`}
               </label>
               <input
                 id="sc-symbols"
                 type="text"
                 value={scSymbols}
                 onChange={(e) => setScSymbols(e.target.value.toUpperCase())}
+                placeholder={
+                  scUniverse === 'CUSTOM'
+                    ? DEFAULT_WATCHLIST
+                    : `Optional extra symbols alongside ${scUniverse}...`
+                }
                 className="min-h-[40px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 font-mono text-xs text-slate-100 focus:border-sky-400 focus:outline-none"
               />
             </div>
 
             <div>
               <label htmlFor="sc-preset" className="mb-1.5 block text-xs font-semibold text-slate-300">
-                Rule Preset
+                Screen (.py plugin)
               </label>
               <select
                 id="sc-preset"
-                value={scPreset}
-                onChange={(e) => setScPreset(e.target.value)}
+                value={scScreenId}
+                onChange={(e) => setScScreenId(e.target.value)}
                 className="min-h-[40px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 text-xs text-slate-100 focus:border-sky-400 focus:outline-none"
               >
-                <option value="all">All Metrics</option>
-                <option value="momentum_breakout">Momentum Breakout</option>
-                <option value="vcp_contraction">VCP Contraction</option>
-                <option value="oversold_rebound">Oversold RSI</option>
-                <option value="trend_following">Trend Following</option>
+                {(meta?.screens || [
+                  { id: 'all_metrics', name: 'All Watchlist Metrics', description: '', category: '', min_bars: 15, params: [] },
+                  { id: 'momentum_breakout', name: 'Momentum Breakout', description: '', category: '', min_bars: 50, params: [] },
+                  { id: 'vcp_contraction', name: 'VCP Contraction', description: '', category: '', min_bars: 30, params: [] },
+                  { id: 'oversold_rebound', name: 'Oversold Mean Reversion', description: '', category: '', min_bars: 20, params: [] },
+                  { id: 'trend_following', name: 'Uptrend Alignment (EMA + ADX)', description: '', category: '', min_bars: 50, params: [] },
+                ]).map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.name}
+                  </option>
+                ))}
               </select>
             </div>
 
             <div>
-              <label htmlFor="sc-tf" className="mb-1.5 block text-xs font-semibold text-slate-300">
+              <label htmlFor="sc-asof" className="mb-1.5 block text-xs font-semibold text-slate-300">
+                As-Of Date (Point-in-Time)
+              </label>
+              <div className="flex gap-1.5">
+                <input
+                  id="sc-asof"
+                  type="date"
+                  max={todayIso}
+                  value={scAsOfDate}
+                  onChange={(e) => setScAsOfDate(e.target.value)}
+                  className="min-h-[40px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-2.5 py-2 font-mono text-xs text-slate-100 focus:border-sky-400 focus:outline-none"
+                />
+                {scAsOfDate && (
+                  <button
+                    type="button"
+                    onClick={() => setScAsOfDate('')}
+                    className="rounded-lg border border-slate-700 bg-[#0b1120] px-2 text-[11px] text-slate-400 hover:text-slate-100"
+                    title="Reset to Latest"
+                  >
+                    Latest
+                  </button>
+                )}
+              </div>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => void handleRunScreener()}
+                disabled={scBusy}
+                className="inline-flex min-h-[40px] shrink-0 items-center justify-center gap-2 whitespace-nowrap rounded-lg bg-sky-400 px-4 py-2 text-xs font-semibold text-sky-950 transition-colors hover:bg-sky-300 disabled:opacity-50"
+              >
+                <Play className="h-3.5 w-3.5" />
+                <span>{scBusy ? 'Scanning...' : 'Run Scan'}</span>
+              </button>
+              {scBusy && scJob && (
+                <button
+                  type="button"
+                  onClick={() => void handleCancelJob(scJob.job_id)}
+                  className="inline-flex min-h-[40px] items-center gap-1 rounded-lg border border-red-800 bg-red-950/60 px-3 py-2 text-xs font-semibold text-red-200 hover:bg-red-900/60"
+                >
+                  <XCircle className="h-3.5 w-3.5" />
+                  <span>Cancel</span>
+                </button>
+              )}
+            </div>
+          </div>
+
+          <div className="grid grid-cols-2 items-end gap-3 sm:grid-cols-4">
+            <div>
+              <label htmlFor="sc-tf" className="mb-1 block text-xs text-slate-400">
                 Timeframe
               </label>
               <select
                 id="sc-tf"
                 value={scTimeframe}
                 onChange={(e) => setScTimeframe(e.target.value)}
-                className="min-h-[40px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 text-xs text-slate-100 focus:border-sky-400 focus:outline-none"
+                className="min-h-[38px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-1.5 text-xs text-slate-100 focus:border-sky-400 focus:outline-none"
               >
                 <option value="1day">1 Day</option>
                 <option value="30minute">30 Min</option>
@@ -520,29 +808,29 @@ export function AnalyticsConsole({
             </div>
 
             <div>
-              <label htmlFor="sc-lookback" className="mb-1.5 block text-xs font-semibold text-slate-300">
+              <label htmlFor="sc-lookback" className="mb-1 block text-xs text-slate-400">
                 Lookback (Days)
               </label>
               <input
                 id="sc-lookback"
                 type="number"
                 min={30}
-                max={730}
+                max={1095}
                 value={scLookback}
                 onChange={(e) => setScLookback(Number(e.target.value))}
-                className="min-h-[40px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 font-mono text-xs text-slate-100 focus:border-sky-400 focus:outline-none"
+                className="min-h-[38px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-1.5 font-mono text-xs text-slate-100 focus:border-sky-400 focus:outline-none"
               />
             </div>
 
             <div>
-              <label htmlFor="sc-provider" className="mb-1.5 block text-xs font-semibold text-slate-300">
+              <label htmlFor="sc-provider" className="mb-1 block text-xs text-slate-400">
                 Data Source
               </label>
               <select
                 id="sc-provider"
                 value={scProvider}
                 onChange={(e) => setScProvider(e.target.value)}
-                className="min-h-[40px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 text-xs text-slate-100 focus:border-sky-400 focus:outline-none"
+                className="min-h-[38px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-1.5 text-xs text-slate-100 focus:border-sky-400 focus:outline-none"
               >
                 <option value="auto">Assigned ({activeDataConnection})</option>
                 <option value="yfinance">Yahoo Finance</option>
@@ -551,16 +839,89 @@ export function AnalyticsConsole({
               </select>
             </div>
 
-            <button
-              type="button"
-              onClick={() => void handleRunScreener()}
-              disabled={scBusy}
-              className="inline-flex min-h-[40px] shrink-0 items-center justify-center gap-2 whitespace-nowrap rounded-lg bg-sky-400 px-4 py-2 text-xs font-semibold text-sky-950 transition-colors hover:bg-sky-300 disabled:opacity-50"
-            >
-              <Play className="h-3.5 w-3.5" />
-              <span>{scBusy ? 'Scanning...' : 'Run Async Scan'}</span>
-            </button>
+            <div>
+              <label htmlFor="sc-ta-backend" className="mb-1 block text-xs text-slate-400">
+                Indicator Engine
+              </label>
+              <select
+                id="sc-ta-backend"
+                value={scBackend}
+                onChange={(e) => setScBackend(e.target.value)}
+                className="min-h-[38px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-1.5 text-xs text-slate-100 focus:border-sky-400 focus:outline-none"
+              >
+                <option value="auto">Auto (TA-Lib → pandas-ta → Built-in)</option>
+                <option value="talib" disabled={!meta?.indicator_backends?.talib}>
+                  TA-Lib {meta?.indicator_backends?.talib ? '' : '(not installed)'}
+                </option>
+                <option value="pandas_ta" disabled={!meta?.indicator_backends?.pandas_ta}>
+                  pandas-ta {meta?.indicator_backends?.pandas_ta ? '' : '(not installed)'}
+                </option>
+                <option value="builtin">Built-in Pure Python O(N)</option>
+              </select>
+            </div>
           </div>
+
+          {activeScreenMeta && activeScreenMeta.params.length > 0 && (
+            <div className="rounded-lg border border-slate-800 bg-[#0b1120] p-3.5">
+              <div className="mb-2.5 flex flex-wrap items-center justify-between gap-2 text-xs">
+                <div>
+                  <span className="font-semibold text-slate-200">{activeScreenMeta.name} Parameters</span>
+                  {activeScreenMeta.description && (
+                    <span className="ml-2 text-slate-400">— {activeScreenMeta.description}</span>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const reset: Record<string, number | boolean | string> = {};
+                    activeScreenMeta.params.forEach((p) => {
+                      reset[p.name] = p.default;
+                    });
+                    setScParams(reset);
+                  }}
+                  className="text-[11px] font-semibold text-sky-400 hover:text-sky-300"
+                >
+                  Reset Defaults
+                </button>
+              </div>
+              <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5">
+                {activeScreenMeta.params.map((spec) => (
+                  <div key={spec.name}>
+                    <label className="mb-1 block text-[11px] text-slate-400">{spec.label}</label>
+                    {spec.type === 'bool' ? (
+                      <label className="flex min-h-[34px] cursor-pointer items-center gap-2 rounded border border-slate-700 bg-[#111827] px-2.5 text-xs text-slate-200">
+                        <input
+                          type="checkbox"
+                          checked={Boolean(scParams[spec.name] ?? spec.default)}
+                          onChange={(e) =>
+                            setScParams((prev) => ({ ...prev, [spec.name]: e.target.checked }))
+                          }
+                          className="h-3.5 w-3.5 accent-sky-400"
+                        />
+                        <span>Enabled</span>
+                      </label>
+                    ) : (
+                      <input
+                        type={spec.type === 'str' ? 'text' : 'number'}
+                        min={spec.min_val ?? undefined}
+                        max={spec.max_val ?? undefined}
+                        step={spec.step ?? (spec.type === 'int' ? 1 : 0.1)}
+                        value={String(scParams[spec.name] ?? spec.default)}
+                        onChange={(e) =>
+                          setScParams((prev) => ({
+                            ...prev,
+                            [spec.name]:
+                              spec.type === 'str' ? e.target.value : Number(e.target.value),
+                          }))
+                        }
+                        className="min-h-[34px] w-full rounded border border-slate-700 bg-[#111827] px-2.5 py-1 font-mono text-xs text-slate-100 focus:border-sky-400 focus:outline-none"
+                      />
+                    )}
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
 
           <div className="flex flex-wrap items-center gap-3 text-xs text-slate-400">
             <span>Exchange:</span>
@@ -596,7 +957,8 @@ export function AnalyticsConsole({
             <div className="space-y-3 border-t border-slate-800 pt-4">
               <div className="flex flex-wrap items-center justify-between gap-2 font-mono text-xs text-slate-400">
                 <span>
-                  Matched {scResult.matched_count} of {scResult.evaluated_count} evaluated symbols ({scResult.preset_label})
+                  Matched {scResult.matched_count} of {scResult.evaluated_count} evaluated ({scResult.universe_label} · {scResult.screen_name || scResult.preset_label}) · As Of{' '}
+                  <strong className="text-slate-200">{scResult.as_of_date}</strong>
                 </span>
                 <span>
                   Source: {scResult.provider.toUpperCase()} · API Calls: {scResult.api_calls_made} · Cached Days Skipped: {scResult.existing_days_skipped}
@@ -605,19 +967,19 @@ export function AnalyticsConsole({
 
               {scResult.results.length === 0 ? (
                 <div className="rounded-lg border border-slate-800 bg-[#0b1120] p-4 text-xs text-slate-400">
-                  No symbols matched "{scResult.preset_label}". Try "All Metrics" to inspect live technical readings across the watchlist.
+                  No symbols matched &ldquo;{scResult.preset_label}&rdquo; as of {scResult.as_of_date}. Try &ldquo;All Watchlist Metrics&rdquo; or adjust indicator parameters above.
                 </div>
               ) : (
-                <div className="max-h-[340px] overflow-auto rounded-lg border border-slate-800">
+                <div className="max-h-[360px] overflow-auto rounded-lg border border-slate-800">
                   <table className="w-full border-collapse text-left font-mono text-xs tabular-nums">
                     <thead className="sticky top-0 bg-[#0b1120] text-slate-400">
                       <tr className="border-b border-slate-800">
                         <th className="px-3 py-2.5 font-semibold">Symbol</th>
                         <th className="px-3 py-2.5 text-right font-semibold">Close</th>
                         <th className="px-3 py-2.5 text-right font-semibold">Chg%</th>
-                        <th className="px-3 py-2.5 text-right font-semibold">EMA20</th>
-                        <th className="px-3 py-2.5 text-right font-semibold">EMA50</th>
-                        <th className="px-3 py-2.5 text-right font-semibold">RSI(14)</th>
+                        <th className="px-3 py-2.5 text-right font-semibold">EMA Fast</th>
+                        <th className="px-3 py-2.5 text-right font-semibold">EMA Slow</th>
+                        <th className="px-3 py-2.5 text-right font-semibold">RSI</th>
                         <th className="px-3 py-2.5 text-right font-semibold">ATR%</th>
                         <th className="px-3 py-2.5 text-right font-semibold">Vol Ratio</th>
                         <th className="px-3 py-2.5 font-semibold">Signal</th>
@@ -636,11 +998,11 @@ export function AnalyticsConsole({
                             {r.change_pct >= 0 ? '+' : ''}
                             {r.change_pct.toFixed(2)}%
                           </td>
-                          <td className="px-3 py-2 text-right text-slate-300">{r.ema20 !== null ? r.ema20.toFixed(2) : '—'}</td>
-                          <td className="px-3 py-2 text-right text-slate-400">{r.ema50 !== null ? r.ema50.toFixed(2) : '—'}</td>
-                          <td className="px-3 py-2 text-right">{r.rsi14 !== null ? r.rsi14.toFixed(1) : '—'}</td>
-                          <td className="px-3 py-2 text-right text-slate-400">{r.atr_pct !== null ? `${r.atr_pct.toFixed(2)}%` : '—'}</td>
-                          <td className="px-3 py-2 text-right">{r.vol_ratio.toFixed(2)}x</td>
+                          <td className="px-3 py-2 text-right text-slate-300">{r.ema20 !== null && r.ema20 !== undefined ? r.ema20.toFixed(2) : '—'}</td>
+                          <td className="px-3 py-2 text-right text-slate-400">{r.ema50 !== null && r.ema50 !== undefined ? r.ema50.toFixed(2) : '—'}</td>
+                          <td className="px-3 py-2 text-right">{r.rsi14 !== null && r.rsi14 !== undefined ? r.rsi14.toFixed(1) : '—'}</td>
+                          <td className="px-3 py-2 text-right text-slate-400">{r.atr_pct !== null && r.atr_pct !== undefined ? `${r.atr_pct.toFixed(2)}%` : '—'}</td>
+                          <td className="px-3 py-2 text-right">{Number(r.vol_ratio ?? 1).toFixed(2)}x</td>
                           <td className="px-3 py-2">
                             <span className={r.score >= 30 ? 'font-semibold text-sky-400' : 'text-slate-400'}>
                               {r.signal}
@@ -668,8 +1030,9 @@ export function AnalyticsConsole({
               )}
 
               {scResult.errors && scResult.errors.length > 0 && (
-                <div className="text-xs text-amber-400">
-                  Skipped {scResult.errors.length} symbol(s): {scResult.errors.map((e) => `${e.symbol} (${e.error})`).join(' · ')}
+                <div className="max-h-[90px] overflow-auto text-xs text-amber-400">
+                  Skipped {scResult.errors.length} symbol(s): {scResult.errors.slice(0, 15).map((e) => `${e.symbol} (${e.error})`).join(' · ')}
+                  {scResult.errors.length > 15 ? ` · +${scResult.errors.length - 15} more` : ''}
                 </div>
               )}
             </div>
@@ -712,7 +1075,7 @@ export function AnalyticsConsole({
 
             <div>
               <label htmlFor="bt-strategy" className="mb-1.5 block text-xs font-semibold text-slate-300">
-                Strategy
+                Strategy (.py plugin)
               </label>
               <select
                 id="bt-strategy"
@@ -720,10 +1083,16 @@ export function AnalyticsConsole({
                 onChange={(e) => setBtStrategy(e.target.value)}
                 className="min-h-[40px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-2 text-xs text-slate-100 focus:border-sky-400 focus:outline-none"
               >
-                <option value="ema_crossover">EMA 20 / 50 Crossover</option>
-                <option value="rsi_mean_reversion">Wilder RSI (14) Mean Reversion</option>
-                <option value="vcp_breakout">VCP Range Breakout</option>
-                <option value="supertrend_atr">Supertrend (10, ATR 3.0x)</option>
+                {(meta?.strategy_specs || [
+                  { id: 'ema_crossover', name: 'EMA 20 / 50 Crossover', description: '', params: [] },
+                  { id: 'rsi_mean_reversion', name: 'Wilder RSI (14) Mean Reversion', description: '', params: [] },
+                  { id: 'vcp_breakout', name: 'VCP Range Breakout', description: '', params: [] },
+                  { id: 'supertrend_atr', name: 'Supertrend (10, ATR 3.0x)', description: '', params: [] },
+                ]).map((s) => (
+                  <option key={s.id} value={s.id}>
+                    {s.name}
+                  </option>
+                ))}
               </select>
             </div>
 
@@ -768,15 +1137,27 @@ export function AnalyticsConsole({
               />
             </div>
 
-            <button
-              type="button"
-              onClick={() => void handleRunBacktest()}
-              disabled={btBusy}
-              className="inline-flex min-h-[40px] shrink-0 items-center justify-center gap-2 whitespace-nowrap rounded-lg bg-sky-400 px-4 py-2 text-xs font-semibold text-sky-950 transition-colors hover:bg-sky-300 disabled:opacity-50"
-            >
-              <Play className="h-3.5 w-3.5" />
-              <span>{btBusy ? 'Simulating...' : 'Run Backtest'}</span>
-            </button>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => void handleRunBacktest()}
+                disabled={btBusy}
+                className="inline-flex min-h-[40px] shrink-0 items-center justify-center gap-2 whitespace-nowrap rounded-lg bg-sky-400 px-4 py-2 text-xs font-semibold text-sky-950 transition-colors hover:bg-sky-300 disabled:opacity-50"
+              >
+                <Play className="h-3.5 w-3.5" />
+                <span>{btBusy ? 'Simulating...' : 'Run Backtest'}</span>
+              </button>
+              {btBusy && btJob && (
+                <button
+                  type="button"
+                  onClick={() => void handleCancelJob(btJob.job_id)}
+                  className="inline-flex min-h-[40px] items-center gap-1 rounded-lg border border-red-800 bg-red-950/60 px-3 py-2 text-xs font-semibold text-red-200 hover:bg-red-900/60"
+                >
+                  <XCircle className="h-3.5 w-3.5" />
+                  <span>Cancel</span>
+                </button>
+              )}
+            </div>
           </div>
 
           <div className="grid grid-cols-2 items-end gap-3 sm:grid-cols-4">
@@ -835,6 +1216,54 @@ export function AnalyticsConsole({
               </select>
             </div>
           </div>
+
+          {activeStrategyMeta && activeStrategyMeta.params.length > 0 && (
+            <div className="rounded-lg border border-slate-800 bg-[#0b1120] p-3.5">
+              <div className="mb-2 flex flex-wrap items-center justify-between gap-2 text-xs">
+                <div>
+                  <span className="font-semibold text-slate-200">{activeStrategyMeta.name} Parameters</span>
+                  {activeStrategyMeta.description && (
+                    <span className="ml-2 text-slate-400">— {activeStrategyMeta.description}</span>
+                  )}
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const reset: Record<string, number | boolean | string> = {};
+                    activeStrategyMeta.params.forEach((p) => {
+                      reset[p.name] = p.default;
+                    });
+                    setBtParams(reset);
+                  }}
+                  className="text-[11px] font-semibold text-sky-400 hover:text-sky-300"
+                >
+                  Reset Defaults
+                </button>
+              </div>
+              <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+                {activeStrategyMeta.params.map((spec) => (
+                  <div key={spec.name}>
+                    <label className="mb-1 block text-[11px] text-slate-400">{spec.label}</label>
+                    <input
+                      type={spec.type === 'str' ? 'text' : 'number'}
+                      min={spec.min_val ?? undefined}
+                      max={spec.max_val ?? undefined}
+                      step={spec.step ?? (spec.type === 'int' ? 1 : 0.1)}
+                      value={String(btParams[spec.name] ?? spec.default)}
+                      onChange={(e) =>
+                        setBtParams((prev) => ({
+                          ...prev,
+                          [spec.name]:
+                            spec.type === 'str' ? e.target.value : Number(e.target.value),
+                        }))
+                      }
+                      className="min-h-[34px] w-full rounded border border-slate-700 bg-[#111827] px-2.5 py-1 font-mono text-xs text-slate-100 focus:border-sky-400 focus:outline-none"
+                    />
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
 
           {btJob && (
             <div className="font-mono text-xs text-slate-300">

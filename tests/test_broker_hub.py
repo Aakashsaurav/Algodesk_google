@@ -1510,7 +1510,7 @@ class TestBrokerHubArchitecture(unittest.TestCase):
                 self.assertIn("telemetry", risk)
 
             # Submit an async backtest job against fake seeded data in hub_service's ohlcv
-            with patch("core.analytics._load_candles_gap_only") as mock_loader:
+            with patch("backtest.engine.BacktestEngine._load_candles") as mock_loader:
                 today_d = datetime.now(tz=IST_TZ).date()
                 fake_rows = [
                     {
@@ -1546,7 +1546,7 @@ class TestBrokerHubArchitecture(unittest.TestCase):
                 for _ in range(30):
                     with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/analytics/jobs/{job_id}", timeout=3) as jr:
                         jb = _json.loads(jr.read().decode("utf-8"))["job"]
-                        if jb["status"] in {"COMPLETED", "FAILED"}:
+                        if jb["status"] in {"COMPLETED", "FAILED", "CANCELLED"}:
                             final_job = jb
                             break
                     _time.sleep(0.05)
@@ -1554,9 +1554,285 @@ class TestBrokerHubArchitecture(unittest.TestCase):
                 self.assertIsNotNone(final_job)
                 self.assertEqual(final_job["status"], "COMPLETED")
                 self.assertEqual(final_job["result"]["symbol"], "RELIANCE")
+
+            # Also verify new analytics meta fields & reload endpoint
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/analytics/meta", timeout=3) as r:
+                meta_full = _json.loads(r.read().decode("utf-8"))
+                self.assertIn("screens", meta_full)
+                self.assertIn("strategy_specs", meta_full)
+                self.assertIn("universes", meta_full)
+                self.assertIn("storage", meta_full)
+                self.assertIn("indicator_backends", meta_full)
+
+            reload_req = urllib.request.Request(
+                f"http://127.0.0.1:{port}/api/analytics/reload",
+                data=b"{}",
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(reload_req, timeout=3) as r:
+                reloaded = _json.loads(r.read().decode("utf-8"))
+                self.assertTrue(reloaded["ok"])
         finally:
             srv.shutdown()
             srv.server_close()
+
+    def test_modular_indicators_toolkit_and_backends(self) -> None:
+        from indicators.toolkit import IndicatorToolkit, available_backends
+
+        backends = available_backends()
+        self.assertTrue(backends["builtin"])
+
+        candles = []
+        base_d = date(2026, 7, 1)
+        for i in range(60):
+            px = 100.0 + i * 1.5 + (2.0 if i % 2 == 0 else -1.0)
+            candles.append(
+                {
+                    "trade_date": (base_d + timedelta(days=i)).isoformat(),
+                    "open": px - 1.0,
+                    "high": px + 2.5,
+                    "low": px - 2.0,
+                    "close": px,
+                    "volume": 100000 + i * 1000,
+                }
+            )
+        tk = IndicatorToolkit(candles, backend="builtin")
+        sma20 = tk.sma(20)
+        ema20 = tk.ema(20)
+        rsi14 = tk.rsi(14)
+        atr14, atr_pct = tk.atr(14)
+        macd = tk.macd()
+        bb = tk.bbands(20, 2.0)
+        adx = tk.adx(14)
+        stoch = tk.stoch(14, 3)
+        roc10 = tk.roc(10)
+        st_dirs, _ = tk.supertrend(10, 3.0)
+
+        self.assertIsNotNone(sma20[-1])
+        self.assertIsNotNone(ema20[-1])
+        self.assertGreater(rsi14[-1], 55.0)
+        self.assertGreater(atr14[-1], 0.0)
+        self.assertGreater(atr_pct[-1], 0.0)
+        self.assertIsNotNone(macd["hist"][-1])
+        self.assertGreater(bb["upper"][-1], bb["middle"][-1])
+        self.assertGreater(bb["middle"][-1], bb["lower"][-1])
+        self.assertIsNotNone(adx["adx"][-1])
+        self.assertIsNotNone(stoch["k"][-1])
+        self.assertIsNotNone(roc10[-1])
+        self.assertEqual(st_dirs[-1], 1)
+
+    def test_hot_reload_custom_screen_file_and_error_isolation(self) -> None:
+        import time as _time
+        from screener.registry import ScreenRegistry
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sdir = Path(tmpdir)
+            reg = ScreenRegistry(screens_dir=sdir)
+            self.assertEqual(reg.list_screens(), [])
+
+            custom_py = sdir / "my_custom_macd.py"
+            custom_py.write_text(
+                (
+                    "from screener.base import BaseScreen, ParamSpec, ScreenMatch\n"
+                    "class MyCustomMacd(BaseScreen):\n"
+                    "    id = 'my_custom_macd'\n"
+                    "    name = 'Custom MACD Cross'\n"
+                    "    params = [ParamSpec('fast', 'Fast', 'int', 12, min_val=2, max_val=50)]\n"
+                    "    def evaluate(self, candles, params, toolkit):\n"
+                    "        m = toolkit.macd(fast=int(params['fast']))\n"
+                    "        return ScreenMatch(matched=(m['hist'][-1] or 0) > 0, signal='MACD_POS', tags=['MACD'], score=25)\n"
+                ),
+                encoding="utf-8",
+            )
+            screens = reg.list_screens()
+            self.assertEqual(len(screens), 1)
+            self.assertEqual(screens[0]["id"], "my_custom_macd")
+            self.assertEqual(screens[0]["params"][0]["default"], 12)
+
+            # Edit parameter default on disk -> auto-reloads on mtime change
+            _time.sleep(0.02)
+            custom_py.write_text(
+                custom_py.read_text(encoding="utf-8").replace("12, min_val", "8, min_val"),
+                encoding="utf-8",
+            )
+            screens_reloaded = reg.list_screens()
+            self.assertEqual(screens_reloaded[0]["params"][0]["default"], 8)
+
+            # Drop broken syntax file -> isolated in get_errors() without breaking valid screens
+            (sdir / "broken_screen.py").write_text("def oops(:\n    pass\n", encoding="utf-8")
+            screens_after_err = reg.list_screens()
+            self.assertEqual(len(screens_after_err), 1)
+            errs = reg.get_errors()
+            self.assertIn("broken_screen.py", errs)
+
+    def test_as_of_date_zero_lookahead_and_universe_params(self) -> None:
+        from core.instruments import InstrumentIndex, InstrumentRecord
+        from screener.engine import ScreenerEngine
+        from screener.universes import UniverseResolver
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            hist = HistoricalDataManager(db_path=root / "ohlcv.db")
+            instr = InstrumentIndex(db_path=root / "instruments.db")
+            instr.upsert_records(
+                "upstox",
+                [
+                    InstrumentRecord(
+                        broker_id="upstox",
+                        exchange="NFO",
+                        segment="NSE_FO",
+                        trading_symbol=f"SYM{i}26NOVFUT",
+                        asset_symbol=f"SYM{i}",
+                        name=f"SYM {i} FUT",
+                        instrument_type="FUT",
+                        instrument_key=f"NSE_FO|SYM{i}",
+                        expiry="2026-11-26",
+                    )
+                    for i in range(25)
+                ],
+            )
+            uni = UniverseResolver(instr_idx=instr, hist_mgr=hist)
+            nifty50 = uni.resolve("NIFTY_50")
+            self.assertGreaterEqual(len(nifty50["symbols"]), 50)
+            fno = uni.resolve("NIFTY_FNO")
+            self.assertEqual(len(fno["symbols"]), 25)
+            self.assertIn("SYM0", fno["symbols"])
+            n500 = uni.resolve("NIFTY_500")
+            self.assertGreater(len(n500["symbols"]), 250)
+
+            # Seed candles for ASOFCO: strong rally until 2026-10-15, then crash 2026-10-16..2026-11-10
+            rows = []
+            cur = date(2026, 7, 1)
+            cutoff = date(2026, 10, 15)
+            end_d = date(2026, 11, 10)
+            px = 100.0
+            while cur <= end_d:
+                if cur.weekday() < 5:
+                    px = px + 3.0 if cur <= cutoff else max(40.0, px - 12.0)
+                    rows.append(
+                        {
+                            "ts_ist": f"{cur.isoformat()}T15:30:00+05:30",
+                            "trade_date": cur.isoformat(),
+                            "open": px - 1.0,
+                            "high": px + 1.5,
+                            "low": px - 1.5,
+                            "close": px,
+                            "volume": 200000,
+                            "oi": 0,
+                        }
+                    )
+                cur += timedelta(days=1)
+
+            hist.download(
+                symbol="ASOFCO",
+                exchange="NSE",
+                timeframe="1day",
+                from_date="2026-07-01",
+                to_date="2026-11-10",
+                provider="upstox",
+                fetcher=lambda *args: rows,
+            )
+            self.assertEqual(hist.list_cached_symbols(exchange="NSE", timeframe="1day"), ["ASOFCO"])
+            self.assertEqual(hist.list_cached_symbols(exchange="NSE", timeframe="30minute"), [])
+            cached_uni = uni.resolve("CACHED_SQLITE", exchange="NSE", timeframe="1day")
+            self.assertEqual(cached_uni["symbols"], ["ASOFCO"])
+            self.assertGreaterEqual(len(uni.list_universes(exchange="NSE", timeframe="1day")), 7)
+
+            engine = ScreenerEngine(hist_manager=hist, universes=uni)
+            past_scan = engine.scan(
+                symbols=["ASOFCO"],
+                universe="CUSTOM",
+                exchange="NSE",
+                timeframe="1day",
+                lookback_days=120,
+                as_of_date="2026-10-15",
+                screen_id="all_metrics",
+                provider="upstox",
+                fetcher=lambda *args: [],
+            )
+            self.assertEqual(past_scan["as_of_date"], "2026-10-15")
+            self.assertEqual(past_scan["evaluated_count"], 1)
+            row_past = past_scan["results"][0]
+            self.assertLessEqual(row_past["last_date"], "2026-10-15")
+            self.assertGreater(row_past["rsi14"], 75.0)
+            self.assertEqual(row_past["supertrend"], "BULL")
+
+            # Now test editable parameters on oversold_rebound against late scan
+            late_scan = engine.scan(
+                symbols=["ASOFCO"],
+                universe="CUSTOM",
+                exchange="NSE",
+                timeframe="1day",
+                lookback_days=120,
+                as_of_date="2026-11-10",
+                screen_id="oversold_rebound",
+                params={"rsi_oversold": 35.0, "require_positive_bounce": False},
+                provider="upstox",
+                fetcher=lambda *args: [],
+            )
+            self.assertEqual(late_scan["matched_count"], 1)
+
+    def test_risk_validate_order_and_job_cancel_and_hybrid_storage(self) -> None:
+        from broker.upstox.broker import UpstoxBroker
+        from core.jobs import AsyncJobRunner
+        from core.preflight import KillSwitchController
+        from core.runtime import CanonicalSessionManager, OrderRequest as RuntimeOrderReq, TradingState
+        from risk.limits import RiskLimitManager
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            hist = HistoricalDataManager(db_path=root / "ohlcv.db")
+            st = hist.storage_info()
+            self.assertIn(st["active_mode"], {"hybrid_parquet", "sqlite_fallback"})
+
+            # Pre-trade RiskLimitManager validation wired into CanonicalSessionManager
+            trail = AuditTrail(root / "audit.db")
+            ks = KillSwitchController(state_file=root / "ks.json", audit=trail)
+            risk_mgr = RiskLimitManager(limits_file=root / "risk.json", audit=trail, kill_switch=ks)
+            risk_mgr.save_limits(
+                {
+                    "total_capital_inr": 100000.0,
+                    "max_capital_per_trade_pct": 10.0,  # cap ₹10,000 per trade
+                    "max_gross_exposure_inr": 50000.0,
+                    "max_open_positions": 2,
+                }
+            )
+            broker = UpstoxBroker(access_token="dummy")
+            sm = CanonicalSessionManager(
+                state=TradingState(),
+                broker=broker,
+                risk_engine=risk_mgr,
+                kill_switch=ks,
+                audit=trail,
+            )
+            with self.assertRaises(RuntimeError) as ctx:
+                sm.submit_signal_order(
+                    RuntimeOrderReq(trading_symbol="RELIANCE", exchange="NSE", transaction_type="BUY", quantity=10, price=2500.0)
+                )
+            self.assertIn("Pre-trade risk limit rejected", str(ctx.exception))
+
+            # Cooperative AsyncJobRunner cancel_job
+            import threading
+            import time as _time
+
+            runner = AsyncJobRunner(max_workers=1)
+            started_ev = threading.Event()
+
+            def long_task(progress_cb, cancel_ev):
+                started_ev.set()
+                for idx in range(100):
+                    if cancel_ev.is_set():
+                        from core.jobs import JobCancelledError
+                        raise JobCancelledError("Stopped mid-scan")
+                    progress_cb(idx, 100, f"step {idx}")
+                    _time.sleep(0.02)
+                return {"ok": True}
+
+            jb = runner.submit("screener", {}, long_task)
+            started_ev.wait(timeout=2.0)
+            cancelled = runner.cancel_job(jb["job_id"])
+            self.assertEqual(cancelled["status"], "CANCELLED")
 
 
 if __name__ == "__main__":

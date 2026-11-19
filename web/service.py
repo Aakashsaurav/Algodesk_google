@@ -24,25 +24,24 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
+from backtest.engine import backtest_engine
+from backtest.registry import strategy_registry
 from broker.base import BrokerHealthSnapshot, ConnectionState
 from broker.registry import BrokerRegistry, SelectionStore
 from broker.upstox.auth import auth_manager as upstox_auth_manager
 from broker.zerodha.auth import zerodha_auth_manager
 from config import IST_TZ, config
-from core.analytics import (
-    BACKTEST_STRATEGIES,
-    DEFAULT_SCREENER_WATCHLIST,
-    SCREENER_PRESETS,
-    analytics_job_runner,
-    backtest_engine,
-    market_screener,
-    risk_limit_manager,
-)
 from core.audit import audit_trail
 from core.feed_manager import feed_manager
 from core.historical import historical_data_manager
 from core.instruments import instrument_index
+from core.jobs import analytics_job_runner
 from core.preflight import PreflightChecker, kill_switch_controller
+from indicators.toolkit import available_backends
+from risk.limits import risk_limit_manager
+from screener.engine import screener_engine
+from screener.registry import screen_registry
+from screener.universes import DEFAULT_WATCHLIST, universe_resolver
 
 logger = logging.getLogger(__name__)
 
@@ -704,45 +703,76 @@ class BrokerHubService:
 
     def get_analytics_metadata(self) -> Dict[str, Any]:
         sel = self._store.load()
+        screens = screen_registry.list_screens()
+        strat_specs = strategy_registry.list_strategies()
         return {
             "ok": True,
             "selections": sel,
-            "presets": SCREENER_PRESETS,
-            "strategies": BACKTEST_STRATEGIES,
-            "default_watchlist": DEFAULT_SCREENER_WATCHLIST,
+            "presets": {s["id"]: s["name"] for s in screens},
+            "screens": screens,
+            "strategies": {s["id"]: s["name"] for s in strat_specs},
+            "strategy_specs": strat_specs,
+            "universes": universe_resolver.list_universes(),
+            "indicator_backends": available_backends(),
+            "storage": historical_data_manager.storage_info(),
+            "file_errors": {
+                "screens": screen_registry.get_errors(),
+                "strategies": strategy_registry.get_errors(),
+            },
+            "screens_dir": str(screen_registry.screens_dir),
+            "strategies_dir": str(strategy_registry.strategies_dir),
+            "default_watchlist": DEFAULT_WATCHLIST,
         }
+
+    def reload_analytics_plugins(self) -> Dict[str, Any]:
+        screen_registry.refresh_if_changed(force=True)
+        strategy_registry.refresh_if_changed(force=True)
+        return self.get_analytics_metadata()
 
     def run_screener(
         self,
         *,
         symbols: Optional[List[str]] = None,
+        universe: str = "CUSTOM",
         exchange: str = "NSE",
         timeframe: str = "1day",
         lookback_days: int = 120,
-        preset: str = "all",
+        as_of_date: Optional[str] = None,
+        screen_id: Optional[str] = None,
+        preset: str = "all_metrics",
+        params: Optional[Dict[str, Any]] = None,
         provider: Optional[str] = None,
+        backend: str = "auto",
         async_job: bool = False,
     ) -> Dict[str, Any]:
         sel = self._store.load()
         eff_provider = (provider or sel.get("data_connection") or "yfinance").strip().lower()
-        clean_syms = [str(s).strip().upper() for s in (symbols or []) if str(s).strip()] or list(DEFAULT_SCREENER_WATCHLIST)
+        target_screen = screen_id or preset or "all_metrics"
+        eff_universe = (universe or "CUSTOM").strip().upper()
         meta = {
-            "preset": preset,
+            "screen_id": target_screen,
+            "preset": target_screen,
+            "universe": eff_universe,
+            "as_of_date": as_of_date or "LATEST",
             "provider": eff_provider,
             "exchange": exchange,
             "timeframe": timeframe,
-            "symbols_count": len(clean_syms),
         }
 
-        def _task(progress_cb):
-            return market_screener.scan(
-                symbols=clean_syms,
+        def _task(progress_cb, cancel_ev):
+            return screener_engine.scan(
+                symbols=symbols,
+                universe=eff_universe,
                 exchange=exchange,
                 timeframe=timeframe,
                 lookback_days=lookback_days,
-                preset=preset,
+                as_of_date=as_of_date,
+                screen_id=target_screen,
+                params=params,
                 provider=eff_provider,
+                backend=backend,
                 progress_cb=progress_cb,
+                cancel_event=cancel_ev,
             )
 
         if async_job:
@@ -758,6 +788,7 @@ class BrokerHubService:
         symbol: str,
         exchange: str = "NSE",
         strategy: str = "ema_crossover",
+        params: Optional[Dict[str, Any]] = None,
         timeframe: str = "1day",
         from_date: Optional[str] = None,
         to_date: Optional[str] = None,
@@ -767,6 +798,7 @@ class BrokerHubService:
         stop_loss_pct: float = 5.0,
         take_profit_pct: float = 12.0,
         provider: Optional[str] = None,
+        backend: str = "auto",
         instrument_type: Optional[str] = None,
         instrument_key: Optional[str] = None,
         async_job: bool = False,
@@ -781,11 +813,12 @@ class BrokerHubService:
             "provider": eff_provider,
         }
 
-        def _task(progress_cb):
+        def _task(progress_cb, cancel_ev):
             return backtest_engine.run(
                 symbol=symbol,
                 exchange=exchange,
                 strategy=strategy,
+                params=params,
                 timeframe=timeframe,
                 from_date=from_date,
                 to_date=to_date,
@@ -795,9 +828,11 @@ class BrokerHubService:
                 stop_loss_pct=stop_loss_pct,
                 take_profit_pct=take_profit_pct,
                 provider=eff_provider,
+                backend=backend,
                 instrument_type=instrument_type,
                 instrument_key=instrument_key,
                 progress_cb=progress_cb,
+                cancel_event=cancel_ev,
             )
 
         if async_job:
@@ -811,6 +846,10 @@ class BrokerHubService:
         job = analytics_job_runner.get_job(job_id)
         if not job:
             raise ValueError(f"Job '{job_id}' not found.")
+        return {"ok": True, "job": job}
+
+    def cancel_analytics_job(self, job_id: str) -> Dict[str, Any]:
+        job = analytics_job_runner.cancel_job(job_id)
         return {"ok": True, "job": job}
 
     def list_analytics_jobs(self, limit: int = 15) -> Dict[str, Any]:

@@ -259,6 +259,20 @@ class AppConfig:
         return self.SQLITE_DIR / "ohlcv.db"
 
     @property
+    def PARQUET_DIR(self) -> Path:
+        rel = os.getenv("ALGODESK_PARQUET_DIR", "").strip()
+        if rel:
+            p = Path(rel)
+            return p if p.is_absolute() else (self.BASE_DIR / p)
+        return self.DATA_DIR / "parquet"
+
+    @property
+    def OHLCV_STORAGE_MODE(self) -> str:
+        # 'hybrid' (SQLite coverage ledger + Parquet candles when pyarrow/pandas installed, else SQLite)
+        # or 'sqlite' (SQLite only)
+        return os.getenv("ALGODESK_OHLCV_STORAGE", "hybrid").strip().lower() or "hybrid"
+
+    @property
     def AUDIT_DB_PATH(self) -> Path:
         rel = os.getenv("ALGODESK_AUDIT_DB", "").strip()
         if rel:
@@ -277,6 +291,14 @@ class AppConfig:
     @property
     def SELECTION_FILE(self) -> Path:
         return self.DATA_DIR / "broker_selection.json"
+
+    @property
+    def RISK_LIMITS_FILE(self) -> Path:
+        rel = os.getenv("ALGODESK_RISK_LIMITS_FILE", "").strip()
+        if rel:
+            p = Path(rel)
+            return p if p.is_absolute() else (self.BASE_DIR / p)
+        return self.DATA_DIR / "risk_limits.json"
 
     @property
     def KILL_SWITCH_FILE(self) -> Path:

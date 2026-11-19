@@ -25,6 +25,7 @@ import csv
 import io
 import json
 import logging
+import os
 import sqlite3
 import threading
 import urllib.error
@@ -40,6 +41,20 @@ from config import IST_TZ, config
 from core.instruments import instrument_index
 
 logger = logging.getLogger(__name__)
+
+
+def _parquet_engine() -> Optional[Tuple[Any, Any, Any]]:
+    """Return (pandas, pyarrow, pyarrow.parquet) if installed & hybrid mode active."""
+    if config.OHLCV_STORAGE_MODE == "sqlite":
+        return None
+    try:
+        import pandas as pd  # type: ignore
+        import pyarrow as pa  # type: ignore
+        import pyarrow.parquet as pq  # type: ignore
+
+        return pd, pa, pq
+    except ImportError:
+        return None
 
 VALID_TIMEFRAMES = {
     "1day": {
@@ -180,16 +195,46 @@ def _split_chunk(start_d: date, end_d: date, max_days: int) -> List[Tuple[date, 
 
 
 class HistoricalDataManager:
-    """Thread-safe SQLite OHLCV store and gap-only multi-provider downloader."""
+    """Thread-safe Hybrid SQLite/Parquet OHLCV store and gap-only multi-provider downloader."""
 
-    def __init__(self, db_path: Optional[Path] = None) -> None:
+    def __init__(self, db_path: Optional[Path] = None, parquet_dir: Optional[Path] = None) -> None:
         self._explicit_path = db_path
+        self._explicit_parquet_dir = parquet_dir
         self._lock = threading.RLock()
         self._initialized_paths: set[Path] = set()
 
     @property
     def db_path(self) -> Path:
         return self._explicit_path or config.OHLCV_DB_PATH
+
+    @property
+    def parquet_dir(self) -> Path:
+        if self._explicit_parquet_dir is not None:
+            return self._explicit_parquet_dir
+        if self._explicit_path is not None:
+            return self._explicit_path.parent / "parquet"
+        return config.PARQUET_DIR
+
+    def _parquet_file(self, symbol: str, exchange: str, timeframe: str) -> Path:
+        safe_sym = "".join(ch if (ch.isalnum() or ch in {"_", "-", "."}) else "_" for ch in symbol.upper())
+        safe_exch = "".join(ch if ch.isalnum() else "_" for ch in exchange.upper()) or "NSE"
+        safe_tf = "".join(ch if ch.isalnum() else "_" for ch in timeframe.lower()) or "1day"
+        return self.parquet_dir / safe_exch / safe_tf / f"{safe_sym}.parquet"
+
+    def storage_info(self) -> Dict[str, Any]:
+        engine = _parquet_engine()
+        p_dir = self.parquet_dir
+        p_files = 0
+        if p_dir.exists():
+            p_files = sum(1 for _ in p_dir.rglob("*.parquet"))
+        return {
+            "configured_mode": config.OHLCV_STORAGE_MODE,
+            "active_mode": "hybrid_parquet" if engine is not None else "sqlite_fallback",
+            "parquet_available": engine is not None,
+            "parquet_dir": str(p_dir),
+            "parquet_files": p_files,
+            "sqlite_ledger_path": str(self.db_path),
+        }
 
     def _connect(self) -> sqlite3.Connection:
         path = self.db_path
@@ -238,6 +283,22 @@ class HistoricalDataManager:
                 status TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 PRIMARY KEY (symbol, exchange, timeframe, covered_date)
+            );
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS dataset_catalog (
+                symbol TEXT NOT NULL,
+                exchange TEXT NOT NULL,
+                timeframe TEXT NOT NULL,
+                row_count INTEGER NOT NULL DEFAULT 0,
+                start_date TEXT NOT NULL,
+                end_date TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                storage_backend TEXT NOT NULL DEFAULT 'sqlite',
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (symbol, exchange, timeframe)
             );
             """
         )
@@ -710,34 +771,113 @@ class HistoricalDataManager:
                             checked_weekdays.append(d_cur)
                         d_cur += timedelta(days=1)
 
+            engine = _parquet_engine()
+            storage_backend = "sqlite"
+            parquet_meta: Optional[Tuple[int, str, str]] = None
+
             with self._connect() as conn:
                 if all_candles:
-                    conn.executemany(
-                        """
-                        INSERT OR REPLACE INTO candles
-                        (symbol, exchange, timeframe, ts_ist, trade_date,
-                         open, high, low, close, volume, oi, source)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        [
+                    if engine is not None:
+                        pd, pa, pq = engine
+                        p_file = self._parquet_file(clean_sym, clean_exch, tf)
+                        p_file.parent.mkdir(parents=True, exist_ok=True)
+                        new_df = pd.DataFrame(
+                            [
+                                {
+                                    "ts_ist": str(c["ts_ist"]),
+                                    "trade_date": str(c["trade_date"]),
+                                    "open": float(c["open"]),
+                                    "high": float(c["high"]),
+                                    "low": float(c["low"]),
+                                    "close": float(c["close"]),
+                                    "volume": int(c.get("volume", 0)),
+                                    "oi": int(c.get("oi", 0)),
+                                    "source": eff_provider,
+                                }
+                                for c in all_candles
+                            ]
+                        )
+                        frames = []
+                        if p_file.exists():
+                            frames.append(pq.read_table(p_file).to_pandas())
+                        else:
+                            # Migrate any legacy SQLite rows on first Parquet write
+                            legacy_rows = conn.execute(
+                                "SELECT ts_ist, trade_date, open, high, low, close, volume, oi, source "
+                                "FROM candles WHERE symbol = ? AND exchange = ? AND timeframe = ?",
+                                (clean_sym, clean_exch, tf),
+                            ).fetchall()
+                            if legacy_rows:
+                                frames.append(pd.DataFrame([dict(r) for r in legacy_rows]))
+                        frames.append(new_df)
+                        merged_df = pd.concat(frames, ignore_index=True)
+                        merged_df = merged_df.drop_duplicates(subset=["ts_ist"], keep="last")
+                        merged_df = merged_df.sort_values("ts_ist").reset_index(drop=True)
+                        tmp_file = p_file.with_suffix(".tmp.parquet")
+                        table = pa.Table.from_pandas(merged_df, preserve_index=False)
+                        pq.write_table(table, tmp_file, compression="snappy")
+                        os.replace(tmp_file, p_file)
+                        storage_backend = "parquet"
+                        rows_inserted = len(all_candles)
+                        parquet_meta = (
+                            int(len(merged_df)),
+                            str(merged_df["trade_date"].iloc[0]),
+                            str(merged_df["trade_date"].iloc[-1]),
+                        )
+                    else:
+                        conn.executemany(
+                            """
+                            INSERT OR REPLACE INTO candles
+                            (symbol, exchange, timeframe, ts_ist, trade_date,
+                             open, high, low, close, volume, oi, source)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
+                            [
+                                (
+                                    clean_sym,
+                                    clean_exch,
+                                    tf,
+                                    c["ts_ist"],
+                                    c["trade_date"],
+                                    float(c["open"]),
+                                    float(c["high"]),
+                                    float(c["low"]),
+                                    float(c["close"]),
+                                    int(c.get("volume", 0)),
+                                    int(c.get("oi", 0)),
+                                    eff_provider,
+                                )
+                                for c in all_candles
+                            ],
+                        )
+                        rows_inserted = len(all_candles)
+                        agg_cat = conn.execute(
+                            "SELECT COUNT(*) AS cnt, MIN(trade_date) AS s_d, MAX(trade_date) AS e_d "
+                            "FROM candles WHERE symbol = ? AND exchange = ? AND timeframe = ?",
+                            (clean_sym, clean_exch, tf),
+                        ).fetchone()
+                        if agg_cat and int(agg_cat["cnt"] or 0) > 0:
+                            parquet_meta = (int(agg_cat["cnt"]), str(agg_cat["s_d"]), str(agg_cat["e_d"]))
+
+                    if parquet_meta is not None:
+                        conn.execute(
+                            """
+                            INSERT OR REPLACE INTO dataset_catalog
+                            (symbol, exchange, timeframe, row_count, start_date, end_date, provider, storage_backend, updated_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            """,
                             (
                                 clean_sym,
                                 clean_exch,
                                 tf,
-                                c["ts_ist"],
-                                c["trade_date"],
-                                float(c["open"]),
-                                float(c["high"]),
-                                float(c["low"]),
-                                float(c["close"]),
-                                int(c.get("volume", 0)),
-                                int(c.get("oi", 0)),
+                                parquet_meta[0],
+                                parquet_meta[1],
+                                parquet_meta[2],
                                 eff_provider,
-                            )
-                            for c in all_candles
-                        ],
-                    )
-                    rows_inserted = len(all_candles)
+                                storage_backend,
+                                now_ist_str,
+                            ),
+                        )
 
                 coverage_rows = []
                 for d_item in checked_weekdays:
@@ -808,15 +948,90 @@ class HistoricalDataManager:
         clean_exch = (exchange or "NSE").strip().upper()
         tf = (timeframe or "1day").strip().lower()
         mode = "full" if (view or "").strip().lower() == "full" else "snapshot"
+        from_iso = _parse_iso_date(from_date).isoformat() if from_date else None
+        to_iso = _parse_iso_date(to_date).isoformat() if to_date else None
+
+        # Hybrid read path: prefer Parquet file if present & pyarrow/pandas installed
+        p_file = self._parquet_file(clean_sym, clean_exch, tf)
+        engine = _parquet_engine()
+        if engine is not None and p_file.exists():
+            _pd, _pa, pq = engine
+            df = pq.read_table(p_file).to_pandas()
+            if from_iso:
+                df = df[df["trade_date"] >= from_iso]
+            if to_iso:
+                df = df[df["trade_date"] <= to_iso]
+            df = df.sort_values("ts_ist").reset_index(drop=True)
+            total_rows = int(len(df))
+            if total_rows == 0:
+                return {
+                    "symbol": clean_sym,
+                    "exchange": clean_exch,
+                    "timeframe": tf,
+                    "view_mode": mode,
+                    "storage_backend": "parquet",
+                    "total_rows": 0,
+                    "returned_rows": 0,
+                    "is_truncated": False,
+                    "summary": {
+                        "start_ts": None,
+                        "end_ts": None,
+                        "min_low": None,
+                        "max_high": None,
+                        "latest_close": None,
+                        "change_pct": None,
+                        "total_volume": 0,
+                        "latest_oi": 0,
+                    },
+                    "rows": [],
+                }
+
+            first_open = float(df["open"].iloc[0])
+            latest_close = float(df["close"].iloc[-1])
+            latest_oi = int(df["oi"].iloc[-1]) if "oi" in df.columns else 0
+            change_pct = (
+                round(((latest_close - first_open) / first_open) * 100.0, 2)
+                if first_open != 0
+                else None
+            )
+            if mode == "full":
+                sliced = df.iloc[max(0, int(offset)) : (max(0, int(offset)) + int(limit))] if (limit and limit > 0) else df
+            else:
+                if total_rows <= 15:
+                    sliced = df
+                else:
+                    sliced = _pd.concat([df.iloc[:5], df.iloc[-10:]], ignore_index=True).drop_duplicates(subset=["ts_ist"])
+            rows_out = sliced.to_dict(orient="records")
+            return {
+                "symbol": clean_sym,
+                "exchange": clean_exch,
+                "timeframe": tf,
+                "view_mode": mode,
+                "storage_backend": "parquet",
+                "total_rows": total_rows,
+                "returned_rows": len(rows_out),
+                "is_truncated": len(rows_out) < total_rows,
+                "summary": {
+                    "start_ts": str(df["ts_ist"].iloc[0]),
+                    "end_ts": str(df["ts_ist"].iloc[-1]),
+                    "min_low": round(float(df["low"].min()), 4),
+                    "max_high": round(float(df["high"].max()), 4),
+                    "latest_close": round(latest_close, 4),
+                    "change_pct": change_pct,
+                    "total_volume": int(df["volume"].sum()),
+                    "latest_oi": latest_oi,
+                },
+                "rows": rows_out,
+            }
 
         clauses = ["symbol = ?", "exchange = ?", "timeframe = ?"]
         params: List[Any] = [clean_sym, clean_exch, tf]
-        if from_date:
+        if from_iso:
             clauses.append("trade_date >= ?")
-            params.append(_parse_iso_date(from_date).isoformat())
-        if to_date:
+            params.append(from_iso)
+        if to_iso:
             clauses.append("trade_date <= ?")
-            params.append(_parse_iso_date(to_date).isoformat())
+            params.append(to_iso)
 
         where_sql = " AND ".join(clauses)
 
@@ -858,7 +1073,6 @@ class HistoricalDataManager:
                         q_params.extend([int(limit), max(0, int(offset))])
                     rows_out = [dict(r) for r in conn.execute(sql, q_params).fetchall()]
                 else:
-                    # Snapshot: up to 15 representative bars (first 5 + latest 10 if larger)
                     if total_rows <= 15:
                         rows_out = [
                             dict(r)
@@ -906,6 +1120,7 @@ class HistoricalDataManager:
             "exchange": clean_exch,
             "timeframe": tf,
             "view_mode": mode,
+            "storage_backend": "sqlite",
             "total_rows": total_rows,
             "returned_rows": len(rows_out),
             "is_truncated": len(rows_out) < total_rows,
@@ -923,9 +1138,10 @@ class HistoricalDataManager:
         }
 
     def list_catalog(self) -> List[Dict[str, Any]]:
-        """List all locally stored datasets in ohlcv.db without making any network calls."""
+        """List all locally stored datasets (Parquet + SQLite) without network calls."""
+        merged: Dict[Tuple[str, str, str], Dict[str, Any]] = {}
         with self._connect() as conn:
-            rows = conn.execute(
+            sqlite_rows = conn.execute(
                 """
                 SELECT symbol, exchange, timeframe,
                        COUNT(*) AS row_count,
@@ -934,10 +1150,45 @@ class HistoricalDataManager:
                        MAX(source) AS provider
                 FROM candles
                 GROUP BY symbol, exchange, timeframe
-                ORDER BY MAX(trade_date) DESC, symbol ASC
                 """
             ).fetchall()
-        return [dict(r) for r in rows]
+            for r in sqlite_rows:
+                item = dict(r)
+                item["storage_backend"] = "sqlite"
+                merged[(item["symbol"], item["exchange"], item["timeframe"])] = item
+
+            cat_rows = conn.execute(
+                """
+                SELECT symbol, exchange, timeframe, row_count, start_date, end_date, provider, storage_backend
+                FROM dataset_catalog
+                """
+            ).fetchall()
+            for r in cat_rows:
+                item = dict(r)
+                merged[(item["symbol"], item["exchange"], item["timeframe"])] = item
+
+        out = list(merged.values())
+        out.sort(key=lambda d: (str(d.get("end_date") or ""), str(d.get("symbol") or "")), reverse=True)
+        return out
+
+    def list_cached_symbols(
+        self,
+        exchange: Optional[str] = None,
+        timeframe: Optional[str] = None,
+    ) -> List[str]:
+        """Return unique cached symbols stored in either Parquet or SQLite."""
+        ex_filter = (exchange or "").strip().upper()
+        tf_filter = (timeframe or "").strip().lower()
+        syms: Set[str] = set()
+        for ds in self.list_catalog():
+            if ex_filter and str(ds.get("exchange") or "").upper() != ex_filter:
+                continue
+            if tf_filter and str(ds.get("timeframe") or "").lower() != tf_filter:
+                continue
+            sym = str(ds.get("symbol") or "").strip().upper()
+            if sym:
+                syms.add(sym)
+        return sorted(syms)
 
     def export_csv(
         self,

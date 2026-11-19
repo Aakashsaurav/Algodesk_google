@@ -132,6 +132,17 @@ class CanonicalSessionManager:
             except Exception:
                 pass
             raise RuntimeError("Trading kill switch is engaged; order rejected.")
+        if self.risk_engine is not None and hasattr(self.risk_engine, "validate_order"):
+            verdict = self.risk_engine.validate_order(
+                symbol=req.trading_symbol,
+                quantity=req.quantity,
+                price=req.price,
+                transaction_type=req.transaction_type,
+                current_open_positions=len(self.state.open_orders),
+            )
+            if not verdict.get("allowed", True):
+                reasons = "; ".join(verdict.get("reasons", []) or ["Blocked by portfolio risk limits"])
+                raise RuntimeError(f"Pre-trade risk limit rejected order: {reasons}")
         res = self.order_manager.place(req)
         try:
             self._audit.log(

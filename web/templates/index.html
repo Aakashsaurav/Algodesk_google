@@ -870,55 +870,67 @@
       <div class="p5-head">
         <div>
           <h2>Phase 05 — Screener, Backtester &amp; Portfolio Risk Console</h2>
-          <p class="section-desc" style="margin:0;">Pure O(N) asynchronous technical screener, strategy backtester, and live exposure risk limits routed through your assigned Data &amp; Trading connections.</p>
+          <p id="p5RuntimeBadges" class="section-desc" style="margin:0;">Hot-reloaded .py screens &amp; strategies routed through your assigned Data &amp; Trading connections.</p>
         </div>
-        <div class="p5-tabs">
-          <button id="p5TabScreener" class="p5-tab active" type="button">Market Screener</button>
-          <button id="p5TabBacktest" class="p5-tab" type="button">Strategy Backtester</button>
-          <button id="p5TabRisk" class="p5-tab" type="button">Risk Limits</button>
+        <div style="display:flex; align-items:center; gap:8px; flex-wrap:wrap;">
+          <button id="p5ReloadBtn" class="btn" type="button" style="min-height:34px; padding:5px 12px; font-size:12px;">Reload .py Files</button>
+          <div class="p5-tabs">
+            <button id="p5TabScreener" class="p5-tab active" type="button">Market Screener</button>
+            <button id="p5TabBacktest" class="p5-tab" type="button">Strategy Backtester</button>
+            <button id="p5TabRisk" class="p5-tab" type="button">Risk Limits</button>
+          </div>
         </div>
       </div>
 
+      <div id="p5PluginErrors" class="feedback err" style="display:none; margin-bottom:12px;"></div>
+
       <!-- Panel 1: Market Screener -->
       <div id="p5PanelScreener" class="panel">
-        <div class="p5-grid-sc">
+        <div class="p5-grid-sc" style="grid-template-columns:1fr 1.3fr 1fr 0.9fr auto;">
           <div class="field">
-            <label for="p5ScSymbols">Watchlist Symbols (comma-separated)</label>
+            <label for="p5ScUniverse">Universe / Group</label>
+            <select id="p5ScUniverse">
+              <option value="CUSTOM" selected>Custom (Comma-Separated)</option>
+              <option value="DEFAULT_WATCHLIST">Default Watchlist (10)</option>
+              <option value="NIFTY_50">NIFTY 50</option>
+              <option value="NIFTY_BANK">NIFTY Bank</option>
+              <option value="NIFTY_IT">NIFTY IT</option>
+              <option value="NIFTY_FNO">NIFTY F&amp;O</option>
+              <option value="NIFTY_500">NIFTY 500</option>
+              <option value="CACHED_SQLITE">Local Cached</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="p5ScSymbols">Symbols (comma-separated / extra)</label>
             <input id="p5ScSymbols" class="mono" type="text" value="RELIANCE, TCS, INFY, HDFCBANK, ICICIBANK, SBIN, BHARTIARTL, ITC, LT, AXISBANK" />
           </div>
           <div class="field">
-            <label for="p5ScPreset">Rule Preset</label>
+            <label for="p5ScPreset">Screen (.py plugin)</label>
             <select id="p5ScPreset">
-              <option value="all">All Metrics</option>
+              <option value="all_metrics">All Watchlist Metrics</option>
               <option value="momentum_breakout">Momentum Breakout</option>
               <option value="vcp_contraction">VCP Contraction</option>
-              <option value="oversold_rebound">Oversold RSI</option>
-              <option value="trend_following">Trend Following</option>
+              <option value="oversold_rebound">Oversold Mean Reversion</option>
+              <option value="trend_following">Uptrend Alignment (EMA + ADX)</option>
             </select>
           </div>
           <div class="field">
-            <label for="p5ScTf">Timeframe</label>
-            <select id="p5ScTf">
-              <option value="1day">1 Day</option>
-              <option value="30minute">30 Min</option>
-            </select>
+            <label for="p5ScAsOf">As-Of Date</label>
+            <input id="p5ScAsOf" class="mono" type="date" />
           </div>
-          <div class="field">
-            <label for="p5ScLookback">Lookback (D)</label>
-            <input id="p5ScLookback" class="mono" type="number" min="30" max="730" value="120" />
+          <div style="display:flex; gap:8px;">
+            <button id="p5ScRunBtn" class="btn btn-primary" type="button">Run Scan</button>
+            <button id="p5ScCancelBtn" class="btn" type="button" style="display:none; border-color:var(--red); color:#fca5a5;">Cancel</button>
           </div>
-          <div class="field">
-            <label for="p5ScProvider">Data Source</label>
-            <select id="p5ScProvider">
-              <option value="auto">Assigned Connection</option>
-              <option value="yfinance">Yahoo Finance</option>
-              <option value="upstox">Upstox</option>
-              <option value="zerodha">Zerodha Kite</option>
-            </select>
-          </div>
-          <button id="p5ScRunBtn" class="btn btn-primary" type="button">Run Async Scan</button>
         </div>
-        <div id="p5ScMeta" class="mono" style="font-size:12px; color:var(--text-muted); margin-top:10px;">Ready for O(N) multi-symbol scan.</div>
+        <div style="display:grid; grid-template-columns:repeat(4, minmax(0,1fr)); gap:12px; margin-top:12px;">
+          <div class="field"><label for="p5ScTf">Timeframe</label><select id="p5ScTf"><option value="1day">1 Day</option><option value="30minute">30 Min</option></select></div>
+          <div class="field"><label for="p5ScLookback">Lookback (D)</label><input id="p5ScLookback" class="mono" type="number" min="30" max="1095" value="120" /></div>
+          <div class="field"><label for="p5ScProvider">Data Source</label><select id="p5ScProvider"><option value="auto">Assigned Connection</option><option value="yfinance">Yahoo Finance</option><option value="upstox">Upstox</option><option value="zerodha">Zerodha Kite</option></select></div>
+          <div class="field"><label for="p5ScBackend">Indicator Engine</label><select id="p5ScBackend"><option value="auto">Auto (TA-Lib → pandas-ta → Built-in)</option><option value="builtin">Built-in Python O(N)</option></select></div>
+        </div>
+        <div id="p5ScParamsBox" style="margin-top:12px;"></div>
+        <div id="p5ScMeta" class="mono" style="font-size:12px; color:var(--text-muted); margin-top:10px;">Ready for multi-symbol scan.</div>
         <div id="p5ScTableWrap" style="margin-top:12px;"></div>
       </div>
 
@@ -938,7 +950,7 @@
             </select>
           </div>
           <div class="field">
-            <label for="p5BtStrategy">Strategy</label>
+            <label for="p5BtStrategy">Strategy (.py plugin)</label>
             <select id="p5BtStrategy">
               <option value="ema_crossover">EMA 20 / 50 Crossover</option>
               <option value="rsi_mean_reversion">Wilder RSI (14) Mean Reversion</option>
@@ -961,7 +973,10 @@
             <label for="p5BtTo">To</label>
             <input id="p5BtTo" class="mono" type="date" />
           </div>
-          <button id="p5BtRunBtn" class="btn btn-primary" type="button">Run Backtest</button>
+          <div style="display:flex; gap:8px;">
+            <button id="p5BtRunBtn" class="btn btn-primary" type="button">Run Backtest</button>
+            <button id="p5BtCancelBtn" class="btn" type="button" style="display:none; border-color:var(--red); color:#fca5a5;">Cancel</button>
+          </div>
         </div>
         <div style="display:grid; grid-template-columns:repeat(4, minmax(0,1fr)); gap:12px; margin-top:12px;">
           <div class="field"><label for="p5BtCap">Capital (₹)</label><input id="p5BtCap" class="mono" type="number" value="500000" /></div>
@@ -969,6 +984,7 @@
           <div class="field"><label for="p5BtTp">Take Profit %</label><input id="p5BtTp" class="mono" type="number" step="0.5" value="12" /></div>
           <div class="field"><label for="p5BtProvider">Source</label><select id="p5BtProvider"><option value="auto">Assigned</option><option value="yfinance">Yahoo Finance</option><option value="upstox">Upstox</option><option value="zerodha">Zerodha Kite</option></select></div>
         </div>
+        <div id="p5BtParamsBox" style="margin-top:12px;"></div>
         <div id="p5BtMeta" class="mono" style="font-size:12px; color:var(--text-muted); margin-top:10px;">Configure parameters and click Run Backtest.</div>
         <div id="p5BtSummary" class="summary-strip mono" style="display:none; margin-top:12px;"></div>
         <div id="p5BtChart" style="margin-top:12px;"></div>
@@ -2343,18 +2359,26 @@
 
     // Phase 5: Screener, O(N) Backtester & Risk Limits JS
     const p5 = {
+      badges: document.getElementById('p5RuntimeBadges'),
+      reloadBtn: document.getElementById('p5ReloadBtn'),
+      pluginErrors: document.getElementById('p5PluginErrors'),
       tabSc: document.getElementById('p5TabScreener'),
       tabBt: document.getElementById('p5TabBacktest'),
       tabRk: document.getElementById('p5TabRisk'),
       panSc: document.getElementById('p5PanelScreener'),
       panBt: document.getElementById('p5PanelBacktest'),
       panRk: document.getElementById('p5PanelRisk'),
+      scUni: document.getElementById('p5ScUniverse'),
       scSym: document.getElementById('p5ScSymbols'),
       scPreset: document.getElementById('p5ScPreset'),
+      scAsOf: document.getElementById('p5ScAsOf'),
       scTf: document.getElementById('p5ScTf'),
       scLookback: document.getElementById('p5ScLookback'),
       scProv: document.getElementById('p5ScProvider'),
+      scBackend: document.getElementById('p5ScBackend'),
+      scParamsBox: document.getElementById('p5ScParamsBox'),
       scBtn: document.getElementById('p5ScRunBtn'),
+      scCancelBtn: document.getElementById('p5ScCancelBtn'),
       scMeta: document.getElementById('p5ScMeta'),
       scTable: document.getElementById('p5ScTableWrap'),
       btSym: document.getElementById('p5BtSymbol'),
@@ -2367,7 +2391,9 @@
       btSl: document.getElementById('p5BtSl'),
       btTp: document.getElementById('p5BtTp'),
       btProv: document.getElementById('p5BtProvider'),
+      btParamsBox: document.getElementById('p5BtParamsBox'),
       btBtn: document.getElementById('p5BtRunBtn'),
+      btCancelBtn: document.getElementById('p5BtCancelBtn'),
       btMeta: document.getElementById('p5BtMeta'),
       btSummary: document.getElementById('p5BtSummary'),
       btChart: document.getElementById('p5BtChart'),
@@ -2384,9 +2410,90 @@
       rkAuto: document.getElementById('p5RkAutoKill'),
       rkFeedback: document.getElementById('p5RiskFeedback'),
       rkSaveBtn: document.getElementById('p5RiskSaveBtn'),
+      metaData: null,
+      scJobId: null,
+      btJobId: null,
     };
     p5.btTo.value = new Date().toISOString().slice(0, 10);
     p5.btFrom.value = new Date(Date.now() - 365 * 86400000).toISOString().slice(0, 10);
+    p5.scAsOf.max = new Date().toISOString().slice(0, 10);
+
+    function renderParamInputsP5(container, specs, prefix) {
+      if (!specs || !specs.length) {
+        container.innerHTML = '';
+        return;
+      }
+      container.innerHTML = `<div style="border:1px solid var(--border);border-radius:8px;background:var(--bg);padding:10px 12px;"><div style="font-size:11px;font-weight:600;color:var(--text-muted);margin-bottom:8px;">Indicator Parameters</div><div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(140px,1fr));gap:10px;">${specs.map((sp) => {
+        const eid = `${prefix}_${sp.name}`;
+        if (sp.type === 'bool') {
+          return `<div class="field"><label for="${eid}" style="font-size:11px;">${sp.label}</label><label style="display:flex;align-items:center;gap:6px;min-height:34px;border:1px solid var(--border);border-radius:6px;padding:0 8px;background:var(--surface);font-size:12px;"><input id="${eid}" data-pname="${sp.name}" data-ptype="bool" type="checkbox" ${sp.default ? 'checked' : ''} /><span>Enabled</span></label></div>`;
+        }
+        return `<div class="field"><label for="${eid}" style="font-size:11px;">${sp.label}</label><input id="${eid}" data-pname="${sp.name}" data-ptype="${sp.type}" class="mono" type="${sp.type === 'str' ? 'text' : 'number'}" ${sp.min_val !== null && sp.min_val !== undefined ? `min="${sp.min_val}"` : ''} ${sp.max_val !== null && sp.max_val !== undefined ? `max="${sp.max_val}"` : ''} ${sp.step ? `step="${sp.step}"` : ''} value="${sp.default}" /></div>`;
+      }).join('')}</div></div>`;
+    }
+
+    function readParamValuesP5(container) {
+      const out = {};
+      container.querySelectorAll('[data-pname]').forEach((el) => {
+        const k = el.getAttribute('data-pname');
+        const t = el.getAttribute('data-ptype');
+        if (t === 'bool') out[k] = Boolean(el.checked);
+        else if (t === 'str') out[k] = el.value;
+        else out[k] = Number(el.value);
+      });
+      return out;
+    }
+
+    function syncActiveParamsP5() {
+      if (!p5.metaData) return;
+      const scObj = (p5.metaData.screens || []).find((s) => s.id === p5.scPreset.value);
+      renderParamInputsP5(p5.scParamsBox, scObj ? scObj.params : [], 'p5sc_param');
+      const btObj = (p5.metaData.strategy_specs || []).find((s) => s.id === p5.btStrat.value);
+      renderParamInputsP5(p5.btParamsBox, btObj ? btObj.params : [], 'p5bt_param');
+    }
+
+    async function loadAnalyticsMetaP5(forceReload = false) {
+      try {
+        const res = await fetch(forceReload ? '/api/analytics/reload' : '/api/analytics/meta', {
+          method: forceReload ? 'POST' : 'GET',
+        });
+        if (!res.ok) return;
+        const m = await res.json();
+        p5.metaData = m;
+        if (m.storage || m.indicator_backends) {
+          const stLabel = m.storage && m.storage.parquet_available ? 'HYBRID PARQUET' : 'SQLITE FALLBACK';
+          const taList = Object.entries(m.indicator_backends || {}).filter(([, ok]) => ok).map(([k]) => k).join(', ');
+          p5.badges.textContent = `Hot-reloaded .py plugins · Storage: ${stLabel}${taList ? ' · TA: ' + taList : ''}`;
+        }
+        const curUni = p5.scUni.value;
+        if (Array.isArray(m.universes)) {
+          p5.scUni.innerHTML = m.universes.map((u) => `<option value="${u.id}">${u.label}</option>`).join('');
+          p5.scUni.value = m.universes.some((u) => u.id === curUni) ? curUni : 'CUSTOM';
+        }
+        const curSc = p5.scPreset.value;
+        if (Array.isArray(m.screens)) {
+          p5.scPreset.innerHTML = m.screens.map((s) => `<option value="${s.id}">${s.name}</option>`).join('');
+          p5.scPreset.value = m.screens.some((s) => s.id === curSc) ? curSc : (m.screens[0] ? m.screens[0].id : 'all_metrics');
+        }
+        const curBt = p5.btStrat.value;
+        if (Array.isArray(m.strategy_specs)) {
+          p5.btStrat.innerHTML = m.strategy_specs.map((s) => `<option value="${s.id}">${s.name}</option>`).join('');
+          p5.btStrat.value = m.strategy_specs.some((s) => s.id === curBt) ? curBt : 'ema_crossover';
+        }
+        const errs = [
+          ...Object.entries((m.file_errors && m.file_errors.screens) || {}).map(([f, msg]) => `[Screen ${f}] ${String(msg).split('\n')[0]}`),
+          ...Object.entries((m.file_errors && m.file_errors.strategies) || {}).map(([f, msg]) => `[Strategy ${f}] ${String(msg).split('\n')[0]}`),
+        ];
+        if (errs.length) {
+          p5.pluginErrors.style.display = 'block';
+          p5.pluginErrors.textContent = errs.join(' · ');
+        } else {
+          p5.pluginErrors.style.display = 'none';
+          p5.pluginErrors.textContent = '';
+        }
+        syncActiveParamsP5();
+      } catch {}
+    }
 
     function switchP5Tab(tab) {
       p5.tabSc.classList.toggle('active', tab === 'screener');
@@ -2399,12 +2506,12 @@
     }
 
     async function pollJobP5(jobId, onProgress) {
-      for (let i = 0; i < 180; i += 1) {
+      for (let i = 0; i < 1500; i += 1) {
         const res = await fetch(`/api/analytics/jobs/${encodeURIComponent(jobId)}`);
         const body = await res.json();
         if (!res.ok || !body.job) throw new Error(body.detail || 'Job status error');
         onProgress(body.job);
-        if (body.job.status === 'COMPLETED' || body.job.status === 'FAILED') return body.job;
+        if (body.job.status === 'COMPLETED' || body.job.status === 'FAILED' || body.job.status === 'CANCELLED') return body.job;
         await new Promise((r) => setTimeout(r, 450));
       }
       throw new Error('Job polling timed out');
@@ -2420,28 +2527,39 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             symbols: syms.length ? syms : null,
+            universe: p5.scUni.value,
             exchange: 'NSE',
             timeframe: p5.scTf.value,
             lookback_days: Number(p5.scLookback.value) || 120,
+            as_of_date: p5.scAsOf.value || null,
+            screen_id: p5.scPreset.value,
             preset: p5.scPreset.value,
+            params: readParamValuesP5(p5.scParamsBox),
             provider: p5.scProv.value === 'auto' ? null : p5.scProv.value,
+            backend: p5.scBackend.value || 'auto',
             async_job: true,
           }),
         });
         const startBody = await res.json();
         if (!res.ok || !startBody.job) throw new Error(startBody.detail || 'Screener failed');
+        p5.scJobId = startBody.job.job_id;
+        p5.scCancelBtn.style.display = 'inline-flex';
         const done = await pollJobP5(startBody.job.job_id, (j) => {
           p5.scMeta.textContent = `Job ${j.job_id}: ${j.status} (${j.progress_pct}%) — ${j.progress_message}`;
         });
         if (done.status === 'FAILED') throw new Error(done.error || done.progress_message);
-        const r = done.result;
-        p5.scMeta.textContent = `Matched ${r.matched_count}/${r.evaluated_count} via ${String(r.provider).toUpperCase()} · API Calls: ${r.api_calls_made} · Cached Days Skipped: ${r.existing_days_skipped}`;
-        const rows = r.results || [];
-        if (!rows.length) {
-          p5.scTable.innerHTML = '<div style="font-size:12px;color:var(--text-muted);padding:10px 0;">No symbols matched this preset.</div>';
+        if (done.status === 'CANCELLED') {
+          p5.scMeta.textContent = done.progress_message || 'Scan cancelled.';
           return;
         }
-        p5.scTable.innerHTML = `<div class="table-wrap"><table class="ohlcv-table mono"><thead><tr><th>Symbol</th><th class="num">Close</th><th class="num">Chg%</th><th class="num">EMA20</th><th class="num">EMA50</th><th class="num">RSI(14)</th><th class="num">ATR%</th><th class="num">Vol</th><th>Signal</th><th class="num">Action</th></tr></thead><tbody>${rows.map((x) => `<tr><td style="font-weight:600">${x.symbol}</td><td class="num">${Number(x.close).toFixed(2)}</td><td class="num" style="color:${x.change_pct >= 0 ? '#34d399' : '#f87171'}">${x.change_pct >= 0 ? '+' : ''}${Number(x.change_pct).toFixed(2)}%</td><td class="num">${x.ema20 !== null ? Number(x.ema20).toFixed(2) : '—'}</td><td class="num">${x.ema50 !== null ? Number(x.ema50).toFixed(2) : '—'}</td><td class="num">${x.rsi14 !== null ? Number(x.rsi14).toFixed(1) : '—'}</td><td class="num">${x.atr_pct !== null ? Number(x.atr_pct).toFixed(2) + '%' : '—'}</td><td class="num">${Number(x.vol_ratio).toFixed(2)}x</td><td style="color:var(--accent);font-weight:600">${x.signal}</td><td class="num"><button type="button" class="quick-btn" data-bt-sym="${x.symbol}" data-bt-ex="${x.exchange}">Backtest &rarr;</button></td></tr>`).join('')}</tbody></table></div>`;
+        const r = done.result;
+        p5.scMeta.textContent = `Matched ${r.matched_count}/${r.evaluated_count} (${r.universe_label} · As-Of ${r.as_of_date}) via ${String(r.provider).toUpperCase()} · API Calls: ${r.api_calls_made} · Cached Days Skipped: ${r.existing_days_skipped}`;
+        const rows = r.results || [];
+        if (!rows.length) {
+          p5.scTable.innerHTML = `<div style="font-size:12px;color:var(--text-muted);padding:10px 0;">No symbols matched as of ${r.as_of_date}.</div>`;
+          return;
+        }
+        p5.scTable.innerHTML = `<div class="table-wrap"><table class="ohlcv-table mono"><thead><tr><th>Symbol</th><th class="num">Close</th><th class="num">Chg%</th><th class="num">EMA Fast</th><th class="num">EMA Slow</th><th class="num">RSI</th><th class="num">ATR%</th><th class="num">Vol</th><th>Signal</th><th class="num">Action</th></tr></thead><tbody>${rows.map((x) => `<tr><td style="font-weight:600">${x.symbol} <span style="font-size:10px;color:var(--text-muted);font-weight:400">${x.last_date || ''}</span></td><td class="num">${Number(x.close).toFixed(2)}</td><td class="num" style="color:${x.change_pct >= 0 ? '#34d399' : '#f87171'}">${x.change_pct >= 0 ? '+' : ''}${Number(x.change_pct).toFixed(2)}%</td><td class="num">${x.ema20 !== null && x.ema20 !== undefined ? Number(x.ema20).toFixed(2) : '—'}</td><td class="num">${x.ema50 !== null && x.ema50 !== undefined ? Number(x.ema50).toFixed(2) : '—'}</td><td class="num">${x.rsi14 !== null && x.rsi14 !== undefined ? Number(x.rsi14).toFixed(1) : '—'}</td><td class="num">${x.atr_pct !== null && x.atr_pct !== undefined ? Number(x.atr_pct).toFixed(2) + '%' : '—'}</td><td class="num">${Number(x.vol_ratio ?? 1).toFixed(2)}x</td><td style="color:var(--accent);font-weight:600">${x.signal}</td><td class="num"><button type="button" class="quick-btn" data-bt-sym="${x.symbol}" data-bt-ex="${x.exchange}">Backtest &rarr;</button></td></tr>`).join('')}</tbody></table></div>`;
         p5.scTable.querySelectorAll('[data-bt-sym]').forEach((btn) => {
           btn.addEventListener('click', () => {
             p5.btSym.value = btn.getAttribute('data-bt-sym') || 'RELIANCE';
@@ -2454,6 +2572,8 @@
         p5.scMeta.textContent = err.message;
       } finally {
         p5.scBtn.disabled = false;
+        p5.scCancelBtn.style.display = 'none';
+        p5.scJobId = null;
       }
     }
 
@@ -2481,6 +2601,7 @@
             symbol: p5.btSym.value.trim().toUpperCase(),
             exchange: p5.btExch.value,
             strategy: p5.btStrat.value,
+            params: readParamValuesP5(p5.btParamsBox),
             timeframe: p5.btTf.value,
             from_date: p5.btFrom.value,
             to_date: p5.btTo.value,
@@ -2488,15 +2609,22 @@
             stop_loss_pct: Number(p5.btSl.value) || 0,
             take_profit_pct: Number(p5.btTp.value) || 0,
             provider: p5.btProv.value === 'auto' ? null : p5.btProv.value,
+            backend: p5.scBackend.value || 'auto',
             async_job: true,
           }),
         });
         const startBody = await res.json();
         if (!res.ok || !startBody.job) throw new Error(startBody.detail || 'Backtest failed');
+        p5.btJobId = startBody.job.job_id;
+        p5.btCancelBtn.style.display = 'inline-flex';
         const done = await pollJobP5(startBody.job.job_id, (j) => {
           p5.btMeta.textContent = `Job ${j.job_id}: ${j.status} (${j.progress_pct}%) — ${j.progress_message}`;
         });
         if (done.status === 'FAILED') throw new Error(done.error || done.progress_message);
+        if (done.status === 'CANCELLED') {
+          p5.btMeta.textContent = done.progress_message || 'Backtest cancelled.';
+          return;
+        }
         const r = done.result;
         p5.btMeta.textContent = `${r.symbol} · ${r.strategy_label} · ${r.bars_evaluated} bars via ${String(r.provider).toUpperCase()} (API calls: ${r.api_calls_made})`;
         p5.btSummary.style.display = 'grid';
@@ -2507,6 +2635,8 @@
         p5.btMeta.textContent = err.message;
       } finally {
         p5.btBtn.disabled = false;
+        p5.btCancelBtn.style.display = 'none';
+        p5.btJobId = null;
       }
     }
 
@@ -2569,6 +2699,19 @@
       }
     }
 
+    p5.reloadBtn.addEventListener('click', () => loadAnalyticsMetaP5(true));
+    p5.scUni.addEventListener('change', () => {
+      if (p5.scUni.value !== 'CUSTOM') p5.scSym.value = '';
+      else if (!p5.scSym.value.trim()) p5.scSym.value = 'RELIANCE, TCS, INFY, HDFCBANK, ICICIBANK, SBIN, BHARTIARTL, ITC, LT, AXISBANK';
+    });
+    p5.scPreset.addEventListener('change', syncActiveParamsP5);
+    p5.btStrat.addEventListener('change', syncActiveParamsP5);
+    p5.scCancelBtn.addEventListener('click', () => {
+      if (p5.scJobId) fetch(`/api/analytics/jobs/${encodeURIComponent(p5.scJobId)}/cancel`, { method: 'POST' });
+    });
+    p5.btCancelBtn.addEventListener('click', () => {
+      if (p5.btJobId) fetch(`/api/analytics/jobs/${encodeURIComponent(p5.btJobId)}/cancel`, { method: 'POST' });
+    });
     p5.tabSc.addEventListener('click', () => switchP5Tab('screener'));
     p5.tabBt.addEventListener('click', () => switchP5Tab('backtest'));
     p5.tabRk.addEventListener('click', () => switchP5Tab('risk'));
@@ -2576,6 +2719,7 @@
     p5.btBtn.addEventListener('click', runBacktestP5);
     p5.rkEvalBtn.addEventListener('click', loadRiskStatusP5);
     p5.rkSaveBtn.addEventListener('click', saveRiskLimitsP5);
+    loadAnalyticsMetaP5(false);
     loadRiskStatusP5();
   </script>
 </body>

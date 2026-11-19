@@ -512,6 +512,17 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
                 self._send_json(200, hub_service.set_kill_switch(engaged=engaged, reason=reason))
                 return
 
+            if path == "/api/analytics/reload":
+                self._send_json(200, hub_service.reload_analytics_plugins())
+                return
+
+            if len(parts) == 5 and parts[0] == "api" and parts[1] == "analytics" and parts[2] == "jobs" and parts[4] == "cancel":
+                try:
+                    self._send_json(200, hub_service.cancel_analytics_job(parts[3]))
+                except ValueError as exc:
+                    self._send_json(404, {"detail": str(exc)})
+                return
+
             if path == "/api/analytics/screener":
                 query = parse_qs(parsed.query)
                 async_q = query.get("async_job", [None])[0]
@@ -520,11 +531,16 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
                     200,
                     hub_service.run_screener(
                         symbols=body.get("symbols") if isinstance(body.get("symbols"), list) else None,
+                        universe=str(body.get("universe", "CUSTOM")),
                         exchange=str(body.get("exchange", "NSE")),
                         timeframe=str(body.get("timeframe", "1day")),
                         lookback_days=int(body.get("lookback_days", 120) or 120),
-                        preset=str(body.get("preset", "all")),
+                        as_of_date=body.get("as_of_date"),
+                        screen_id=body.get("screen_id"),
+                        preset=str(body.get("preset", "all_metrics")),
+                        params=body.get("params") if isinstance(body.get("params"), dict) else None,
                         provider=body.get("provider"),
+                        backend=str(body.get("backend", "auto")),
                         async_job=is_async,
                     ),
                 )
@@ -540,6 +556,7 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
                         symbol=str(body.get("symbol", "")),
                         exchange=str(body.get("exchange", "NSE")),
                         strategy=str(body.get("strategy", "ema_crossover")),
+                        params=body.get("params") if isinstance(body.get("params"), dict) else None,
                         timeframe=str(body.get("timeframe", "1day")),
                         from_date=body.get("from_date"),
                         to_date=body.get("to_date"),
@@ -549,6 +566,7 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
                         stop_loss_pct=float(body.get("stop_loss_pct", 5.0) or 5.0),
                         take_profit_pct=float(body.get("take_profit_pct", 12.0) or 12.0),
                         provider=body.get("provider"),
+                        backend=str(body.get("backend", "auto")),
                         instrument_type=body.get("instrument_type"),
                         instrument_key=body.get("instrument_key"),
                         async_job=is_async,
