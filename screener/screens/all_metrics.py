@@ -19,10 +19,10 @@ class AllMetricsScreen(BaseScreen):
     category = "overview"
     min_bars = 15
     params = [
-        ParamSpec("ema_fast", "Fast EMA Period", "int", 20, min_val=5, max_val=100, step=1),
-        ParamSpec("ema_slow", "Slow EMA Period", "int", 50, min_val=10, max_val=200, step=1),
-        ParamSpec("rsi_period", "RSI Period", "int", 14, min_val=2, max_val=50, step=1),
-        ParamSpec("supertrend_period", "Supertrend ATR Period", "int", 10, min_val=3, max_val=50, step=1),
+        ParamSpec("ema_fast", "Fast EMA Period", "int", 20, min_val=2, max_val=500, step=1),
+        ParamSpec("ema_slow", "Slow EMA Period", "int", 50, min_val=5, max_val=1000, step=1),
+        ParamSpec("rsi_period", "RSI Period", "int", 14, min_val=2, max_val=100, step=1),
+        ParamSpec("supertrend_period", "Supertrend ATR Period", "int", 10, min_val=3, max_val=100, step=1),
         ParamSpec("supertrend_mult", "Supertrend Multiplier", "float", 3.0, min_val=1.0, max_val=8.0, step=0.5),
     ]
 
@@ -34,7 +34,7 @@ class AllMetricsScreen(BaseScreen):
             int(params.get("rsi_period", 14)),
             int(params.get("supertrend_period", 10)),
         )
-        return max(65, longest * 2 + 25)
+        return max(65, longest * 4 + 30)
 
     def get_columns(self, params: Dict[str, Any]) -> List[ColumnSpec]:
         return [

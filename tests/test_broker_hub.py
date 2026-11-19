@@ -1325,34 +1325,35 @@ class TestBrokerHubArchitecture(unittest.TestCase):
 
             api_calls = 0
 
+            origin = datetime.now(tz=IST_TZ).date() - timedelta(days=500)
+
             def fake_fetcher(sym: str, exch: str, tf: str, c_start: date, c_end: date):
                 nonlocal api_calls
                 api_calls += 1
                 rows = []
                 cur = c_start
-                step_idx = 0
-                base = 1000.0 if sym == "TRENDCO" else 500.0
+                base = 1000.0 if sym == "TRENDCO" else 800.0
                 while cur <= c_end:
                     if cur.weekday() < 5:
+                        day_idx = max(0, (cur - origin).days)
                         if sym == "TRENDCO":
-                            close_px = base + step_idx * 4.5
-                            if step_idx > 70:
-                                close_px += (step_idx - 70) * 6.0
+                            close_px = base + day_idx * 4.5
+                            if day_idx > 200:
+                                close_px += (day_idx - 200) * 6.0
                         else:
-                            close_px = base - step_idx * 2.5
+                            close_px = max(25.0, base * (0.995 ** day_idx))
                         rows.append(
                             {
                                 "ts_ist": f"{cur.isoformat()}T15:30:00+05:30",
                                 "trade_date": cur.isoformat(),
-                                "open": close_px - 2.0,
-                                "high": close_px + 3.0,
-                                "low": close_px - 4.0,
-                                "close": close_px,
-                                "volume": 250000 if step_idx > 75 else 100000,
+                                "open": close_px - 1.5,
+                                "high": close_px + 2.5,
+                                "low": max(1.0, close_px - 3.0),
+                                "close": round(close_px, 2),
+                                "volume": 250000 if day_idx > 250 else 100000,
                                 "oi": 0,
                             }
                         )
-                        step_idx += 1
                     cur += timedelta(days=1)
                 return rows
 
@@ -2177,6 +2178,107 @@ class TestBrokerHubArchitecture(unittest.TestCase):
             self.assertIn("roc_pct", custom_keys)
             self.assertIn("custom_ratio", custom_keys)
             self.assertEqual(scan_custom["results"][0]["custom_ratio"], 1.85)
+
+    def test_slow_ema_233_not_clamped_and_full_cache_convergence(self) -> None:
+        from indicators.toolkit import compute_ema_series
+        from screener.engine import ScreenerEngine
+        from screener.registry import ScreenRegistry
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            hist = HistoricalDataManager(root / "hist.db", parquet_dir=root / "parquet")
+            engine = ScreenerEngine(hist_manager=hist, registry=ScreenRegistry())
+
+            # Seed 1,300+ weekdays (~5 years) of daily candles locally, including future bars
+            # past as_of_date to verify both full-history warmup AND strict zero-lookahead.
+            start_d = date(2020, 1, 1)
+            end_d = date(2026, 6, 30)
+            as_of = "2026-03-31"
+
+            full_rows = []
+            cur = start_d
+            idx = 0
+            while cur <= end_d:
+                if cur.weekday() < 5:
+                    # Non-linear synthetic trend + regime shift so truncated EMA differs visibly
+                    px = round(1000.0 + idx * 0.8 + (250.0 if idx > 600 else 0.0) + ((idx % 17) - 8) * 3.2, 2)
+                    full_rows.append(
+                        {
+                            "ts_ist": f"{cur.isoformat()}T15:30:00+05:30",
+                            "trade_date": cur.isoformat(),
+                            "open": round(px - 2.0, 2),
+                            "high": round(px + 5.0, 2),
+                            "low": round(px - 5.0, 2),
+                            "close": px,
+                            "volume": 200000 + (idx % 20) * 5000,
+                            "oi": 0,
+                        }
+                    )
+                    idx += 1
+                cur += timedelta(days=1)
+
+            # Seed entire local span via download() so gap-only fetcher makes zero network calls on scan
+            hist.download(
+                symbol="EMACO",
+                exchange="NSE",
+                timeframe="1day",
+                from_date=start_d.isoformat(),
+                to_date=end_d.isoformat(),
+                provider="upstox",
+                fetcher=lambda s, e, tf, c0, c1: [
+                    r for r in full_rows if c0.isoformat() <= r["trade_date"] <= c1.isoformat()
+                ],
+            )
+
+            scan = engine.scan(
+                symbols=["EMACO"],
+                exchange="NSE",
+                timeframe="1day",
+                as_of_date=as_of,
+                screen_id="all_metrics",
+                params={"ema_fast": 21, "ema_slow": 233},
+                provider="upstox",
+                backend="builtin",
+                fetcher=lambda *args: [],
+            )
+            self.assertTrue(scan["ok"])
+            self.assertEqual(scan["params"]["ema_slow"], 233)
+            self.assertEqual(scan["params"]["ema_fast"], 21)
+            self.assertGreaterEqual(scan["required_bars"], 960)
+            self.assertEqual(scan["api_calls_made"], 0)
+
+            col_labels = [c["label"] for c in scan["columns"]]
+            self.assertIn("EMA 233", col_labels)
+            self.assertNotIn("EMA 200", col_labels)
+
+            row = scan["results"][0]
+            self.assertEqual(row["last_date"], as_of)
+
+            # Reference EMA 233 over ALL bars <= as_of_date (must match to 0.00 error & exclude future bars)
+            closes_up_to_as_of = [r["close"] for r in full_rows if r["trade_date"] <= as_of]
+            self.assertEqual(row["bars"], len(closes_up_to_as_of))
+            expected_ema233 = round(compute_ema_series(closes_up_to_as_of, 233)[-1], 2)
+            self.assertAlmostEqual(row["ema50"], expected_ema233, places=2)
+
+            # Verify other screens also accept >200 EMA periods without clamping
+            for sid, pkey in (
+                ("trend_following", "ema_slow"),
+                ("momentum_breakout", "ema_slow"),
+                ("vcp_contraction", "ema_support"),
+            ):
+                s_res = engine.scan(
+                    symbols=["EMACO"],
+                    exchange="NSE",
+                    timeframe="1day",
+                    as_of_date=as_of,
+                    screen_id=sid,
+                    params={pkey: 233},
+                    provider="upstox",
+                    backend="builtin",
+                    fetcher=lambda *args: [],
+                )
+                self.assertEqual(s_res["params"][pkey], 233, f"{sid} clamped {pkey}")
+                self.assertIn("EMA 233", [c["label"] for c in s_res["columns"]])
 
 
 if __name__ == "__main__":

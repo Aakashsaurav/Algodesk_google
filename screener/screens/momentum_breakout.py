@@ -19,9 +19,9 @@ class MomentumBreakoutScreen(BaseScreen):
     category = "momentum"
     min_bars = 50
     params = [
-        ParamSpec("ema_fast", "Fast EMA Period", "int", 20, min_val=5, max_val=100, step=1),
-        ParamSpec("ema_slow", "Slow EMA Period", "int", 50, min_val=15, max_val=200, step=1),
-        ParamSpec("rsi_period", "RSI Period", "int", 14, min_val=2, max_val=50, step=1),
+        ParamSpec("ema_fast", "Fast EMA Period", "int", 20, min_val=2, max_val=500, step=1),
+        ParamSpec("ema_slow", "Slow EMA Period", "int", 50, min_val=5, max_val=1000, step=1),
+        ParamSpec("rsi_period", "RSI Period", "int", 14, min_val=2, max_val=100, step=1),
         ParamSpec("rsi_min", "Min RSI", "float", 55.0, min_val=30.0, max_val=85.0, step=1.0),
         ParamSpec("rsi_max", "Max RSI", "float", 80.0, min_val=50.0, max_val=98.0, step=1.0),
         ParamSpec("min_vol_ratio", "Min Vol Ratio (vs 20D)", "float", 1.2, min_val=0.5, max_val=10.0, step=0.1),
@@ -35,7 +35,7 @@ class MomentumBreakoutScreen(BaseScreen):
             int(params.get("rsi_period", 14)),
             21,
         )
-        return max(self.min_bars + 15, longest * 2 + 25)
+        return max(self.min_bars + 15, longest * 4 + 30)
 
     def get_columns(self, params: Dict[str, Any]) -> List[ColumnSpec]:
         return [

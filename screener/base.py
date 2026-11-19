@@ -115,8 +115,8 @@ class BaseScreen(ABC):
                     val = int(params.get(spec.name, spec.default) or 0)
                     if val > max_period:
                         max_period = val
-        # Recursive indicators (EMA, Wilder RSI/ATR/ADX) converge reliably after ~3x period warmup
-        return max(int(self.min_bars or 15) + 15, max_period * 3 + 10)
+        # Recursive indicators (EMA, Wilder RSI/ATR/ADX) converge within <0.2% after ~4x period warmup
+        return max(int(self.min_bars or 15) + 15, max_period * 4 + 30)
 
     def get_columns(self, params: Dict[str, Any]) -> List[ColumnSpec]:
         """

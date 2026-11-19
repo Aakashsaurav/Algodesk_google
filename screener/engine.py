@@ -41,13 +41,13 @@ def compute_auto_lookback_days(required_bars: int, timeframe: str) -> int:
     if unit == "minute":
         bars_per_day = max(1, 375 // count)
         trading_days = math.ceil(bars / float(bars_per_day)) + 2
-        return max(7, min(365, math.ceil(trading_days * 1.6) + 5))
+        return max(7, min(730, math.ceil(trading_days * 1.6) + 5))
     if unit == "week":
-        return max(90, min(3650, bars * 7 * count + 28))
+        return max(90, min(4500, bars * 7 * count + 28))
     if unit == "month":
         return max(180, min(5475, bars * 32 * count + 45))
     # Daily / N-day bars (~250 trading days/365 calendar days ≈ 1.46x + holiday buffer)
-    return max(45, min(3650, math.ceil(bars * count * 1.55) + 15))
+    return max(45, min(4500, math.ceil(bars * count * 1.55) + 15))
 
 
 def _infer_columns_from_metrics(sample_metrics: Dict[str, Any]) -> List[ColumnSpec]:
@@ -103,11 +103,13 @@ class ScreenerEngine:
             provider=provider,
             fetcher=fetcher,
         )
+        # Read ALL locally cached bars <= to_date (zero extra API calls) so recursive
+        # indicators like Slow EMA (200/233), Wilder RSI, and ADX achieve maximum convergence.
         records = self._hist.get_records(
             symbol=dl_meta["symbol"],
             exchange=dl_meta["exchange"],
             timeframe=dl_meta["timeframe"],
-            from_date=from_date,
+            from_date=None,
             to_date=to_date,
             view="full",
         )

@@ -19,9 +19,9 @@ class TrendFollowingScreen(BaseScreen):
     category = "trend"
     min_bars = 50
     params = [
-        ParamSpec("ema_fast", "Fast EMA Period", "int", 20, min_val=5, max_val=100, step=1),
-        ParamSpec("ema_slow", "Slow EMA Period", "int", 50, min_val=15, max_val=200, step=1),
-        ParamSpec("adx_period", "ADX Period", "int", 14, min_val=5, max_val=30, step=1),
+        ParamSpec("ema_fast", "Fast EMA Period", "int", 20, min_val=2, max_val=500, step=1),
+        ParamSpec("ema_slow", "Slow EMA Period", "int", 50, min_val=5, max_val=1000, step=1),
+        ParamSpec("adx_period", "ADX Period", "int", 14, min_val=5, max_val=100, step=1),
         ParamSpec("min_adx", "Min ADX (0 = ignore)", "float", 15.0, min_val=0.0, max_val=60.0, step=1.0),
         ParamSpec("require_supertrend_bull", "Require Supertrend BULL", "bool", True),
     ]
@@ -32,7 +32,7 @@ class TrendFollowingScreen(BaseScreen):
             int(params.get("ema_slow", 50)),
             int(params.get("adx_period", 14)) * 2,
         )
-        return max(self.min_bars + 15, longest * 2 + 25)
+        return max(self.min_bars + 15, longest * 4 + 30)
 
     def get_columns(self, params: Dict[str, Any]) -> List[ColumnSpec]:
         return [

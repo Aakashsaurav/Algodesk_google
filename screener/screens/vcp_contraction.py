@@ -22,12 +22,12 @@ class VcpContractionScreen(BaseScreen):
         ParamSpec("max_range_7d_pct", "Max 7D Range %", "float", 7.0, min_val=1.0, max_val=25.0, step=0.5),
         ParamSpec("max_contraction_ratio", "Max 7D/30D Ratio", "float", 0.72, min_val=0.2, max_val=1.2, step=0.05),
         ParamSpec("min_dist_50d_high_pct", "Min Dist From 50D High %", "float", -6.5, min_val=-25.0, max_val=0.0, step=0.5),
-        ParamSpec("ema_support", "Support EMA Period", "int", 50, min_val=10, max_val=200, step=5),
+        ParamSpec("ema_support", "Support EMA Period", "int", 50, min_val=5, max_val=1000, step=1),
     ]
 
     def required_bars(self, params: Dict[str, Any]) -> int:
         longest = max(50, int(params.get("ema_support", 50)))
-        return max(65, longest * 2 + 25)
+        return max(65, longest * 4 + 30)
 
     def get_columns(self, params: Dict[str, Any]) -> List[ColumnSpec]:
         return [

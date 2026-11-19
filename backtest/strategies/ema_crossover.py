@@ -18,8 +18,8 @@ class EmaCrossoverStrategy(BacktestStrategy):
     name = "EMA 20 / 50 Crossover"
     description = "Enters long when Fast EMA crosses above Slow EMA; exits on bearish cross."
     params = [
-        ParamSpec("fast_period", "Fast EMA Period", "int", 20, min_val=3, max_val=100, step=1),
-        ParamSpec("slow_period", "Slow EMA Period", "int", 50, min_val=10, max_val=250, step=1),
+        ParamSpec("fast_period", "Fast EMA Period", "int", 20, min_val=2, max_val=500, step=1),
+        ParamSpec("slow_period", "Slow EMA Period", "int", 50, min_val=5, max_val=1000, step=1),
     ]
 
     def __init__(self) -> None:

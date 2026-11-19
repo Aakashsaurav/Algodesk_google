@@ -20,8 +20,8 @@ class VcpBreakoutStrategy(BacktestStrategy):
     params = [
         ParamSpec("breakout_window", "Breakout High Window", "int", 15, min_val=5, max_val=60, step=1),
         ParamSpec("max_contraction_ratio", "Max 7D/30D Ratio", "float", 0.78, min_val=0.2, max_val=1.2, step=0.05),
-        ParamSpec("exit_ema", "Trailing Exit EMA", "int", 20, min_val=5, max_val=100, step=1),
-        ParamSpec("trend_ema", "Trend Filter EMA", "int", 50, min_val=15, max_val=200, step=5),
+        ParamSpec("exit_ema", "Trailing Exit EMA", "int", 20, min_val=2, max_val=500, step=1),
+        ParamSpec("trend_ema", "Trend Filter EMA", "int", 50, min_val=5, max_val=1000, step=1),
     ]
 
     def __init__(self) -> None:
