@@ -764,7 +764,9 @@ class LiveScreenerEngine:
 
     def _build_sorted_results_locked(self) -> List[Dict[str, Any]]:
         rows = [st["row"] for st in self._sym_state.values() if st.get("row")]
-        rows.sort(key=lambda r: (bool(r.get("matched")), int(r.get("score") or 0), float(r.get("change_pct") or 0.0)), reverse=True)
+        # Stable sort: matched first, then score desc, then alphabetical symbol A->Z
+        # so rows don't constantly jump around on minor 0.01% LTP ticks while scrolling.
+        rows.sort(key=lambda r: (0 if r.get("matched") else 1, -int(r.get("score") or 0), str(r.get("symbol") or "")))
         return rows
 
     def status(self) -> Dict[str, Any]:

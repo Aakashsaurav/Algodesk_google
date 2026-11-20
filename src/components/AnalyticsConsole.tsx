@@ -550,11 +550,13 @@ export function AnalyticsConsole({
   const [lsBackend, setLsBackend] = useState<string>('auto');
   const [lsIntervalSec, setLsIntervalSec] = useState<string>('2');
   const [lsMatchedOnly, setLsMatchedOnly] = useState<boolean>(false);
+  const [lsShowAlerts, setLsShowAlerts] = useState<boolean>(true);
   const [lsBusy, setLsBusy] = useState<boolean>(false);
   const [lsError, setLsError] = useState<string>('');
   const [lsWsStatus, setLsWsStatus] = useState<'connecting' | 'connected' | 'disconnected'>('disconnected');
   const [lsState, setLsState] = useState<LiveScreenerStatePayload | null>(null);
   const lsWsRef = useRef<WebSocket | null>(null);
+  const lsTableWrapRef = useRef<HTMLDivElement | null>(null);
 
   // Backtest state
   const todayIso = new Date().toISOString().slice(0, 10);
@@ -2318,26 +2320,40 @@ export function AnalyticsConsole({
 
               {lsState.alerts && lsState.alerts.length > 0 && (
                 <div className="rounded-lg border border-slate-800 bg-[#0b1120] p-3">
-                  <div className="mb-1.5 text-[11px] font-semibold uppercase tracking-wider text-slate-400">
-                    Live Signal Transitions
+                  <div className="mb-1.5 flex flex-wrap items-center justify-between gap-2">
+                    <div className="text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+                      Live Signal Transitions ({lsState.alerts.length})
+                      <span className="ml-2 font-normal normal-case tracking-normal text-slate-500">
+                        — real-time log of symbols newly matching (ENTERED) or leaving (EXITED) the active screen
+                      </span>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setLsShowAlerts((prev) => !prev)}
+                      className="text-[11px] font-semibold text-sky-400 hover:text-sky-300"
+                    >
+                      {lsShowAlerts ? 'Hide' : 'Show'}
+                    </button>
                   </div>
-                  <div className="flex max-h-[84px] flex-wrap gap-2 overflow-auto font-mono text-[11px]">
-                    {lsState.alerts.slice(0, 12).map((al) => (
-                      <div
-                        key={al.id}
-                        className={`flex items-center gap-1.5 rounded border px-2 py-1 ${
-                          al.transition === 'ENTERED'
-                            ? 'border-emerald-700/70 bg-emerald-950/50 text-emerald-200'
-                            : 'border-amber-700/70 bg-amber-950/50 text-amber-200'
-                        }`}
-                      >
-                        <span className="font-bold">{al.transition}</span>
-                        <span>{al.symbol}</span>
-                        <span>@{al.ltp.toFixed(2)}</span>
-                        <span className="text-slate-400">{al.ts_ist.slice(11, 19)}</span>
-                      </div>
-                    ))}
-                  </div>
+                  {lsShowAlerts && (
+                    <div className="flex max-h-[84px] flex-wrap gap-2 overflow-auto font-mono text-[11px]">
+                      {lsState.alerts.slice(0, 12).map((al) => (
+                        <div
+                          key={al.id}
+                          className={`flex items-center gap-1.5 rounded border px-2 py-1 ${
+                            al.transition === 'ENTERED'
+                              ? 'border-emerald-700/70 bg-emerald-950/50 text-emerald-200'
+                              : 'border-amber-700/70 bg-amber-950/50 text-amber-200'
+                          }`}
+                        >
+                          <span className="font-bold">{al.transition}</span>
+                          <span>{al.symbol}</span>
+                          <span>@{al.ltp.toFixed(2)}</span>
+                          <span className="text-slate-400">{al.ts_ist.slice(11, 19)}</span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
               )}
 
@@ -2357,7 +2373,10 @@ export function AnalyticsConsole({
                   );
                 }
                 return (
-                  <div className="max-h-[420px] overflow-auto rounded-lg border border-slate-800">
+                  <div
+                    ref={lsTableWrapRef}
+                    className="max-h-[420px] overflow-auto rounded-lg border border-slate-800 [overflow-anchor:none]"
+                  >
                     <table className="w-full border-collapse text-left font-mono text-xs tabular-nums">
                       <thead className="sticky top-0 bg-[#0b1120] text-slate-400">
                         <tr className="border-b border-slate-800">

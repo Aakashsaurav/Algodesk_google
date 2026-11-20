@@ -2651,12 +2651,32 @@
         if (col.fmt === 'ratio') return `<td class="num">${n.toFixed(dec)}x</td>`;
         return `<td class="num">${n.toFixed(dec)}</td>`;
       };
-      wrapEl.innerHTML = `<div class="table-wrap"><table class="ohlcv-table mono"><thead><tr><th>Symbol</th><th class="num">Live LTP</th><th class="num">Chg%</th>${headCols}<th>Signal</th></tr></thead><tbody>${rows.map((x) => {
+      const prevScroller = wrapEl.querySelector('.table-wrap');
+      const prevScrollTop = prevScroller ? prevScroller.scrollTop : 0;
+      const prevScrollLeft = prevScroller ? prevScroller.scrollLeft : 0;
+      const colSig = cols.map((c) => `${c.key}:${c.label}`).join('|');
+      const existingTable = wrapEl.querySelector('table.ohlcv-table');
+      const tbodyHtml = rows.map((x) => {
         const ltp = x.ltp != null ? x.ltp : x.close;
         const arrow = x.tick_direction === 'up' ? '▲ ' : (x.tick_direction === 'down' ? '▼ ' : '');
         const ltpCol = x.tick_direction === 'up' ? '#34d399' : (x.tick_direction === 'down' ? '#f87171' : 'inherit');
         return `<tr><td style="font-weight:600">${x.symbol}</td><td class="num" style="color:${ltpCol};font-weight:600">${arrow}${Number(ltp).toFixed(2)}</td><td class="num" style="color:${x.change_pct >= 0 ? '#34d399' : '#f87171'}">${x.change_pct >= 0 ? '+' : ''}${Number(x.change_pct).toFixed(2)}%</td>${cols.map((c) => fmtVal(x[c.key], c)).join('')}<td style="color:${x.matched ? '#34d399' : 'var(--text-muted)'};font-weight:600">${x.signal}</td></tr>`;
-      }).join('')}</tbody></table></div>`;
+      }).join('');
+      if (existingTable && existingTable.getAttribute('data-col-sig') === colSig) {
+        const tbody = existingTable.querySelector('tbody');
+        if (tbody) tbody.innerHTML = tbodyHtml;
+        if (prevScroller) {
+          prevScroller.scrollTop = prevScrollTop;
+          prevScroller.scrollLeft = prevScrollLeft;
+        }
+      } else {
+        wrapEl.innerHTML = `<div class="table-wrap" style="overflow-anchor:none;"><table class="ohlcv-table mono" data-col-sig="${colSig.replace(/"/g, '&quot;')}"><thead><tr><th>Symbol</th><th class="num">Live LTP</th><th class="num">Chg%</th>${headCols}<th>Signal</th></tr></thead><tbody>${tbodyHtml}</tbody></table></div>`;
+        const newScroller = wrapEl.querySelector('.table-wrap');
+        if (newScroller) {
+          newScroller.scrollTop = prevScrollTop;
+          newScroller.scrollLeft = prevScrollLeft;
+        }
+      }
     }
 
     function connectLiveScreenWsP5() {

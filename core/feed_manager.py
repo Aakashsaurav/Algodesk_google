@@ -1290,32 +1290,40 @@ class HotStandbyFeedManager:
             else:
                 candidates = list(chain)
 
-        step = max(1, int(batch_size or 40))
+        base_step = max(1, int(batch_size or 40))
         last_err = ""
 
         for fid in candidates:
             fetcher = self._fetchers.get(fid)
             if fetcher is None:
                 continue
+            # Upstox v3 & Zerodha Kite quote endpoints accept large batches in a single HTTP RTT
+            step = max(base_step, 100) if fid in {"upstox", "zerodha"} else base_step
             started = time.perf_counter()
+            req_latencies: List[float] = []
             merged_quotes: Dict[str, Dict[str, Any]] = {}
             is_builtin = fetcher in _DEFAULT_FETCHERS.values()
             try:
                 for i in range(0, len(subs), step):
                     chunk = subs[i : i + step]
                     arg = chunk if is_builtin else [s["symbol"] for s in chunk]
+                    req_t0 = time.perf_counter()
                     chunk_res = fetcher(arg) or {}
+                    req_latencies.append((time.perf_counter() - req_t0) * 1000.0)
                     for k, q in chunk_res.items():
                         q_sym = str(q.get("symbol") or k).strip().upper()
                         if q_sym:
                             merged_quotes[q_sym] = {**q, "symbol": q_sym, "source": q.get("source") or fid}
                 if not merged_quotes:
                     raise RuntimeError(f"{fid} returned empty quote snapshot")
-                elapsed_ms = round((time.perf_counter() - started) * 1000.0, 1)
+                total_elapsed_ms = round((time.perf_counter() - started) * 1000.0, 1)
+                per_req_ms = round(sum(req_latencies) / max(1, len(req_latencies)), 1)
                 return {
                     "ok": True,
                     "active_feed": fid,
-                    "latency_ms": elapsed_ms,
+                    "latency_ms": per_req_ms,
+                    "total_batch_ms": total_elapsed_ms,
+                    "batch_count": len(req_latencies),
                     "quotes": merged_quotes,
                     "ts_ist": datetime.now(tz=IST_TZ).isoformat(timespec="seconds"),
                 }
@@ -1327,6 +1335,8 @@ class HotStandbyFeedManager:
             "ok": False,
             "active_feed": self._active_feed_id,
             "latency_ms": None,
+            "total_batch_ms": None,
+            "batch_count": 0,
             "quotes": {},
             "error": last_err or "All live feeds unavailable.",
             "ts_ist": datetime.now(tz=IST_TZ).isoformat(timespec="seconds"),
