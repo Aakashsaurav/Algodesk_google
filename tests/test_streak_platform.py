@@ -586,6 +586,51 @@ class TestBasketsAndDiscover(unittest.TestCase):
         modes = {item["mode"] for item in catalog}
         self.assertTrue({"visual", "python", "options"}.issubset(modes))
 
+    def test_local_server_serves_built_react_spa_and_assets(self) -> None:
+        import json as _json
+        import re
+        import threading
+        import urllib.error
+        import urllib.request
+        from web.local_server import _AlgoDeskHTTPServer, _StdlibBrokerHandler
+        from web.spa import has_spa_bundle
+
+        self.assertTrue(has_spa_bundle())
+        srv = _AlgoDeskHTTPServer(("127.0.0.1", 0), _StdlibBrokerHandler)
+        port = srv.server_address[1]
+        thread = threading.Thread(target=srv.serve_forever, daemon=True)
+        thread.start()
+        try:
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=3) as r:
+                body = r.read().decode("utf-8")
+                self.assertEqual(r.status, 200)
+                self.assertIn('<div id="root"></div>', body)
+                js_match = re.search(r'src="(/assets/[^"]+\.js)"', body)
+                css_match = re.search(r'href="(/assets/[^"]+\.css)"', body)
+                self.assertIsNotNone(js_match)
+                self.assertIsNotNone(css_match)
+
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}{js_match.group(1)}", timeout=3) as r:
+                self.assertEqual(r.status, 200)
+                self.assertIn("javascript", r.headers.get("Content-Type", ""))
+                self.assertGreater(len(r.read()), 10000)
+
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}{css_match.group(1)}", timeout=3) as r:
+                self.assertEqual(r.status, 200)
+                self.assertIn("text/css", r.headers.get("Content-Type", ""))
+
+            with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health", timeout=3) as r:
+                health = _json.loads(r.read().decode("utf-8"))
+                self.assertTrue(health.get("spa"))
+                self.assertGreaterEqual(health.get("phase", 0), 6)
+
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(f"http://127.0.0.1:{port}/assets/../../config.py", timeout=3)
+            self.assertEqual(ctx.exception.code, 404)
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()

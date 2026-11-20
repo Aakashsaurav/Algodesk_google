@@ -36,6 +36,7 @@ from core.ws_protocol import (
     send_ws_text,
 )
 from web.service import hub_service
+from web.spa import has_spa_bundle, render_spa_html, resolve_spa_asset
 
 logger = logging.getLogger(__name__)
 TEMPLATE_PATH = Path(__file__).resolve().parent / "templates" / "index.html"
@@ -78,22 +79,33 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
         path = parsed.path
         query = parse_qs(parsed.query)
 
-        if path == "/":
+        if path in {"/", "/terminal", "/terminal/"}:
+            body_html = render_spa_html(path)
+            if body_html is None:
+                self._send_json(500, {"detail": "Frontend SPA bundle and fallback template are missing"})
+                return
+            self._send_html(200, body_html)
+            return
+
+        if path == "/legacy":
             if not TEMPLATE_PATH.exists():
-                self._send_json(500, {"detail": "index.html template missing"})
+                self._send_json(404, {"detail": "Legacy template not found"})
                 return
             self._send_html(200, TEMPLATE_PATH.read_text(encoding="utf-8"))
             return
 
-        if path in {"/terminal", "/terminal/"}:
-            if not TERMINAL_TEMPLATE_PATH.exists():
-                self._send_json(500, {"detail": "terminal.html template missing"})
-                return
-            self._send_html(200, TERMINAL_TEMPLATE_PATH.read_text(encoding="utf-8"))
-            return
-
         if path == "/api/health":
-            self._send_json(200, {"ok": True, "service": "algodesk", "phase": 5, "live_terminal": True, "analytics": True})
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "service": "algodesk",
+                    "phase": 6,
+                    "live_terminal": True,
+                    "analytics": True,
+                    "spa": has_spa_bundle(),
+                },
+            )
             return
 
         if path == "/api/overview":
@@ -553,6 +565,27 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
                     f"<a href='/' style='color:#38bdf8'>Return to AlgoDesk</a></body></html>",
                 )
             return
+
+        asset = resolve_spa_asset(path)
+        if asset is not None:
+            raw_bytes, content_type, cache_control = asset
+            self.send_response(200)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(raw_bytes)))
+            self.send_header("Cache-Control", cache_control)
+            self.end_headers()
+            self.wfile.write(raw_bytes)
+            return
+
+        # Client-side SPA route fallback (never hijack /api, /ws, /auth, or missing /assets)
+        if (
+            not path.startswith(("/api/", "/ws/", "/auth/", "/assets/"))
+            and "." not in path.rsplit("/", 1)[-1]
+        ):
+            body_html = render_spa_html(path)
+            if body_html is not None:
+                self._send_html(200, body_html)
+                return
 
         self._send_json(404, {"detail": "Not Found"})
 

@@ -20,6 +20,7 @@ from fastapi.responses import HTMLResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
 from web.service import hub_service
+from web.spa import has_spa_bundle, render_spa_html, resolve_spa_asset
 
 TEMPLATE_PATH = Path(__file__).resolve().parent / "templates" / "index.html"
 TERMINAL_TEMPLATE_PATH = Path(__file__).resolve().parent / "templates" / "terminal.html"
@@ -182,20 +183,35 @@ def create_app() -> FastAPI:
 
     @app.get("/", response_class=HTMLResponse)
     def index() -> HTMLResponse:
-        if not TEMPLATE_PATH.exists():
-            raise HTTPException(status_code=500, detail="index.html template missing")
-        return HTMLResponse(TEMPLATE_PATH.read_text(encoding="utf-8"))
+        body_html = render_spa_html("/")
+        if body_html is None:
+            raise HTTPException(status_code=500, detail="Frontend SPA bundle and fallback template are missing")
+        return HTMLResponse(body_html, headers={"Cache-Control": "no-store"})
 
     @app.get("/terminal", response_class=HTMLResponse)
     @app.get("/terminal/", response_class=HTMLResponse)
     def terminal_page() -> HTMLResponse:
-        if not TERMINAL_TEMPLATE_PATH.exists():
-            raise HTTPException(status_code=500, detail="terminal.html template missing")
-        return HTMLResponse(TERMINAL_TEMPLATE_PATH.read_text(encoding="utf-8"))
+        body_html = render_spa_html("/terminal")
+        if body_html is None:
+            raise HTTPException(status_code=500, detail="Frontend SPA bundle and fallback template are missing")
+        return HTMLResponse(body_html, headers={"Cache-Control": "no-store"})
+
+    @app.get("/legacy", response_class=HTMLResponse)
+    def legacy_page() -> HTMLResponse:
+        if not TEMPLATE_PATH.exists():
+            raise HTTPException(status_code=404, detail="Legacy template missing")
+        return HTMLResponse(TEMPLATE_PATH.read_text(encoding="utf-8"))
 
     @app.get("/api/health")
     def api_health() -> dict:
-        return {"ok": True, "service": "algodesk", "phase": 5, "live_terminal": True, "analytics": True}
+        return {
+            "ok": True,
+            "service": "algodesk",
+            "phase": 6,
+            "live_terminal": True,
+            "analytics": True,
+            "spa": has_spa_bundle(),
+        }
 
     @app.get("/api/overview")
     def api_overview(refresh: bool = Query(default=True)) -> dict:
@@ -964,6 +980,24 @@ def create_app() -> FastAPI:
             pass
         finally:
             hub_service.unregister_deployments_listener(listener_q)
+
+    @app.get("/{full_path:path}")
+    def spa_static_or_fallback(full_path: str) -> Response:
+        if full_path.startswith(("api/", "ws/", "auth/")):
+            raise HTTPException(status_code=404, detail="Not Found")
+        asset = resolve_spa_asset(full_path)
+        if asset is not None:
+            raw_bytes, content_type, cache_control = asset
+            return Response(
+                content=raw_bytes,
+                media_type=content_type,
+                headers={"Cache-Control": cache_control},
+            )
+        if not full_path.startswith("assets/") and "." not in full_path.rsplit("/", 1)[-1]:
+            body_html = render_spa_html("/" + full_path)
+            if body_html is not None:
+                return HTMLResponse(body_html, headers={"Cache-Control": "no-store"})
+        raise HTTPException(status_code=404, detail="Not Found")
 
     return app
 
