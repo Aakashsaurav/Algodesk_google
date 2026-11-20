@@ -37,7 +37,7 @@ from core.historical import historical_data_manager
 from core.instruments import instrument_index
 from core.jobs import analytics_job_runner
 from core.preflight import PreflightChecker, kill_switch_controller
-from indicators.toolkit import available_backends
+from indicators.toolkit import available_backends, backend_diagnostics, refresh_backend_cache
 from risk.limits import risk_limit_manager
 from screener.engine import screener_engine
 from screener.live_engine import live_screener_engine
@@ -723,6 +723,7 @@ class BrokerHubService:
             "universes": universe_resolver.list_universes(),
             "timeframes": timeframes,
             "indicator_backends": available_backends(),
+            "indicator_backend_diagnostics": backend_diagnostics(),
             "storage": historical_data_manager.storage_info(),
             "file_errors": {
                 "screens": screen_registry.get_errors(),
@@ -815,6 +816,7 @@ class BrokerHubService:
         }
 
     def reload_analytics_plugins(self) -> Dict[str, Any]:
+        refresh_backend_cache()
         screen_registry.refresh_if_changed(force=True)
         strategy_registry.refresh_if_changed(force=True)
         return self.get_analytics_metadata()

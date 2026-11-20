@@ -280,6 +280,7 @@ class LiveScreenerEngine:
 
         # Live feed telemetry
         self._active_feed: str = ""
+        self._transport: str = ""
         self._tick_seq: int = 0
         self._ticks_processed: int = 0
         self._latency_ms: Optional[float] = None
@@ -405,6 +406,7 @@ class LiveScreenerEngine:
         quotes: Dict[str, Dict[str, Any]],
         *,
         active_feed: str = "",
+        transport: str = "",
         latency_ms: Optional[float] = None,
     ) -> Dict[str, Any]:
         """
@@ -425,6 +427,8 @@ class LiveScreenerEngine:
             tf = self._timeframe
             if active_feed:
                 self._active_feed = active_feed
+            if transport:
+                self._transport = transport
             if latency_ms is not None:
                 self._latency_ms = latency_ms
 
@@ -484,6 +488,7 @@ class LiveScreenerEngine:
                 "ticks_processed": self._ticks_processed,
                 "updated_count": len(updated_rows),
                 "active_feed": self._active_feed,
+                "transport": self._transport,
                 "latency_ms": self._latency_ms,
                 "last_tick_ist": self._last_tick_ist,
                 "columns": list(self._columns),
@@ -603,6 +608,10 @@ class LiveScreenerEngine:
                 self._warmup_message = "Live screen stopped by operator."
         if worker and worker.is_alive() and worker is not threading.current_thread():
             worker.join(timeout=3.0)
+        try:
+            self._feed.release_live_screen_ws()
+        except Exception:
+            pass
         st = self.status()
         if not silent:
             self._broadcast("live_screen:stopped", st)
@@ -735,7 +744,7 @@ class LiveScreenerEngine:
                     try:
                         if live_fetcher is not None:
                             raw_q = live_fetcher(active_syms) or {}
-                            self.apply_live_quotes(raw_q, active_feed=self._provider, latency_ms=1.0)
+                            self.apply_live_quotes(raw_q, active_feed=self._provider, transport="custom", latency_ms=1.0)
                         else:
                             res = self._feed.fetch_live_quotes_for(
                                 active_syms,
@@ -746,6 +755,7 @@ class LiveScreenerEngine:
                                 self.apply_live_quotes(
                                     res["quotes"],
                                     active_feed=str(res.get("active_feed") or self._provider),
+                                    transport=str(res.get("transport") or ""),
                                     latency_ms=res.get("latency_ms"),
                                 )
                             elif res.get("error"):
@@ -756,6 +766,10 @@ class LiveScreenerEngine:
 
                 stop_ev.wait(self._poll_interval_sec)
         finally:
+            try:
+                self._feed.release_live_screen_ws()
+            except Exception:
+                pass
             if main_feed_q is not None:
                 try:
                     self._feed.unregister_listener(main_feed_q)
@@ -803,6 +817,7 @@ class LiveScreenerEngine:
                 },
                 "live": {
                     "active_feed": self._active_feed,
+                    "transport": self._transport,
                     "tick_seq": self._tick_seq,
                     "ticks_processed": self._ticks_processed,
                     "latency_ms": self._latency_ms,

@@ -15,27 +15,104 @@ Custom screens in `screener/screens/*.py` and strategies in
 
 from __future__ import annotations
 
+import importlib
 import math
+import platform
+import sys
 from collections import deque
 from typing import Any, Dict, List, Optional, Tuple
 
 
-def _try_import(name: str) -> Any:
+_MODULE_PROBE_CACHE: Dict[str, Tuple[Any, str, str]] = {}
+
+
+def _probe_module(name: str, *, force: bool = False) -> Tuple[Any, str, str]:
+    """
+    Safely import an optional indicator/dataframe library and return
+    `(module_or_None, version_str, error_str)`.
+
+    Catches *all* exceptions (not just `ImportError`) so ABI mismatches,
+    missing shared C libraries, or NumPy 2.x deprecations never crash startup
+    and surface clear diagnostics in the UI.
+    """
+    if not force and name in _MODULE_PROBE_CACHE:
+        return _MODULE_PROBE_CACHE[name]
+
+    # Compatibility shim: pandas-ta <= 0.3.14b imports `from numpy import NaN as npNaN`,
+    # which was removed in NumPy 2.0. Restore the alias safely before importing pandas_ta.
+    if name == "pandas_ta":
+        np_mod, _, _ = _probe_module("numpy", force=force)
+        if np_mod is not None and not hasattr(np_mod, "NaN"):
+            try:
+                setattr(np_mod, "NaN", np_mod.nan)
+            except Exception:
+                pass
+
     try:
-        return __import__(name)
-    except ImportError:
-        return None
+        mod = importlib.import_module(name)
+        ver = str(
+            getattr(mod, "__version__", "")
+            or getattr(mod, "version", "")
+            or ""
+        ).strip()
+        result = (mod, ver, "")
+    except Exception as exc:
+        result = (None, "", f"{type(exc).__name__}: {exc}")
+
+    _MODULE_PROBE_CACHE[name] = result
+    return result
+
+
+def refresh_backend_cache() -> None:
+    """Clear cached import probe results so newly installed packages are re-detected."""
+    _MODULE_PROBE_CACHE.clear()
+
+
+def _try_import(name: str) -> Any:
+    mod, _, _ = _probe_module(name)
+    return mod
 
 
 def available_backends() -> Dict[str, bool]:
     """Probe installed optional TA and DataFrame libraries dynamically."""
+    has_np = _try_import("numpy") is not None
+    has_pd = _try_import("pandas") is not None
     return {
-        "talib": _try_import("talib") is not None,
-        "pandas_ta": _try_import("pandas_ta") is not None,
-        "ta": _try_import("ta") is not None,
-        "pandas": _try_import("pandas") is not None,
-        "numpy": _try_import("numpy") is not None,
+        "talib": (_try_import("talib") is not None) and has_np,
+        "pandas_ta": (_try_import("pandas_ta") is not None) and has_pd,
+        "ta": (_try_import("ta") is not None) and has_pd,
+        "pandas": has_pd,
+        "numpy": has_np,
         "builtin": True,
+    }
+
+
+def backend_diagnostics() -> Dict[str, Any]:
+    """Return active Python interpreter path plus per-library import status & errors."""
+    np_mod, np_ver, np_err = _probe_module("numpy")
+    pd_mod, pd_ver, pd_err = _probe_module("pandas")
+    tl_mod, tl_ver, tl_err = _probe_module("talib")
+    pta_mod, pta_ver, pta_err = _probe_module("pandas_ta")
+    ta_mod, ta_ver, ta_err = _probe_module("ta")
+
+    def _entry(mod: Any, ver: str, err: str, dep_ok: bool = True, dep_name: str = "") -> Dict[str, Any]:
+        avail = (mod is not None) and dep_ok
+        reason = err
+        if mod is not None and not dep_ok:
+            reason = f"Requires {dep_name} to be installed alongside this library"
+        return {"available": avail, "version": ver, "error": reason}
+
+    return {
+        "python_executable": sys.executable,
+        "python_version": platform.python_version(),
+        "backends": {
+            "talib": _entry(tl_mod, tl_ver, tl_err, dep_ok=np_mod is not None, dep_name="numpy"),
+            "pandas_ta": _entry(pta_mod, pta_ver, pta_err, dep_ok=pd_mod is not None, dep_name="pandas"),
+            "ta": _entry(ta_mod, ta_ver, ta_err, dep_ok=pd_mod is not None, dep_name="pandas"),
+            "pandas": _entry(pd_mod, pd_ver, pd_err),
+            "numpy": _entry(np_mod, np_ver, np_err),
+            "builtin": {"available": True, "version": "pure-python-O(N)", "error": ""},
+        },
     }
 
 
@@ -494,6 +571,9 @@ class IndicatorToolkit:
             s = self._pta.sma(self.df["close"].astype(float), length=period)
             if s is not None:
                 out = _to_clean_list(s.tolist(), self.n)
+        elif self.has_ta and self._use("ta"):
+            s = self._ta.trend.SMAIndicator(close=self.df["close"].astype(float), window=period).sma_indicator()
+            out = _to_clean_list(s.tolist(), self.n)
         if out is None:
             out = compute_sma_series(self.closes, period)
         self._cache[key] = out
@@ -510,6 +590,9 @@ class IndicatorToolkit:
             s = self._pta.ema(self.df["close"].astype(float), length=period)
             if s is not None:
                 out = _to_clean_list(s.tolist(), self.n)
+        elif self.has_ta and self._use("ta"):
+            s = self._ta.trend.EMAIndicator(close=self.df["close"].astype(float), window=period).ema_indicator()
+            out = _to_clean_list(s.tolist(), self.n)
         if out is None:
             out = compute_ema_series(self.closes, period)
         self._cache[key] = out
@@ -556,6 +639,14 @@ class IndicatorToolkit:
             )
             if s is not None:
                 atr_vals = _to_clean_list(s.tolist(), self.n)
+        elif self.has_ta and self._use("ta") and self.n >= period:
+            s = self._ta.volatility.AverageTrueRange(
+                high=self.df["high"].astype(float),
+                low=self.df["low"].astype(float),
+                close=self.df["close"].astype(float),
+                window=period,
+            ).average_true_range()
+            atr_vals = _to_clean_list(s.tolist(), self.n)
         if atr_vals is None:
             res = compute_atr_series(self.candles, period)
             self._cache[key] = res
@@ -593,6 +684,18 @@ class IndicatorToolkit:
                     "hist": _to_clean_list(mdf.iloc[:, 1].tolist(), self.n),
                     "signal": _to_clean_list(mdf.iloc[:, 2].tolist(), self.n),
                 }
+        elif self.has_ta and self._use("ta"):
+            mi = self._ta.trend.MACD(
+                close=self.df["close"].astype(float),
+                window_slow=slow,
+                window_fast=fast,
+                window_sign=signal,
+            )
+            out = {
+                "macd": _to_clean_list(mi.macd().tolist(), self.n),
+                "signal": _to_clean_list(mi.macd_signal().tolist(), self.n),
+                "hist": _to_clean_list(mi.macd_diff().tolist(), self.n),
+            }
         if out is None:
             out = compute_macd_series(self.closes, fast=fast, slow=slow, signal=signal)
         self._cache[key] = out
@@ -623,6 +726,17 @@ class IndicatorToolkit:
                     "middle": _to_clean_list(bdf.iloc[:, 1].tolist(), self.n),
                     "upper": _to_clean_list(bdf.iloc[:, 2].tolist(), self.n),
                 }
+        elif self.has_ta and self._use("ta"):
+            bb = self._ta.volatility.BollingerBands(
+                close=self.df["close"].astype(float),
+                window=period,
+                window_dev=std_dev,
+            )
+            out = {
+                "upper": _to_clean_list(bb.bollinger_hband().tolist(), self.n),
+                "middle": _to_clean_list(bb.bollinger_mavg().tolist(), self.n),
+                "lower": _to_clean_list(bb.bollinger_lband().tolist(), self.n),
+            }
         if out is None:
             out = compute_bbands_series(self.closes, period=period, std_dev=std_dev)
         self._cache[key] = out
@@ -650,6 +764,18 @@ class IndicatorToolkit:
                 "plus_di": _to_clean_list(pdi_v, self.n),
                 "minus_di": _to_clean_list(mdi_v, self.n),
             }
+        elif self.has_ta and self._use("ta") and self.n >= period * 2:
+            ai = self._ta.trend.ADXIndicator(
+                high=self.df["high"].astype(float),
+                low=self.df["low"].astype(float),
+                close=self.df["close"].astype(float),
+                window=period,
+            )
+            out = {
+                "adx": _to_clean_list(ai.adx().tolist(), self.n),
+                "plus_di": _to_clean_list(ai.adx_pos().tolist(), self.n),
+                "minus_di": _to_clean_list(ai.adx_neg().tolist(), self.n),
+            }
         if out is None:
             out = compute_adx_series(self.candles, period=period)
         self._cache[key] = out
@@ -670,6 +796,9 @@ class IndicatorToolkit:
         out: Optional[List[Optional[float]]] = None
         if self.has_talib and self._use("talib"):
             out = _to_clean_list(self._talib.ROC(self._np_arr(self.closes), timeperiod=period), self.n)
+        elif self.has_ta and self._use("ta"):
+            s = self._ta.momentum.ROCIndicator(close=self.df["close"].astype(float), window=period).roc()
+            out = _to_clean_list(s.tolist(), self.n)
         if out is None:
             out = compute_roc_series(self.closes, period=period)
         self._cache[key] = out
@@ -696,6 +825,8 @@ class IndicatorToolkit:
 __all__ = [
     "IndicatorToolkit",
     "available_backends",
+    "backend_diagnostics",
+    "refresh_backend_cache",
     "compute_adx_series",
     "compute_atr_series",
     "compute_bbands_series",

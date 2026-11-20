@@ -79,6 +79,11 @@ interface AnalyticsMetaPayload {
   universes: UniverseMeta[];
   timeframes?: TimeframeMeta[];
   indicator_backends: Record<string, boolean>;
+  indicator_backend_diagnostics?: {
+    python_executable: string;
+    python_version: string;
+    backends: Record<string, { available: boolean; version: string; error: string }>;
+  };
   storage: {
     configured_mode: string;
     active_mode: string;
@@ -148,6 +153,7 @@ interface LiveScreenerStatePayload {
   };
   live?: {
     active_feed: string;
+    transport?: string;
     tick_seq: number;
     ticks_processed: number;
     latency_ms?: number | null;
@@ -754,6 +760,7 @@ export function AnalyticsConsole({
                 alerts: (msg.alerts as LiveScreenerAlert[]) || base.alerts,
                 live: {
                   active_feed: String(msg.active_feed ?? base.live?.active_feed ?? ''),
+                  transport: String(msg.transport ?? base.live?.transport ?? ''),
                   tick_seq: Number(msg.tick_seq ?? base.live?.tick_seq ?? 0),
                   ticks_processed: Number(msg.ticks_processed ?? base.live?.ticks_processed ?? 0),
                   latency_ms: (msg.latency_ms as number | null | undefined) ?? base.live?.latency_ms,
@@ -1435,7 +1442,15 @@ export function AnalyticsConsole({
             </div>
 
             <div>
-              <label htmlFor="sc-ta-backend" className="mb-1 block text-xs text-slate-400">
+              <label
+                htmlFor="sc-ta-backend"
+                className="mb-1 block text-xs text-slate-400"
+                title={
+                  meta?.indicator_backend_diagnostics
+                    ? `Python: ${meta.indicator_backend_diagnostics.python_executable}`
+                    : undefined
+                }
+              >
                 Indicator Engine
               </label>
               <select
@@ -1444,12 +1459,30 @@ export function AnalyticsConsole({
                 onChange={(e) => setScBackend(e.target.value)}
                 className="min-h-[38px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 py-1.5 text-xs text-slate-100 focus:border-sky-400 focus:outline-none"
               >
-                <option value="auto">Auto (TA-Lib → pandas-ta → Built-in)</option>
+                <option value="auto">Auto (TA-Lib → pandas-ta → ta → Built-in)</option>
                 <option value="talib" disabled={!meta?.indicator_backends?.talib}>
-                  TA-Lib {meta?.indicator_backends?.talib ? '' : '(not installed)'}
+                  TA-Lib C Engine{' '}
+                  {meta?.indicator_backends?.talib
+                    ? meta?.indicator_backend_diagnostics?.backends?.talib?.version
+                      ? `(v${meta.indicator_backend_diagnostics.backends.talib.version})`
+                      : ''
+                    : '(not in active Python env)'}
                 </option>
                 <option value="pandas_ta" disabled={!meta?.indicator_backends?.pandas_ta}>
-                  pandas-ta {meta?.indicator_backends?.pandas_ta ? '' : '(not installed)'}
+                  pandas-ta{' '}
+                  {meta?.indicator_backends?.pandas_ta
+                    ? meta?.indicator_backend_diagnostics?.backends?.pandas_ta?.version
+                      ? `(v${meta.indicator_backend_diagnostics.backends.pandas_ta.version})`
+                      : ''
+                    : '(not in active Python env)'}
+                </option>
+                <option value="ta" disabled={!meta?.indicator_backends?.ta}>
+                  ta Library{' '}
+                  {meta?.indicator_backends?.ta
+                    ? meta?.indicator_backend_diagnostics?.backends?.ta?.version
+                      ? `(v${meta.indicator_backend_diagnostics.backends.ta.version})`
+                      : ''
+                    : '(not in active Python env)'}
                 </option>
                 <option value="builtin">Built-in Pure Python O(N)</option>
               </select>
@@ -2161,7 +2194,15 @@ export function AnalyticsConsole({
               </select>
             </div>
             <div>
-              <label htmlFor="ls-backend" className="mb-1 block text-[11px] font-semibold text-slate-400">
+              <label
+                htmlFor="ls-backend"
+                className="mb-1 block text-[11px] font-semibold text-slate-400"
+                title={
+                  meta?.indicator_backend_diagnostics
+                    ? `Active Python: ${meta.indicator_backend_diagnostics.python_executable}`
+                    : undefined
+                }
+              >
                 Indicator Engine
               </label>
               <select
@@ -2170,10 +2211,32 @@ export function AnalyticsConsole({
                 onChange={(e) => setLsBackend(e.target.value)}
                 className="min-h-[36px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-2.5 py-1.5 text-xs text-slate-100 focus:border-emerald-400 focus:outline-none"
               >
-                <option value="auto">Auto (TA-Lib / Built-in)</option>
+                <option value="auto">Auto (TA-Lib → pandas-ta → ta → Built-in)</option>
+                <option value="talib" disabled={!meta?.indicator_backends?.talib}>
+                  TA-Lib C Engine{' '}
+                  {meta?.indicator_backends?.talib
+                    ? meta?.indicator_backend_diagnostics?.backends?.talib?.version
+                      ? `(v${meta.indicator_backend_diagnostics.backends.talib.version})`
+                      : ''
+                    : '(not in active Python env)'}
+                </option>
+                <option value="pandas_ta" disabled={!meta?.indicator_backends?.pandas_ta}>
+                  pandas-ta{' '}
+                  {meta?.indicator_backends?.pandas_ta
+                    ? meta?.indicator_backend_diagnostics?.backends?.pandas_ta?.version
+                      ? `(v${meta.indicator_backend_diagnostics.backends.pandas_ta.version})`
+                      : ''
+                    : '(not in active Python env)'}
+                </option>
+                <option value="ta" disabled={!meta?.indicator_backends?.ta}>
+                  ta Library{' '}
+                  {meta?.indicator_backends?.ta
+                    ? meta?.indicator_backend_diagnostics?.backends?.ta?.version
+                      ? `(v${meta.indicator_backend_diagnostics.backends.ta.version})`
+                      : ''
+                    : '(not in active Python env)'}
+                </option>
                 <option value="builtin">Built-in Pure O(N)</option>
-                {meta?.indicator_backends?.talib && <option value="talib">TA-Lib C Engine</option>}
-                {meta?.indicator_backends?.pandas_ta && <option value="pandas_ta">pandas-ta</option>}
               </select>
             </div>
             <div>
@@ -2312,6 +2375,17 @@ export function AnalyticsConsole({
                 </span>
                 <span>
                   Feed: <strong className="text-slate-200">{(lsState.live?.active_feed || lsState.provider || '—').toUpperCase()}</strong>
+                  {lsState.live?.transport && (
+                    <span
+                      className={`ml-1.5 rounded px-1.5 py-0.5 text-[10px] font-semibold ${
+                        lsState.live.transport === 'broker_websocket'
+                          ? 'bg-emerald-950/70 text-emerald-300 border border-emerald-700/60'
+                          : 'bg-slate-800 text-slate-300 border border-slate-700'
+                      }`}
+                    >
+                      {lsState.live.transport === 'broker_websocket' ? 'BROKER WS' : lsState.live.transport.toUpperCase()}
+                    </span>
+                  )}
                   {lsState.live?.latency_ms != null ? ` · ${lsState.live.latency_ms} ms` : ''}
                   {' · '}Ticks: {lsState.live?.tick_seq ?? 0}
                   {lsState.live?.last_tick_ist ? ` · Last: ${lsState.live.last_tick_ist.slice(11, 19)} IST` : ''}

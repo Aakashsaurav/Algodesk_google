@@ -42,12 +42,31 @@ function resolvePythonBin(): string {
   if (process.env.PYTHON_BIN?.trim()) {
     return process.env.PYTHON_BIN.trim();
   }
-  const venvCandidates = [
-    path.join(__dirname, '.venv', 'bin', 'python3'),
-    path.join(__dirname, '.venv', 'bin', 'python'),
-    path.join(__dirname, '.venv', 'Scripts', 'python.exe'),
-  ];
-  for (const candidate of venvCandidates) {
+  const candidates: string[] = [];
+  const activeVenv = process.env.VIRTUAL_ENV?.trim();
+  if (activeVenv) {
+    candidates.push(
+      path.join(activeVenv, 'bin', 'python3'),
+      path.join(activeVenv, 'bin', 'python'),
+      path.join(activeVenv, 'Scripts', 'python.exe')
+    );
+  }
+  const condaPrefix = process.env.CONDA_PREFIX?.trim();
+  if (condaPrefix) {
+    candidates.push(
+      path.join(condaPrefix, 'bin', 'python3'),
+      path.join(condaPrefix, 'bin', 'python'),
+      path.join(condaPrefix, 'python.exe')
+    );
+  }
+  for (const dirName of ['.venv', 'venv', 'env']) {
+    candidates.push(
+      path.join(__dirname, dirName, 'bin', 'python3'),
+      path.join(__dirname, dirName, 'bin', 'python'),
+      path.join(__dirname, dirName, 'Scripts', 'python.exe')
+    );
+  }
+  for (const candidate of candidates) {
     if (fs.existsSync(candidate)) {
       return candidate;
     }
@@ -59,6 +78,7 @@ function startPythonHub(port = activePythonPort): void {
   if (pythonProc && pythonProc.exitCode === null && !pythonProc.killed) return;
   activePythonPort = port;
   const pythonBin = resolvePythonBin();
+  console.log(`[python-hub] starting with interpreter: ${pythonBin}`);
   pythonProc = spawn(
     pythonBin,
     ['-m', 'web.local_server', '--host', '127.0.0.1', '--port', String(activePythonPort), '--no-browser'],

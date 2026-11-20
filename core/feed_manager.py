@@ -40,6 +40,7 @@ from broker.upstox.auth import auth_manager as upstox_auth
 from broker.zerodha.auth import zerodha_auth_manager as zerodha_auth
 from config import IST_TZ, config
 from core.audit import AuditTrail, audit_trail
+from core.broker_ws import BrokerWebSocketHub
 from core.instruments import InstrumentIndex, instrument_index
 
 logger = logging.getLogger(__name__)
@@ -743,9 +744,11 @@ class HotStandbyFeedManager:
         fetchers: Optional[Dict[str, Callable[[List[Any]], Dict[str, Dict[str, Any]]]]] = None,
         watchlist_file: Optional[Path] = None,
         instruments: Optional[InstrumentIndex] = None,
+        broker_ws: Optional[BrokerWebSocketHub] = None,
     ) -> None:
         self._lock = threading.RLock()
         self._audit = audit or audit_trail
+        self._using_custom_fetchers = fetchers is not None
         self._fetchers = fetchers or dict(_DEFAULT_FETCHERS)
         self._watchlist_file = watchlist_file or (config.DATA_DIR / "watchlist.json")
         self._instruments = instruments or instrument_index
@@ -767,6 +770,14 @@ class HotStandbyFeedManager:
         self._stream_thread: Optional[threading.Thread] = None
         self._stream_stop = threading.Event()
         self._stream_interval_sec = 2.0
+        self._last_rest_poll_mono: float = 0.0
+        self._last_ws_tick_mono: float = 0.0
+
+        self._broker_ws = broker_ws or BrokerWebSocketHub(
+            instruments=self._instruments,
+            on_ticks=self._on_broker_ws_ticks,
+        )
+        self._has_injected_ws = broker_ws is not None
 
     def _load_subscriptions(self) -> List[Dict[str, str]]:
         try:
@@ -1017,6 +1028,139 @@ class HotStandbyFeedManager:
 
     # ── Pub/Sub Streaming for WebSocket / SSE Clients ────────────────────
 
+    def _can_use_broker_ws(self, broker_id: str) -> bool:
+        bid = (broker_id or "").strip().lower()
+        if not self._broker_ws.supports(bid):
+            return False
+        if self._has_injected_ws:
+            return True
+        if self._using_custom_fetchers:
+            return False
+        if urllib.request.urlopen is not _ORIG_URLOPEN:
+            return False
+        return True
+
+    def _sync_watchlist_ws(self) -> None:
+        with self._lock:
+            target = self._active_feed_id
+            subs = [dict(s) for s in self._subscriptions]
+            has_listeners = len(self._listeners) > 0
+        if not has_listeners or not subs:
+            self._broker_ws.release_scope("watchlist")
+            return
+        if self._can_use_broker_ws(target):
+            for other in ("upstox", "zerodha"):
+                if other != target:
+                    self._broker_ws.release_scope("watchlist", broker_id=other)
+            self._broker_ws.set_scope_subscriptions(target, "watchlist", subs)
+        else:
+            self._broker_ws.release_scope("watchlist")
+
+    def ensure_live_screen_ws(self, broker_id: str, subs: List[Dict[str, str]]) -> bool:
+        """Subscribe Live Screen symbols onto the persistent Broker WebSocket."""
+        bid = (broker_id or "").strip().lower()
+        if not self._can_use_broker_ws(bid) or not subs:
+            return False
+        self._broker_ws.set_scope_subscriptions(bid, "live_screen", subs)
+        return True
+
+    def release_live_screen_ws(self) -> None:
+        """Release temporary Live Screen symbols from the Broker WebSocket."""
+        self._broker_ws.release_scope("live_screen")
+
+    def _on_broker_ws_ticks(
+        self,
+        broker_id: str,
+        raw_quotes: Dict[str, Dict[str, Any]],
+        latency_ms: Optional[float],
+    ) -> None:
+        """Ingest real-time push ticks arriving directly from the Broker WebSocket."""
+        if not raw_quotes:
+            return
+        now_ist = datetime.now(tz=IST_TZ).isoformat(timespec="seconds")
+        now_mono = time.monotonic()
+        matched_any_watchlist = False
+
+        with self._lock:
+            self._last_ws_tick_mono = now_mono
+            slot = self._slots.get(broker_id)
+            if slot is not None:
+                slot.transport = "broker_websocket"
+                if latency_ms is not None:
+                    slot.latency_ms = latency_ms
+                slot.ticks_received += len(raw_quotes)
+                slot.last_tick_ist = now_ist
+                slot.last_error = ""
+            self._tick_seq += 1
+
+            for sym_key, q in raw_quotes.items():
+                q_sym = str(q.get("symbol") or sym_key).strip().upper()
+                matched_sub = next(
+                    (s for s in self._subscriptions if s["symbol"] == q_sym),
+                    None,
+                )
+                if matched_sub is None:
+                    continue
+                matched_any_watchlist = True
+                q_exch = matched_sub["exchange"]
+                storage_key = _sub_key(q_sym, q_exch)
+                prev_q = self._quotes.get(storage_key)
+                new_ltp = q.get("ltp")
+                old_ltp = prev_q.get("ltp") if prev_q else None
+                if new_ltp is not None and old_ltp is not None:
+                    direction = "up" if new_ltp > old_ltp else ("down" if new_ltp < old_ltp else "flat")
+                else:
+                    direction = "flat"
+
+                enriched = {
+                    "instrument_type": matched_sub.get("instrument_type") or q.get("instrument_type", "EQUITY"),
+                    "instrument_key": matched_sub.get("instrument_key") or q.get("instrument_key", ""),
+                    **q,
+                    "symbol": q_sym,
+                    "exchange": q_exch,
+                    "transport": "broker_websocket",
+                    "direction": direction,
+                    "tick_seq": self._tick_seq,
+                }
+                self._quotes[storage_key] = enriched
+
+                if new_ltp is not None:
+                    hist = self._tick_history.setdefault(storage_key, [])
+                    hist.append({"ts_ist": enriched["ts_ist"], "ltp": float(new_ltp)})
+                    if len(hist) > 40:
+                        del hist[: len(hist) - 40]
+                    self._tick_events.insert(
+                        0,
+                        {
+                            "seq": self._tick_seq,
+                            "ts_ist": enriched["ts_ist"],
+                            "symbol": q_sym,
+                            "exchange": q_exch,
+                            "ltp": new_ltp,
+                            "change_pct": enriched.get("change_pct"),
+                            "volume": enriched.get("volume", 0),
+                            "oi": enriched.get("oi", 0),
+                            "direction": direction,
+                            "source": broker_id,
+                            "transport": "broker_websocket",
+                        },
+                    )
+            if len(self._tick_events) > 60:
+                del self._tick_events[60:]
+            if broker_id in self._slots:
+                self._mark_active(broker_id)
+                if broker_id == self._primary_id:
+                    self._last_failover_reason = ""
+
+        if matched_any_watchlist:
+            self._broadcast(
+                {
+                    "ok": True,
+                    "message": f"Live WebSocket tick stream active ({broker_id.upper()}).",
+                    **self.status(),
+                }
+            )
+
     def register_listener(self) -> queue.Queue:
         q: queue.Queue = queue.Queue(maxsize=16)
         with self._lock:
@@ -1030,6 +1174,7 @@ class HotStandbyFeedManager:
             no_listeners = len(self._listeners) == 0
         if no_listeners:
             self._stream_stop.set()
+            self._broker_ws.release_scope("watchlist")
 
     def _broadcast(self, payload: Dict[str, Any]) -> None:
         with self._lock:
@@ -1046,6 +1191,7 @@ class HotStandbyFeedManager:
                 pass
 
     def ensure_streaming(self) -> None:
+        self._sync_watchlist_ws()
         with self._lock:
             if self._stream_thread and self._stream_thread.is_alive():
                 return
@@ -1062,10 +1208,26 @@ class HotStandbyFeedManager:
             with self._lock:
                 has_listeners = len(self._listeners) > 0
                 has_subs = len(self._subscriptions) > 0
+                active_fid = self._active_feed_id
+                last_ws_mono = self._last_ws_tick_mono
+                has_any_quotes = len(self._quotes) > 0
             if not has_listeners:
                 break
             if has_subs:
+                self._sync_watchlist_ws()
+                ws_active = self._can_use_broker_ws(active_fid) and self._broker_ws.is_connected(active_fid)
+                now = time.monotonic()
+                ws_pushed_recently = ws_active and last_ws_mono > 0 and (now - last_ws_mono) < 20.0
+                if ws_pushed_recently:
+                    # Broker WebSocket is actively pushing live ticks — zero REST polling!
+                    self._stream_stop.wait(self._stream_interval_sec)
+                    continue
+                if ws_active and has_any_quotes and (now - self._last_rest_poll_mono) < 30.0:
+                    # Broker WS connected (e.g., quiet/after-hours market); avoid spamming REST every 2s.
+                    self._stream_stop.wait(self._stream_interval_sec)
+                    continue
                 try:
+                    self._last_rest_poll_mono = now
                     self.poll_ticks()
                 except Exception as exc:
                     logger.debug("Live stream poll tick error: %s", exc)
@@ -1294,6 +1456,29 @@ class HotStandbyFeedManager:
         last_err = ""
 
         for fid in candidates:
+            # 1) Prefer persistent Broker WebSocket push cache (ZERO REST API calls!)
+            if self._can_use_broker_ws(fid):
+                self._broker_ws.set_scope_subscriptions(fid, "live_screen", subs)
+                if self._broker_ws.is_connected(fid):
+                    ws_quotes, ws_lat = self._broker_ws.get_cached_quotes(
+                        fid,
+                        [s["symbol"] for s in subs],
+                        max_age_sec=30.0,
+                    )
+                    min_needed = max(1, (len(subs) + 1) // 2)
+                    if len(ws_quotes) >= min_needed:
+                        return {
+                            "ok": True,
+                            "active_feed": fid,
+                            "transport": "broker_websocket",
+                            "latency_ms": ws_lat if ws_lat is not None else 0.0,
+                            "total_batch_ms": ws_lat if ws_lat is not None else 0.0,
+                            "batch_count": 0,
+                            "quotes": ws_quotes,
+                            "ts_ist": datetime.now(tz=IST_TZ).isoformat(timespec="seconds"),
+                        }
+
+            # 2) Fallback to REST snapshot (e.g., initial seed, yfinance, or after-hours quiet market)
             fetcher = self._fetchers.get(fid)
             if fetcher is None:
                 continue
@@ -1321,6 +1506,7 @@ class HotStandbyFeedManager:
                 return {
                     "ok": True,
                     "active_feed": fid,
+                    "transport": "rest_fallback" if self._broker_ws.supports(fid) else "http_poll",
                     "latency_ms": per_req_ms,
                     "total_batch_ms": total_elapsed_ms,
                     "batch_count": len(req_latencies),
@@ -1334,6 +1520,7 @@ class HotStandbyFeedManager:
         return {
             "ok": False,
             "active_feed": self._active_feed_id,
+            "transport": "disconnected",
             "latency_ms": None,
             "total_batch_ms": None,
             "batch_count": 0,
@@ -1427,6 +1614,7 @@ class HotStandbyFeedManager:
                 "watchlist": [s["symbol"] for s in self._subscriptions],
                 "subscriptions": [dict(s) for s in self._subscriptions],
                 "slots": [self._slots[fid].to_dict() for fid in ordered if fid in self._slots],
+                "broker_ws": self._broker_ws.status(),
                 "quotes": ordered_quotes,
                 "tick_events": list(self._tick_events[:30]),
             }

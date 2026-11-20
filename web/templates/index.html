@@ -934,7 +934,7 @@
             </div>
           </div>
           <div class="field"><label for="p5ScProvider">Data Source</label><select id="p5ScProvider"><option value="auto">Assigned Connection</option><option value="yfinance">Yahoo Finance</option><option value="upstox">Upstox</option><option value="zerodha">Zerodha Kite</option></select></div>
-          <div class="field"><label for="p5ScBackend">Indicator Engine</label><select id="p5ScBackend"><option value="auto">Auto (TA-Lib → pandas-ta → Built-in)</option><option value="builtin">Built-in Python O(N)</option></select></div>
+          <div class="field"><label for="p5ScBackend">Indicator Engine</label><select id="p5ScBackend"><option value="auto">Auto (TA-Lib → pandas-ta → ta → Built-in)</option><option value="talib" disabled>TA-Lib C Engine (checking...)</option><option value="pandas_ta" disabled>pandas-ta (checking...)</option><option value="ta" disabled>ta Library (checking...)</option><option value="builtin">Built-in Python O(N)</option></select></div>
         </div>
         <div id="p5ScParamsBox" style="margin-top:12px;"></div>
         <div id="p5ScMeta" class="mono" style="font-size:12px; color:var(--text-muted); margin-top:10px;">Ready for multi-symbol scan.</div>
@@ -978,7 +978,7 @@
         </div>
         <div style="display:grid; grid-template-columns:repeat(4, minmax(0,1fr)); gap:12px; margin-top:12px;">
           <div class="field"><label for="p5LsProvider">Feed Provider</label><select id="p5LsProvider"><option value="auto">Assigned Connection</option><option value="upstox">Upstox</option><option value="zerodha">Zerodha Kite</option><option value="yfinance">Yahoo Finance</option></select></div>
-          <div class="field"><label for="p5LsBackend">Indicator Engine</label><select id="p5LsBackend"><option value="auto">Auto</option><option value="builtin">Built-in Python O(N)</option></select></div>
+          <div class="field"><label for="p5LsBackend">Indicator Engine</label><select id="p5LsBackend"><option value="auto">Auto (TA-Lib → pandas-ta → ta → Built-in)</option><option value="talib" disabled>TA-Lib C Engine (checking...)</option><option value="pandas_ta" disabled>pandas-ta (checking...)</option><option value="ta" disabled>ta Library (checking...)</option><option value="builtin">Built-in Python O(N)</option></select></div>
           <div class="field"><label for="p5LsInterval">Tick Cadence (sec)</label><input id="p5LsInterval" class="mono" type="number" min="1" max="30" step="1" value="2" /></div>
           <div class="field" style="justify-content:flex-end;"><label style="display:flex;align-items:center;gap:6px;min-height:38px;"><input id="p5LsMatchedOnly" type="checkbox" /> <span>Matched Only</span></label></div>
         </div>
@@ -2551,7 +2551,30 @@
         if (m.storage || m.indicator_backends) {
           const stLabel = m.storage && m.storage.parquet_available ? 'HYBRID PARQUET' : 'SQLITE FALLBACK';
           const taList = Object.entries(m.indicator_backends || {}).filter(([, ok]) => ok).map(([k]) => k).join(', ');
-          p5.badges.textContent = `Hot-reloaded .py plugins · Storage: ${stLabel}${taList ? ' · TA: ' + taList : ''}`;
+          const pyExec = m.indicator_backend_diagnostics && m.indicator_backend_diagnostics.python_executable ? ` · Python: ${m.indicator_backend_diagnostics.python_executable}` : '';
+          p5.badges.textContent = `Hot-reloaded .py plugins · Storage: ${stLabel}${taList ? ' · TA: ' + taList : ''}${pyExec}`;
+          const diagBackends = (m.indicator_backend_diagnostics && m.indicator_backend_diagnostics.backends) || {};
+          const syncBackendSelect = (selEl) => {
+            if (!selEl) return;
+            const curVal = selEl.value || 'auto';
+            const optDefs = [
+              { id: 'auto', label: 'Auto (TA-Lib → pandas-ta → ta → Built-in)', enabled: true },
+              { id: 'talib', label: 'TA-Lib C Engine', enabled: Boolean(m.indicator_backends && m.indicator_backends.talib) },
+              { id: 'pandas_ta', label: 'pandas-ta', enabled: Boolean(m.indicator_backends && m.indicator_backends.pandas_ta) },
+              { id: 'ta', label: 'ta Library', enabled: Boolean(m.indicator_backends && m.indicator_backends.ta) },
+              { id: 'builtin', label: 'Built-in Python O(N)', enabled: true },
+            ];
+            selEl.innerHTML = optDefs.map((o) => {
+              const info = diagBackends[o.id] || {};
+              const suffix = o.id === 'auto' || o.id === 'builtin'
+                ? ''
+                : (o.enabled ? (info.version ? ` (v${info.version})` : '') : ' (not in active Python env)');
+              return `<option value="${o.id}"${o.enabled ? '' : ' disabled'}>${o.label}${suffix}</option>`;
+            }).join('');
+            selEl.value = optDefs.some((o) => o.id === curVal && o.enabled) ? curVal : 'auto';
+          };
+          syncBackendSelect(document.getElementById('p5ScBackend'));
+          syncBackendSelect(document.getElementById('p5LsBackend'));
         }
         const curUni = p5.scUni.value;
         const lsUniEl = document.getElementById('p5LsUniverse');
