@@ -430,7 +430,15 @@ class ScreenerEngine:
         cancel_event: Optional[threading.Event] = None,
     ) -> Dict[str, Any]:
         target_screen_id = screen_id or preset or "all_metrics"
-        screen = self._registry.get(target_screen_id)
+        try:
+            screen = self._registry.get(target_screen_id)
+        except Exception:
+            from rules.engine import compile_visual_screen, visual_rule_store
+
+            rule_def = visual_rule_store.get(target_screen_id)
+            if rule_def is None:
+                raise
+            screen = compile_visual_screen(rule_def)
         resolved_params = screen.resolve_params(params)
 
         eff_exch = (exchange or "NSE").strip().upper()

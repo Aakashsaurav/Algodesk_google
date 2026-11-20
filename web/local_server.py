@@ -419,6 +419,89 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
                 self._send_json(404, {"detail": str(exc)})
             return
 
+        if path == "/ws/deployments":
+            ws_key = self.headers.get("Sec-WebSocket-Key")
+            if not ws_key or (self.headers.get("Upgrade") or "").lower() != "websocket":
+                self._send_json(400, {"detail": "Expected WebSocket upgrade request."})
+                return
+            accept_val = make_ws_accept_key(ws_key)
+            handshake = (
+                "HTTP/1.1 101 Switching Protocols\r\n"
+                "Upgrade: websocket\r\n"
+                "Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Accept: {accept_val}\r\n\r\n"
+            ).encode("ascii")
+            self.connection.sendall(handshake)
+            listener_q = hub_service.register_deployments_listener()
+            send_lock = threading.Lock()
+            stop_event = threading.Event()
+            sock = self.connection
+
+            def _dep_writer() -> None:
+                try:
+                    initial = hub_service.list_deployments()
+                    send_ws_text(sock, json.dumps({"type": "deployments:state", **initial}), send_lock)
+                    while not stop_event.is_set():
+                        try:
+                            ev = listener_q.get(timeout=1.0)
+                            send_ws_text(sock, json.dumps(ev), send_lock)
+                        except queue.Empty:
+                            continue
+                except OSError:
+                    stop_event.set()
+
+            threading.Thread(target=_dep_writer, daemon=True).start()
+            try:
+                sock.settimeout(1.0)
+                while not stop_event.is_set():
+                    try:
+                        frame = read_ws_frame(sock)
+                    except socket.timeout:
+                        continue
+                    if frame is None:
+                        break
+                    opcode, raw_payload = frame
+                    if opcode == OPCODE_CLOSE:
+                        send_ws_close(sock, send_lock)
+                        break
+                    if opcode == OPCODE_PING:
+                        send_ws_pong(sock, raw_payload, send_lock)
+                        continue
+            except OSError:
+                pass
+            finally:
+                stop_event.set()
+                hub_service.unregister_deployments_listener(listener_q)
+            return
+
+        if path == "/api/streak/meta":
+            self._send_json(200, hub_service.get_streak_meta())
+            return
+
+        if path == "/api/streak/discover":
+            cat = query.get("category", [None])[0]
+            mode_f = query.get("mode", [None])[0]
+            self._send_json(200, hub_service.list_discover(category=cat, mode=mode_f))
+            return
+
+        if path == "/api/streak/rules":
+            kind = query.get("kind", [None])[0]
+            self._send_json(200, hub_service.list_visual_rules(kind=kind))
+            return
+
+        if path == "/api/streak/baskets":
+            self._send_json(200, hub_service.list_baskets())
+            return
+
+        if path == "/api/streak/backtest/runs":
+            limit = int(query.get("limit", ["20"])[0] or 20)
+            self._send_json(200, hub_service.list_backtest_runs(limit=limit))
+            return
+
+        if path == "/api/streak/deployments":
+            self._send_json(200, hub_service.list_deployments())
+            return
+
         if len(parts) == 4 and parts[0] == "api" and parts[1] == "brokers" and parts[3] == "reconnect-status":
             self._send_json(200, hub_service.get_reconnect_status(parts[2]))
             return
@@ -702,6 +785,151 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
                 self._send_json(200, hub_service.update_risk_limits(body))
                 return
 
+            # ── Phase 6: Full Streak Platform Routes ──────────────────────
+            if path == "/api/streak/rules":
+                self._send_json(200, hub_service.save_visual_rule(body))
+                return
+
+            if path == "/api/streak/rules/export-python":
+                rule_obj = body.get("rule_def") if isinstance(body.get("rule_def"), dict) else body
+                self._send_json(
+                    200,
+                    hub_service.export_visual_rule_to_python(
+                        rule_obj,
+                        save_to_disk=bool(body.get("save_to_disk", False)),
+                    ),
+                )
+                return
+
+            if path == "/api/streak/baskets":
+                self._send_json(200, hub_service.save_basket(body))
+                return
+
+            if path == "/api/streak/charges/preview":
+                self._send_json(
+                    200,
+                    hub_service.preview_charges(
+                        entry_price=float(body.get("entry_price", 1000.0) or 1000.0),
+                        exit_price=float(body.get("exit_price", 1025.0) or 1025.0),
+                        quantity=int(body.get("quantity", 100) or 100),
+                        profile=str(body.get("profile", "zerodha")),
+                        segment=str(body.get("segment", "equity_intraday")),
+                        direction=str(body.get("direction", "LONG")),
+                        overrides=body.get("overrides") if isinstance(body.get("overrides"), dict) else None,
+                    ),
+                )
+                return
+
+            if path == "/api/streak/backtest":
+                query = parse_qs(parsed.query)
+                async_q = query.get("async_job", [None])[0]
+                is_async = bool(body.get("async_job", False)) if async_q is None else (async_q.lower() == "true")
+                self._send_json(
+                    200,
+                    hub_service.run_streak_backtest(
+                        mode=str(body.get("mode", "portfolio")),
+                        symbols=body.get("symbols") if isinstance(body.get("symbols"), list) else None,
+                        basket_id=body.get("basket_id"),
+                        universe=body.get("universe"),
+                        exchange=str(body.get("exchange", "NSE")),
+                        strategy=str(body.get("strategy", "ema_crossover")),
+                        rule_def=body.get("rule_def") if isinstance(body.get("rule_def"), dict) else None,
+                        params=body.get("params") if isinstance(body.get("params"), dict) else None,
+                        timeframe=str(body.get("timeframe", "1day")),
+                        from_date=body.get("from_date"),
+                        to_date=body.get("to_date"),
+                        initial_capital=float(body.get("initial_capital", 500000.0) or 500000.0),
+                        allocation_mode=str(body.get("allocation_mode", "shared_pool")),
+                        max_open_positions=int(body.get("max_open_positions", 5) or 5),
+                        risk_per_trade_pct=float(body.get("risk_per_trade_pct", 1.5) or 1.5),
+                        signal_ranking=str(body.get("signal_ranking", "momentum")),
+                        stop_loss_pct=float(body.get("stop_loss_pct", 3.0) or 3.0),
+                        take_profit_pct=float(body.get("take_profit_pct", 7.0) or 7.0),
+                        trailing_sl_pct=float(body.get("trailing_sl_pct", 0.0) or 0.0),
+                        charges_profile=str(body.get("charges_profile", "zerodha")),
+                        segment=str(body.get("segment", "equity_intraday")),
+                        charges_overrides=body.get("charges_overrides") if isinstance(body.get("charges_overrides"), dict) else None,
+                        slippage_bps=float(body.get("slippage_bps", 5.0) or 5.0),
+                        provider=body.get("provider"),
+                        backend=str(body.get("backend", "auto")),
+                        async_job=is_async,
+                    ),
+                )
+                return
+
+            if path == "/api/streak/technicals":
+                self._send_json(
+                    200,
+                    hub_service.analyze_technicals(
+                        symbol=str(body.get("symbol", "RELIANCE")),
+                        exchange=str(body.get("exchange", "NSE")),
+                        timeframe=str(body.get("timeframe", "1day")),
+                        provider=body.get("provider"),
+                        backend=str(body.get("backend", "auto")),
+                    ),
+                )
+                return
+
+            if path == "/api/streak/options/template":
+                self._send_json(
+                    200,
+                    hub_service.build_options_template(
+                        template_id=str(body.get("template_id", "iron_condor")),
+                        spot=float(body.get("spot", 24000.0) or 24000.0),
+                        step=float(body.get("step", 100.0) or 100.0),
+                        lot_size=int(body.get("lot_size", 75) or 75),
+                        dte_days=float(body.get("dte_days", 7.0) or 7.0),
+                        iv_pct=float(body.get("iv_pct", 15.0) or 15.0),
+                        charges_profile=str(body.get("charges_profile", "zerodha")),
+                    ),
+                )
+                return
+
+            if path == "/api/streak/options/analyze":
+                self._send_json(
+                    200,
+                    hub_service.analyze_options(
+                        spot=float(body.get("spot", 24000.0) or 24000.0),
+                        legs=body.get("legs") if isinstance(body.get("legs"), list) else [],
+                        dte_days=float(body.get("dte_days", 7.0) or 7.0),
+                        risk_free_rate=float(body.get("risk_free_rate", 0.068) or 0.068),
+                        charges_profile=str(body.get("charges_profile", "zerodha")),
+                        charges_overrides=body.get("charges_overrides") if isinstance(body.get("charges_overrides"), dict) else None,
+                    ),
+                )
+                return
+
+            if path == "/api/streak/deployments/start":
+                self._send_json(200, hub_service.start_deployment(body))
+                return
+
+            if len(parts) == 5 and parts[0] == "api" and parts[1] == "streak" and parts[2] == "deployments" and parts[4] == "action":
+                self._send_json(200, hub_service.control_deployment(parts[3], str(body.get("action", ""))))
+                return
+
+            if len(parts) == 6 and parts[0] == "api" and parts[1] == "streak" and parts[2] == "deployments" and parts[3] == "alerts" and parts[5] == "action":
+                self._send_json(200, hub_service.resolve_deployment_alert(parts[4], str(body.get("action", ""))))
+                return
+
+            self._send_json(404, {"detail": "Not Found"})
+        except ValueError as exc:
+            self._send_json(400, {"detail": str(exc)})
+        except Exception as exc:
+            self._send_json(500, {"detail": str(exc)})
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        parts = parsed.path.strip("/").split("/")
+        try:
+            if len(parts) == 4 and parts[0] == "api" and parts[1] == "streak" and parts[2] == "rules":
+                self._send_json(200, hub_service.delete_visual_rule(parts[3]))
+                return
+            if len(parts) == 4 and parts[0] == "api" and parts[1] == "streak" and parts[2] == "baskets":
+                self._send_json(200, hub_service.delete_basket(parts[3]))
+                return
+            if len(parts) == 4 and parts[0] == "api" and parts[1] == "streak" and parts[2] == "deployments":
+                self._send_json(200, hub_service.control_deployment(parts[3], "delete"))
+                return
             self._send_json(404, {"detail": "Not Found"})
         except ValueError as exc:
             self._send_json(400, {"detail": str(exc)})

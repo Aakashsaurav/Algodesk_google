@@ -69,12 +69,32 @@ class BacktestEngine:
         )
         return records.get("rows", []), dl_meta
 
+    def _resolve_strategy(
+        self,
+        strategy: str,
+        rule_def: Optional[Dict[str, Any]] = None,
+    ):
+        if rule_def is not None:
+            from rules.engine import compile_visual_strategy
+
+            return compile_visual_strategy(rule_def), "visual"
+        try:
+            return self._registry.create(strategy), "python"
+        except Exception:
+            from rules.engine import compile_visual_strategy, visual_rule_store
+
+            saved = visual_rule_store.get(strategy)
+            if saved is None:
+                raise
+            return compile_visual_strategy(saved), "visual"
+
     def run(
         self,
         *,
         symbol: str,
         exchange: str = "NSE",
         strategy: str = "ema_crossover",
+        rule_def: Optional[Dict[str, Any]] = None,
         params: Optional[Dict[str, Any]] = None,
         timeframe: str = "1day",
         from_date: Optional[str] = None,
@@ -84,6 +104,10 @@ class BacktestEngine:
         fee_bps: float = 5.0,
         stop_loss_pct: float = 5.0,
         take_profit_pct: float = 12.0,
+        trailing_sl_pct: float = 0.0,
+        charges_profile: Optional[str] = None,
+        segment: str = "equity_intraday",
+        charges_overrides: Optional[Dict[str, Any]] = None,
         provider: Optional[str] = None,
         backend: str = "auto",
         instrument_type: Optional[str] = None,
@@ -99,13 +123,30 @@ class BacktestEngine:
         tf = normalize_timeframe(timeframe)
         base_tf = resolve_base_timeframe(tf)
 
-        strat_inst = self._registry.create(strategy)
+        strat_inst, strat_mode = self._resolve_strategy(strategy, rule_def=rule_def)
         resolved_params = strat_inst.resolve_params(params)
 
         cap = max(1000.0, float(initial_capital or 500000.0))
         cost_rate = max(0.0, (float(slippage_bps or 0.0) + float(fee_bps or 0.0)) / 10000.0)
         sl_pct = max(0.0, float(stop_loss_pct or 0.0))
         tp_pct = max(0.0, float(take_profit_pct or 0.0))
+        tsl_pct = max(0.0, float(trailing_sl_pct or 0.0))
+
+        use_real_charges = bool(charges_profile)
+        charges_cfg = None
+        total_charges_acc = None
+        if use_real_charges:
+            from charges.calculator import ChargeBreakdown, charges_engine
+
+            ov = dict(charges_overrides or {})
+            if "slippage_bps" not in ov and slippage_bps is not None:
+                ov["slippage_bps"] = float(slippage_bps)
+            charges_cfg = charges_engine.resolve_config(
+                profile=str(charges_profile),
+                segment=segment or "equity_intraday",
+                overrides=ov,
+            )
+            total_charges_acc = ChargeBreakdown()
 
         today_ist = datetime.now(tz=IST_TZ).date()
         end_str = (to_date or "").strip() or today_ist.isoformat()
@@ -150,6 +191,8 @@ class BacktestEngine:
         entry_price = 0.0
         entry_date = ""
         entry_cost = 0.0
+        entry_leg_charges = None
+        highest_since_entry = 0.0
         trades: List[Dict[str, Any]] = []
         raw_curve: List[Dict[str, Any]] = []
 
@@ -157,6 +200,70 @@ class BacktestEngine:
         max_drawdown_pct = 0.0
         daily_returns: List[float] = []
         prev_equity = cap
+        gross_pnl_total = 0.0
+
+        def _close_trade(exit_px_raw: float, exit_date_str: str, reason: str) -> None:
+            nonlocal cash, shares, entry_price, entry_date, entry_cost, entry_leg_charges, highest_since_entry, gross_pnl_total
+            gross_trade_pnl = (exit_px_raw - entry_price) * shares
+            gross_pnl_total += gross_trade_pnl
+            if use_real_charges and charges_cfg is not None:
+                from charges.calculator import ChargeBreakdown, charges_engine
+
+                sell_leg = charges_engine.calculate_leg(
+                    side="SELL", price=exit_px_raw, quantity=shares, cfg=charges_cfg, include_slippage=True
+                )
+                trade_chg = ChargeBreakdown()
+                if entry_leg_charges is not None:
+                    trade_chg.add(entry_leg_charges)
+                trade_chg.add(sell_leg)
+                if total_charges_acc is not None:
+                    total_charges_acc.add(trade_chg)
+                net_trade_pnl = gross_trade_pnl - trade_chg.total_charges
+                proceeds = (shares * exit_px_raw) - sell_leg.total_charges
+                cash += proceeds
+                ret_pct = (net_trade_pnl / max(1.0, shares * entry_price)) * 100.0
+                trades.append(
+                    {
+                        "symbol": dl_meta["symbol"],
+                        "entry_date": entry_date,
+                        "exit_date": exit_date_str,
+                        "qty": shares,
+                        "entry_price": round(entry_price, 2),
+                        "exit_price": round(exit_px_raw, 2),
+                        "gross_pnl": round(gross_trade_pnl, 2),
+                        "charges": round(trade_chg.total_charges, 2),
+                        "pnl": round(net_trade_pnl, 2),
+                        "return_pct": round(ret_pct, 2),
+                        "exit_reason": reason,
+                    }
+                )
+            else:
+                sell_px = exit_px_raw * (1.0 - cost_rate)
+                proceeds = shares * sell_px
+                pnl = proceeds - (shares * entry_price) - entry_cost
+                ret_pct = ((sell_px - entry_price) / entry_price) * 100.0 if entry_price > 0 else 0.0
+                cash += proceeds
+                trades.append(
+                    {
+                        "symbol": dl_meta["symbol"],
+                        "entry_date": entry_date,
+                        "exit_date": exit_date_str,
+                        "qty": shares,
+                        "entry_price": round(entry_price, 2),
+                        "exit_price": round(exit_px_raw, 2),
+                        "gross_pnl": round(gross_trade_pnl, 2),
+                        "charges": round(gross_trade_pnl - pnl, 2),
+                        "pnl": round(pnl, 2),
+                        "return_pct": round(ret_pct, 2),
+                        "exit_reason": reason,
+                    }
+                )
+            shares = 0
+            entry_price = 0.0
+            entry_date = ""
+            entry_cost = 0.0
+            entry_leg_charges = None
+            highest_since_entry = 0.0
 
         for i, bar in enumerate(rows):
             if cancel_event is not None and (i % 50 == 0) and cancel_event.is_set():
@@ -169,9 +276,14 @@ class BacktestEngine:
             exit_reason = ""
             exit_px = bar_close
             if shares > 0:
+                if bar_high > highest_since_entry:
+                    highest_since_entry = bar_high
                 if sl_pct > 0 and bar_low <= entry_price * (1.0 - sl_pct / 100.0):
                     exit_px = entry_price * (1.0 - sl_pct / 100.0)
                     exit_reason = f"STOP_LOSS (-{sl_pct:.1f}%)"
+                elif tsl_pct > 0 and highest_since_entry > entry_price and bar_low <= highest_since_entry * (1.0 - tsl_pct / 100.0):
+                    exit_px = highest_since_entry * (1.0 - tsl_pct / 100.0)
+                    exit_reason = f"TRAILING_SL (-{tsl_pct:.1f}%)"
                 elif tp_pct > 0 and bar_high >= entry_price * (1.0 + tp_pct / 100.0):
                     exit_px = entry_price * (1.0 + tp_pct / 100.0)
                     exit_reason = f"TAKE_PROFIT (+{tp_pct:.1f}%)"
@@ -179,37 +291,43 @@ class BacktestEngine:
             enter_sig, exit_sig = strat_inst.signal_at(i, bar)
 
             if shares > 0 and (exit_reason or exit_sig):
-                sell_px = exit_px * (1.0 - cost_rate)
-                proceeds = shares * sell_px
-                pnl = proceeds - (shares * entry_price) - entry_cost
-                ret_pct = ((sell_px - entry_price) / entry_price) * 100.0 if entry_price > 0 else 0.0
-                cash += proceeds
-                trades.append(
-                    {
-                        "entry_date": entry_date,
-                        "exit_date": bar_date,
-                        "qty": shares,
-                        "entry_price": round(entry_price, 2),
-                        "exit_price": round(exit_px, 2),
-                        "pnl": round(pnl, 2),
-                        "return_pct": round(ret_pct, 2),
-                        "exit_reason": exit_reason or "STRATEGY_EXIT",
-                    }
-                )
-                shares = 0
-                entry_price = 0.0
-                entry_date = ""
-                entry_cost = 0.0
+                _close_trade(exit_px, bar_date, exit_reason or "STRATEGY_EXIT")
             elif shares == 0 and enter_sig and i < len(rows) - 1:
-                buy_eff = bar_close * (1.0 + cost_rate)
-                qty = int(cash // buy_eff)
-                if qty >= 1:
-                    shares = qty
-                    entry_price = bar_close
-                    entry_date = bar_date
-                    gross = shares * bar_close
-                    entry_cost = gross * cost_rate
-                    cash -= gross + entry_cost
+                if use_real_charges and charges_cfg is not None:
+                    from charges.calculator import charges_engine
+
+                    est_rate = (charges_cfg.slippage_bps / 10000.0) + charges_cfg.stt_buy_pct + charges_cfg.stamp_duty_buy_pct + 0.001
+                    qty = int(max(0.0, cash - charges_cfg.brokerage_flat_per_order * 1.2) // (bar_close * (1.0 + est_rate)))
+                    if qty >= 1:
+                        buy_leg = charges_engine.calculate_leg(
+                            side="BUY", price=bar_close, quantity=qty, cfg=charges_cfg, include_slippage=True
+                        )
+                        total_outlay = (qty * bar_close) + buy_leg.total_charges
+                        if total_outlay > cash and qty > 1:
+                            qty = max(1, int((cash - buy_leg.total_charges) // bar_close))
+                            buy_leg = charges_engine.calculate_leg(
+                                side="BUY", price=bar_close, quantity=qty, cfg=charges_cfg, include_slippage=True
+                            )
+                            total_outlay = (qty * bar_close) + buy_leg.total_charges
+                        if qty >= 1 and total_outlay <= cash:
+                            shares = qty
+                            entry_price = bar_close
+                            entry_date = bar_date
+                            entry_cost = buy_leg.total_charges
+                            entry_leg_charges = buy_leg
+                            highest_since_entry = bar_close
+                            cash -= total_outlay
+                else:
+                    buy_eff = bar_close * (1.0 + cost_rate)
+                    qty = int(cash // buy_eff)
+                    if qty >= 1:
+                        shares = qty
+                        entry_price = bar_close
+                        entry_date = bar_date
+                        gross = shares * bar_close
+                        entry_cost = gross * cost_rate
+                        highest_since_entry = bar_close
+                        cash -= gross + entry_cost
 
             equity = cash + shares * bar_close
             if equity > peak_equity:
@@ -225,24 +343,7 @@ class BacktestEngine:
         if shares > 0:
             last_close = float(rows[-1]["close"])
             last_date = str(rows[-1].get("trade_date") or str(rows[-1].get("ts_ist", ""))[:10])
-            sell_px = last_close * (1.0 - cost_rate)
-            proceeds = shares * sell_px
-            pnl = proceeds - (shares * entry_price) - entry_cost
-            ret_pct = ((sell_px - entry_price) / entry_price) * 100.0 if entry_price > 0 else 0.0
-            cash += proceeds
-            trades.append(
-                {
-                    "entry_date": entry_date,
-                    "exit_date": last_date,
-                    "qty": shares,
-                    "entry_price": round(entry_price, 2),
-                    "exit_price": round(last_close, 2),
-                    "pnl": round(pnl, 2),
-                    "return_pct": round(ret_pct, 2),
-                    "exit_reason": "END_OF_WINDOW",
-                }
-            )
-            shares = 0
+            _close_trade(last_close, last_date, "END_OF_WINDOW")
 
         final_equity = cash
         net_pnl = final_equity - cap
@@ -282,12 +383,31 @@ class BacktestEngine:
             progress_cb(100, 100, f"Backtest finished ({len(trades)} trades, Net PnL ₹{net_pnl:,.2f}).")
 
         storage_meta = self._hist.storage_info()
+        charges_breakdown = (
+            total_charges_acc.to_dict()
+            if total_charges_acc is not None
+            else {
+                "turnover": round(sum((t["entry_price"] + t["exit_price"]) * t["qty"] for t in trades), 2),
+                "brokerage": 0.0,
+                "stt": 0.0,
+                "exchange_txn": 0.0,
+                "sebi_fee": 0.0,
+                "gst": 0.0,
+                "stamp_duty": 0.0,
+                "dp_charges": 0.0,
+                "slippage_cost": round(gross_pnl_total - net_pnl, 2),
+                "statutory_and_brokerage": 0.0,
+                "total_charges": round(gross_pnl_total - net_pnl, 2),
+            }
+        )
+
         return {
             "ok": True,
             "symbol": dl_meta["symbol"],
             "exchange": dl_meta["exchange"],
             "strategy": strat_inst.id,
             "strategy_label": strat_inst.name,
+            "strategy_mode": strat_mode,
             "params": resolved_params,
             "timeframe": tf,
             "base_timeframe": base_tf,
@@ -302,6 +422,11 @@ class BacktestEngine:
             "existing_days_skipped": int(dl_meta.get("existing_days_skipped", 0)),
             "initial_capital": round(cap, 2),
             "final_equity": round(final_equity, 2),
+            "gross_pnl": round(gross_pnl_total, 2),
+            "total_charges": round(float(charges_breakdown["total_charges"]), 2),
+            "charges_profile": charges_profile or "flat_bps",
+            "segment": segment,
+            "charges_breakdown": charges_breakdown,
             "net_pnl": round(net_pnl, 2),
             "total_return_pct": round(total_return_pct, 2),
             "cagr_pct": round(cagr_pct, 2),
@@ -312,6 +437,23 @@ class BacktestEngine:
             "profit_factor": round(profit_factor, 2),
             "equity_curve": curve,
             "trades": trades,
+            "deploy_spec": {
+                "strategy_id": strat_inst.id,
+                "strategy_name": strat_inst.name,
+                "strategy_mode": strat_mode,
+                "rule_def": rule_def,
+                "params": resolved_params,
+                "symbols": [dl_meta["symbol"]],
+                "exchange": dl_meta["exchange"],
+                "timeframe": tf,
+                "initial_capital": round(cap, 2),
+                "stop_loss_pct": sl_pct,
+                "take_profit_pct": tp_pct,
+                "trailing_sl_pct": tsl_pct,
+                "charges_profile": charges_profile or "zerodha",
+                "segment": segment,
+                "charges_overrides": charges_overrides or {},
+            },
             "generated_at_ist": datetime.now(tz=IST_TZ).isoformat(timespec="seconds"),
         }
 

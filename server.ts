@@ -173,11 +173,18 @@ async function proxyToPython(req: Request, res: Response): Promise<void> {
       headers['content-type'] = 'application/json';
     }
 
+    const isLongRoute =
+      req.originalUrl.startsWith('/api/streak/backtest') ||
+      req.originalUrl.startsWith('/api/streak/technicals') ||
+      req.originalUrl.startsWith('/api/analytics/screener') ||
+      req.originalUrl.startsWith('/api/analytics/backtest');
     const upstream = await fetch(targetUrl, {
       method,
       headers,
       body,
-      signal: req.originalUrl.startsWith('/api/live/stream') ? undefined : AbortSignal.timeout(15000),
+      signal: req.originalUrl.startsWith('/api/live/stream')
+        ? undefined
+        : AbortSignal.timeout(isLongRoute ? 60000 : 15000),
     });
 
     const contentType = upstream.headers.get('content-type') || 'application/json';

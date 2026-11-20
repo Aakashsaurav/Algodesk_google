@@ -771,6 +771,200 @@ def create_app() -> FastAPI:
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    # ── Phase 6: Full Streak Platform Routes ──────────────────────────────
+
+    @app.get("/api/streak/meta")
+    def api_streak_meta() -> dict:
+        return hub_service.get_streak_meta()
+
+    @app.get("/api/streak/discover")
+    def api_streak_discover(category: Optional[str] = Query(default=None), mode: Optional[str] = Query(default=None)) -> dict:
+        return hub_service.list_discover(category=category, mode=mode)
+
+    @app.get("/api/streak/rules")
+    def api_streak_rules(kind: Optional[str] = Query(default=None)) -> dict:
+        return hub_service.list_visual_rules(kind=kind)
+
+    @app.post("/api/streak/rules")
+    def api_streak_rules_save(payload: Dict[str, Any]) -> dict:
+        try:
+            return hub_service.save_visual_rule(payload)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.delete("/api/streak/rules/{rule_id}")
+    def api_streak_rules_delete(rule_id: str) -> dict:
+        return hub_service.delete_visual_rule(rule_id)
+
+    @app.post("/api/streak/rules/export-python")
+    def api_streak_rules_export(payload: Dict[str, Any]) -> dict:
+        try:
+            rule_obj = payload.get("rule_def") if isinstance(payload.get("rule_def"), dict) else payload
+            return hub_service.export_visual_rule_to_python(rule_obj, save_to_disk=bool(payload.get("save_to_disk", False)))
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/streak/baskets")
+    def api_streak_baskets() -> dict:
+        return hub_service.list_baskets()
+
+    @app.post("/api/streak/baskets")
+    def api_streak_baskets_save(payload: Dict[str, Any]) -> dict:
+        try:
+            return hub_service.save_basket(payload)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.delete("/api/streak/baskets/{basket_id}")
+    def api_streak_baskets_delete(basket_id: str) -> dict:
+        return hub_service.delete_basket(basket_id)
+
+    @app.post("/api/streak/charges/preview")
+    def api_streak_charges_preview(payload: Dict[str, Any]) -> dict:
+        try:
+            return hub_service.preview_charges(
+                entry_price=float(payload.get("entry_price", 1000.0) or 1000.0),
+                exit_price=float(payload.get("exit_price", 1025.0) or 1025.0),
+                quantity=int(payload.get("quantity", 100) or 100),
+                profile=str(payload.get("profile", "zerodha")),
+                segment=str(payload.get("segment", "equity_intraday")),
+                direction=str(payload.get("direction", "LONG")),
+                overrides=payload.get("overrides") if isinstance(payload.get("overrides"), dict) else None,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/streak/backtest")
+    def api_streak_backtest(payload: Dict[str, Any], async_job: Optional[bool] = Query(default=None)) -> dict:
+        is_async = bool(payload.get("async_job", False)) if async_job is None else async_job
+        try:
+            return hub_service.run_streak_backtest(
+                mode=str(payload.get("mode", "portfolio")),
+                symbols=payload.get("symbols") if isinstance(payload.get("symbols"), list) else None,
+                basket_id=payload.get("basket_id"),
+                universe=payload.get("universe"),
+                exchange=str(payload.get("exchange", "NSE")),
+                strategy=str(payload.get("strategy", "ema_crossover")),
+                rule_def=payload.get("rule_def") if isinstance(payload.get("rule_def"), dict) else None,
+                params=payload.get("params") if isinstance(payload.get("params"), dict) else None,
+                timeframe=str(payload.get("timeframe", "1day")),
+                from_date=payload.get("from_date"),
+                to_date=payload.get("to_date"),
+                initial_capital=float(payload.get("initial_capital", 500000.0) or 500000.0),
+                allocation_mode=str(payload.get("allocation_mode", "shared_pool")),
+                max_open_positions=int(payload.get("max_open_positions", 5) or 5),
+                risk_per_trade_pct=float(payload.get("risk_per_trade_pct", 1.5) or 1.5),
+                signal_ranking=str(payload.get("signal_ranking", "momentum")),
+                stop_loss_pct=float(payload.get("stop_loss_pct", 3.0) or 3.0),
+                take_profit_pct=float(payload.get("take_profit_pct", 7.0) or 7.0),
+                trailing_sl_pct=float(payload.get("trailing_sl_pct", 0.0) or 0.0),
+                charges_profile=str(payload.get("charges_profile", "zerodha")),
+                segment=str(payload.get("segment", "equity_intraday")),
+                charges_overrides=payload.get("charges_overrides") if isinstance(payload.get("charges_overrides"), dict) else None,
+                slippage_bps=float(payload.get("slippage_bps", 5.0) or 5.0),
+                provider=payload.get("provider"),
+                backend=str(payload.get("backend", "auto")),
+                async_job=is_async,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/streak/backtest/runs")
+    def api_streak_backtest_runs(limit: int = Query(default=20)) -> dict:
+        return hub_service.list_backtest_runs(limit=limit)
+
+    @app.post("/api/streak/technicals")
+    def api_streak_technicals(payload: Dict[str, Any]) -> dict:
+        try:
+            return hub_service.analyze_technicals(
+                symbol=str(payload.get("symbol", "RELIANCE")),
+                exchange=str(payload.get("exchange", "NSE")),
+                timeframe=str(payload.get("timeframe", "1day")),
+                provider=payload.get("provider"),
+                backend=str(payload.get("backend", "auto")),
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/streak/options/template")
+    def api_streak_options_template(payload: Dict[str, Any]) -> dict:
+        try:
+            return hub_service.build_options_template(
+                template_id=str(payload.get("template_id", "iron_condor")),
+                spot=float(payload.get("spot", 24000.0) or 24000.0),
+                step=float(payload.get("step", 100.0) or 100.0),
+                lot_size=int(payload.get("lot_size", 75) or 75),
+                dte_days=float(payload.get("dte_days", 7.0) or 7.0),
+                iv_pct=float(payload.get("iv_pct", 15.0) or 15.0),
+                charges_profile=str(payload.get("charges_profile", "zerodha")),
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/streak/options/analyze")
+    def api_streak_options_analyze(payload: Dict[str, Any]) -> dict:
+        try:
+            return hub_service.analyze_options(
+                spot=float(payload.get("spot", 24000.0) or 24000.0),
+                legs=payload.get("legs") if isinstance(payload.get("legs"), list) else [],
+                dte_days=float(payload.get("dte_days", 7.0) or 7.0),
+                risk_free_rate=float(payload.get("risk_free_rate", 0.068) or 0.068),
+                charges_profile=str(payload.get("charges_profile", "zerodha")),
+                charges_overrides=payload.get("charges_overrides") if isinstance(payload.get("charges_overrides"), dict) else None,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/streak/deployments")
+    def api_streak_deployments() -> dict:
+        return hub_service.list_deployments()
+
+    @app.post("/api/streak/deployments/start")
+    def api_streak_deployments_start(payload: Dict[str, Any]) -> dict:
+        try:
+            return hub_service.start_deployment(payload)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/streak/deployments/{deployment_id}/action")
+    def api_streak_deployments_action(deployment_id: str, payload: Dict[str, Any]) -> dict:
+        try:
+            return hub_service.control_deployment(deployment_id, str(payload.get("action", "")))
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.delete("/api/streak/deployments/{deployment_id}")
+    def api_streak_deployments_delete(deployment_id: str) -> dict:
+        try:
+            return hub_service.control_deployment(deployment_id, "delete")
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/streak/deployments/alerts/{alert_id}/action")
+    def api_streak_deployments_alert_action(alert_id: str, payload: Dict[str, Any]) -> dict:
+        try:
+            return hub_service.resolve_deployment_alert(alert_id, str(payload.get("action", "")))
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.websocket("/ws/deployments")
+    async def ws_deployments(websocket: WebSocket) -> None:
+        await websocket.accept()
+        listener_q = hub_service.register_deployments_listener()
+        try:
+            initial = hub_service.list_deployments()
+            await websocket.send_text(json.dumps({"type": "deployments:state", **initial}))
+            while True:
+                try:
+                    event = listener_q.get_nowait()
+                    await websocket.send_text(json.dumps(event))
+                except queue.Empty:
+                    await asyncio.sleep(0.2)
+        except WebSocketDisconnect:
+            pass
+        finally:
+            hub_service.unregister_deployments_listener(listener_q)
+
     return app
 
 

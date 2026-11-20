@@ -25,11 +25,14 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
 from backtest.engine import backtest_engine
+from backtest.portfolio import VALID_ALLOCATION_MODES, VALID_SIGNAL_RANKINGS, portfolio_backtest_engine
 from backtest.registry import strategy_registry
+from baskets.store import basket_store
 from broker.base import BrokerHealthSnapshot, ConnectionState
 from broker.registry import BrokerRegistry, SelectionStore
 from broker.upstox.auth import auth_manager as upstox_auth_manager
 from broker.zerodha.auth import zerodha_auth_manager
+from charges.calculator import charges_engine, list_charge_presets
 from config import IST_TZ, config
 from core.audit import audit_trail
 from core.feed_manager import feed_manager
@@ -37,13 +40,23 @@ from core.historical import historical_data_manager
 from core.instruments import instrument_index
 from core.jobs import analytics_job_runner
 from core.preflight import PreflightChecker, kill_switch_controller
+from deploy.manager import deployment_manager
+from discover.catalog import list_discover_catalog
 from indicators.toolkit import available_backends, backend_diagnostics, refresh_backend_cache
+from options.payoff import OPTIONS_TEMPLATES, analyze_options_strategy, build_template_legs
 from risk.limits import risk_limit_manager
+from rules.engine import (
+    SUPPORTED_OPERANDS,
+    SUPPORTED_OPERATORS,
+    export_rule_to_python,
+    visual_rule_store,
+)
 from screener.engine import screener_engine
 from screener.live_engine import live_screener_engine
 from screener.nse_universe_sync import nse_universe_sync
 from screener.registry import screen_registry
 from screener.universes import DEFAULT_WATCHLIST, universe_resolver
+from technicals.analyzer import technicals_analyzer
 
 logger = logging.getLogger(__name__)
 
@@ -956,6 +969,297 @@ class BrokerHubService:
     def update_risk_limits(self, updates: Dict[str, Any]) -> Dict[str, Any]:
         risk_limit_manager.save_limits(updates, actor="operator")
         return self.get_risk_status()
+
+    # ── Phase 6: Full Streak Platform (Visual + Python, Portfolio Backtest,
+    #    Real Charges, Options Payoff, Technicals, Baskets, Discover, Deploy) ─
+
+    def get_streak_meta(self) -> Dict[str, Any]:
+        analytics = self.get_analytics_metadata()
+        return {
+            "ok": True,
+            "selections": analytics["selections"],
+            "screens": analytics["screens"],
+            "strategy_specs": analytics["strategy_specs"],
+            "universes": analytics["universes"],
+            "timeframes": analytics["timeframes"],
+            "indicator_backends": analytics["indicator_backends"],
+            "charge_presets": list_charge_presets(),
+            "allocation_modes": [
+                {"id": "shared_pool", "label": "Shared Pool + Max Positions + Signal Ranking"},
+                {"id": "equal_split", "label": "Equal Capital Split Across Slots"},
+                {"id": "risk_based", "label": "Risk-Based Sizing (% Risk / Stop-Loss)"},
+            ],
+            "signal_rankings": [
+                {"id": "momentum", "label": "Momentum (10-Bar ROC)"},
+                {"id": "score", "label": "Signal Strength / Score"},
+                {"id": "alphabetical", "label": "Alphabetical (Deterministic)"},
+            ],
+            "visual_operands": SUPPORTED_OPERANDS,
+            "visual_operators": SUPPORTED_OPERATORS,
+            "visual_rules": visual_rule_store.list_rules(),
+            "baskets": basket_store.list_baskets(),
+            "discover": list_discover_catalog(),
+            "options_templates": OPTIONS_TEMPLATES,
+            "recent_backtests": portfolio_backtest_engine.list_runs(limit=15),
+            "deployments_summary": deployment_manager.list_deployments()["summary"],
+        }
+
+    def list_discover(self, category: Optional[str] = None, mode: Optional[str] = None) -> Dict[str, Any]:
+        return {"ok": True, "items": list_discover_catalog(category=category, mode=mode)}
+
+    def list_visual_rules(self, kind: Optional[str] = None) -> Dict[str, Any]:
+        return {"ok": True, "rules": visual_rule_store.list_rules(kind=kind)}
+
+    def save_visual_rule(self, rule_def: Dict[str, Any]) -> Dict[str, Any]:
+        saved = visual_rule_store.save(rule_def)
+        return {"ok": True, "rule": saved, "rules": visual_rule_store.list_rules()}
+
+    def delete_visual_rule(self, rule_id: str) -> Dict[str, Any]:
+        res = visual_rule_store.delete(rule_id)
+        return {**res, "rules": visual_rule_store.list_rules()}
+
+    def export_visual_rule_to_python(self, rule_def: Dict[str, Any], save_to_disk: bool = False) -> Dict[str, Any]:
+        code = export_rule_to_python(rule_def)
+        saved_path = ""
+        if save_to_disk:
+            kind = str(rule_def.get("kind") or "strategy").strip().lower()
+            raw_id = str(rule_def.get("id") or rule_def.get("name") or "custom_rule").strip().lower()
+            slug = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in raw_id).strip("_") or "custom_rule"
+            target_dir = screen_registry.screens_dir if kind == "screen" else strategy_registry.strategies_dir
+            target_dir.mkdir(parents=True, exist_ok=True)
+            out_file = target_dir / f"{slug}.py"
+            out_file.write_text(code, encoding="utf-8")
+            saved_path = str(out_file)
+            if kind == "screen":
+                screen_registry.refresh_if_changed(force=True)
+            else:
+                strategy_registry.refresh_if_changed(force=True)
+        return {"ok": True, "code": code, "saved_path": saved_path}
+
+    def list_baskets(self) -> Dict[str, Any]:
+        return {"ok": True, "baskets": basket_store.list_baskets()}
+
+    def save_basket(self, basket_def: Dict[str, Any]) -> Dict[str, Any]:
+        saved = basket_store.save(basket_def)
+        return {"ok": True, "basket": saved, "baskets": basket_store.list_baskets()}
+
+    def delete_basket(self, basket_id: str) -> Dict[str, Any]:
+        res = basket_store.delete(basket_id)
+        return {**res, "baskets": basket_store.list_baskets()}
+
+    def run_streak_backtest(
+        self,
+        *,
+        mode: str = "portfolio",
+        symbols: Optional[List[str]] = None,
+        basket_id: Optional[str] = None,
+        universe: Optional[str] = None,
+        exchange: str = "NSE",
+        strategy: str = "ema_crossover",
+        rule_def: Optional[Dict[str, Any]] = None,
+        params: Optional[Dict[str, Any]] = None,
+        timeframe: str = "1day",
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None,
+        initial_capital: float = 500000.0,
+        allocation_mode: str = "shared_pool",
+        max_open_positions: int = 5,
+        risk_per_trade_pct: float = 1.5,
+        signal_ranking: str = "momentum",
+        stop_loss_pct: float = 3.0,
+        take_profit_pct: float = 7.0,
+        trailing_sl_pct: float = 0.0,
+        charges_profile: str = "zerodha",
+        segment: str = "equity_intraday",
+        charges_overrides: Optional[Dict[str, Any]] = None,
+        slippage_bps: float = 5.0,
+        provider: Optional[str] = None,
+        backend: str = "auto",
+        async_job: bool = False,
+    ) -> Dict[str, Any]:
+        sel = self._store.load()
+        eff_provider = (provider or sel.get("data_connection") or "yfinance").strip().lower()
+        meta = {
+            "mode": mode,
+            "strategy": strategy,
+            "allocation_mode": allocation_mode,
+            "timeframe": timeframe,
+            "provider": eff_provider,
+            "charges_profile": charges_profile,
+        }
+
+        def _task(progress_cb, cancel_ev):
+            return portfolio_backtest_engine.run(
+                mode=mode,
+                symbols=symbols,
+                basket_id=basket_id,
+                universe=universe,
+                exchange=exchange,
+                strategy=strategy,
+                rule_def=rule_def,
+                params=params,
+                timeframe=timeframe,
+                from_date=from_date,
+                to_date=to_date,
+                initial_capital=initial_capital,
+                allocation_mode=allocation_mode,
+                max_open_positions=max_open_positions,
+                risk_per_trade_pct=risk_per_trade_pct,
+                signal_ranking=signal_ranking,
+                stop_loss_pct=stop_loss_pct,
+                take_profit_pct=take_profit_pct,
+                trailing_sl_pct=trailing_sl_pct,
+                charges_profile=charges_profile,
+                segment=segment,
+                charges_overrides=charges_overrides,
+                slippage_bps=slippage_bps,
+                provider=eff_provider,
+                backend=backend,
+                progress_cb=progress_cb,
+                cancel_event=cancel_ev,
+            )
+
+        if async_job:
+            job = analytics_job_runner.submit("portfolio_backtest", meta, _task)
+            return {"ok": True, "async": True, "job": job}
+
+        job = analytics_job_runner.run_sync("portfolio_backtest", meta, _task)
+        return {"ok": True, "async": False, "job": job, **(job["result"] or {})}
+
+    def list_backtest_runs(self, limit: int = 20) -> Dict[str, Any]:
+        return {"ok": True, "runs": portfolio_backtest_engine.list_runs(limit=limit)}
+
+    def analyze_technicals(
+        self,
+        *,
+        symbol: str,
+        exchange: str = "NSE",
+        timeframe: str = "1day",
+        provider: Optional[str] = None,
+        backend: str = "auto",
+    ) -> Dict[str, Any]:
+        sel = self._store.load()
+        eff_provider = (provider or sel.get("data_connection") or "yfinance").strip().lower()
+        return technicals_analyzer.analyze(
+            symbol=symbol,
+            exchange=exchange,
+            timeframe=timeframe,
+            provider=eff_provider,
+            backend=backend,
+        )
+
+    def build_options_template(
+        self,
+        *,
+        template_id: str,
+        spot: float,
+        step: float = 50.0,
+        lot_size: int = 75,
+        dte_days: float = 7.0,
+        iv_pct: float = 16.0,
+        charges_profile: str = "zerodha",
+    ) -> Dict[str, Any]:
+        legs = build_template_legs(
+            template_id=template_id,
+            spot=spot,
+            step=step,
+            lot_size=lot_size,
+            dte_days=dte_days,
+            iv_pct=iv_pct,
+        )
+        analysis = analyze_options_strategy(
+            spot=spot,
+            legs=legs,
+            dte_days=dte_days,
+            charges_profile=charges_profile,
+        )
+        return {"ok": True, "template_id": template_id, "legs": legs, "analysis": analysis}
+
+    def analyze_options(
+        self,
+        *,
+        spot: float,
+        legs: List[Dict[str, Any]],
+        dte_days: float = 7.0,
+        risk_free_rate: float = 0.068,
+        charges_profile: str = "zerodha",
+        charges_overrides: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        return analyze_options_strategy(
+            spot=spot,
+            legs=legs,
+            dte_days=dte_days,
+            risk_free_rate=risk_free_rate,
+            charges_profile=charges_profile,
+            charges_overrides=charges_overrides,
+        )
+
+    def preview_charges(
+        self,
+        *,
+        entry_price: float,
+        exit_price: float,
+        quantity: int,
+        profile: str = "zerodha",
+        segment: str = "equity_intraday",
+        direction: str = "LONG",
+        overrides: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        cfg = charges_engine.resolve_config(profile=profile, segment=segment, overrides=overrides)
+        return {
+            "ok": True,
+            "config": cfg.to_dict(),
+            **charges_engine.calculate_round_trip(
+                entry_price=entry_price,
+                exit_price=exit_price,
+                quantity=quantity,
+                cfg=cfg,
+                direction=direction,
+            ),
+        }
+
+    def list_deployments(self) -> Dict[str, Any]:
+        return deployment_manager.list_deployments()
+
+    def start_deployment(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        sel = self._store.load()
+        eff_provider = (payload.get("provider") or sel.get("data_connection") or "yfinance").strip().lower()
+        return deployment_manager.deploy(
+            name=payload.get("name"),
+            exec_mode=str(payload.get("exec_mode") or "paper"),
+            strategy_id=str(payload.get("strategy_id") or payload.get("strategy") or "ema_crossover"),
+            rule_def=payload.get("rule_def") if isinstance(payload.get("rule_def"), dict) else None,
+            params=payload.get("params") if isinstance(payload.get("params"), dict) else None,
+            symbols=payload.get("symbols") if isinstance(payload.get("symbols"), list) else None,
+            exchange=str(payload.get("exchange") or "NSE"),
+            timeframe=str(payload.get("timeframe") or "1day"),
+            initial_capital=float(payload.get("initial_capital") or 500000.0),
+            allocation_mode=str(payload.get("allocation_mode") or "shared_pool"),
+            max_open_positions=int(payload.get("max_open_positions") or 5),
+            risk_per_trade_pct=float(payload.get("risk_per_trade_pct") or 1.5),
+            stop_loss_pct=float(payload.get("stop_loss_pct") or 3.0),
+            take_profit_pct=float(payload.get("take_profit_pct") or 7.0),
+            trailing_sl_pct=float(payload.get("trailing_sl_pct") or 0.0),
+            charges_profile=str(payload.get("charges_profile") or "zerodha"),
+            segment=str(payload.get("segment") or "equity_intraday"),
+            charges_overrides=payload.get("charges_overrides") if isinstance(payload.get("charges_overrides"), dict) else None,
+            product=str(payload.get("product") or "MIS"),
+            provider=eff_provider,
+            poll_interval_sec=float(payload.get("poll_interval_sec") or 2.0),
+            backtest_run_id=payload.get("backtest_run_id"),
+        )
+
+    def control_deployment(self, deployment_id: str, action: str) -> Dict[str, Any]:
+        return deployment_manager.control(deployment_id, action)
+
+    def resolve_deployment_alert(self, alert_id: str, action: str) -> Dict[str, Any]:
+        return deployment_manager.resolve_alert(alert_id, action)
+
+    def register_deployments_listener(self):
+        return deployment_manager.register_listener()
+
+    def unregister_deployments_listener(self, q) -> None:
+        deployment_manager.unregister_listener(q)
 
 
 hub_service = BrokerHubService()

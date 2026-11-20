@@ -1068,6 +1068,18 @@ class HotStandbyFeedManager:
         """Release temporary Live Screen symbols from the Broker WebSocket."""
         self._broker_ws.release_scope("live_screen")
 
+    def ensure_deploy_ws(self, broker_id: str, subs: List[Dict[str, str]]) -> bool:
+        """Subscribe Deployed Strategy symbols onto the shared persistent Broker WebSocket."""
+        bid = (broker_id or "").strip().lower()
+        if not self._can_use_broker_ws(bid) or not subs:
+            return False
+        self._broker_ws.set_scope_subscriptions(bid, "deploy", subs)
+        return True
+
+    def release_deploy_ws(self) -> None:
+        """Release Deployed Strategy symbols from the Broker WebSocket."""
+        self._broker_ws.release_scope("deploy")
+
     def _on_broker_ws_ticks(
         self,
         broker_id: str,
@@ -1399,6 +1411,7 @@ class HotStandbyFeedManager:
         exchange: str = "NSE",
         provider: Optional[str] = None,
         batch_size: int = 40,
+        ws_scope: str = "live_screen",
     ) -> Dict[str, Any]:
         """
         Fetch live quotes for an arbitrary list of symbols using the active
@@ -1458,7 +1471,7 @@ class HotStandbyFeedManager:
         for fid in candidates:
             # 1) Prefer persistent Broker WebSocket push cache (ZERO REST API calls!)
             if self._can_use_broker_ws(fid):
-                self._broker_ws.set_scope_subscriptions(fid, "live_screen", subs)
+                self._broker_ws.set_scope_subscriptions(fid, ws_scope or "live_screen", subs)
                 if self._broker_ws.is_connected(fid):
                     ws_quotes, ws_lat = self._broker_ws.get_cached_quotes(
                         fid,
