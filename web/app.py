@@ -1118,6 +1118,8 @@ def create_app() -> FastAPI:
     def spa_static_or_fallback(full_path: str) -> Response:
         if full_path.startswith(("api/", "ws/", "auth/")):
             raise HTTPException(status_code=404, detail="Not Found")
+        if full_path in {"favicon.ico", "apple-touch-icon.png", "apple-touch-icon-precomposed.png"}:
+            return Response(status_code=204)
         asset = resolve_spa_asset(full_path)
         if asset is not None:
             raw_bytes, content_type, cache_control = asset

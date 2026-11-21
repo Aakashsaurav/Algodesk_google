@@ -786,6 +786,29 @@ class TestStreakScannerAndStrategyParity(unittest.TestCase):
         self.assertTrue(src["ok"])
         self.assertIn("class ", src["code"])
 
+    def test_spa_bundle_integrity_rejects_missing_assets(self) -> None:
+        from web.spa import is_complete_spa_bundle
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "assets").mkdir()
+            (root / "index.html").write_text(
+                '<!doctype html><html><head>'
+                '<script type="module" src="/assets/index-ABC123.js"></script>'
+                '<link rel="stylesheet" href="/assets/index-XYZ789.css">'
+                '</head><body><div id="root"></div></body></html>',
+                encoding="utf-8",
+            )
+            # Missing JS and CSS must be rejected so server never serves a blank screen
+            self.assertFalse(is_complete_spa_bundle(root))
+
+            (root / "assets" / "index-ABC123.js").write_text("console.log('ok');", encoding="utf-8")
+            # Still missing CSS
+            self.assertFalse(is_complete_spa_bundle(root))
+
+            (root / "assets" / "index-XYZ789.css").write_text("body{}", encoding="utf-8")
+            self.assertTrue(is_complete_spa_bundle(root))
+
 
 if __name__ == "__main__":
     unittest.main()

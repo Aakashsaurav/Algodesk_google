@@ -36,7 +36,7 @@ from core.ws_protocol import (
     send_ws_text,
 )
 from web.service import hub_service
-from web.spa import has_spa_bundle, render_spa_html, resolve_spa_asset
+from web.spa import ensure_spa_bundle, has_spa_bundle, render_spa_html, resolve_spa_asset
 
 logger = logging.getLogger(__name__)
 TEMPLATE_PATH = Path(__file__).resolve().parent / "templates" / "index.html"
@@ -580,6 +580,12 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
                 )
             return
 
+        if path in {"/favicon.ico", "/apple-touch-icon.png", "/apple-touch-icon-precomposed.png"}:
+            self.send_response(204)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
         asset = resolve_spa_asset(path)
         if asset is not None:
             raw_bytes, content_type, cache_control = asset
@@ -1021,6 +1027,7 @@ class _AlgoDeskHTTPServer(ThreadingHTTPServer):
 
 def run_server(host: str = "127.0.0.1", port: int = 8000, open_browser: bool = True) -> None:
     setup_logging()
+    ensure_spa_bundle(auto_build=True)
     url = f"http://{host}:{port}"
     logger.info("Starting AlgoDesk Broker & Data Hub at %s", url)
 
