@@ -36,9 +36,12 @@ export interface VisualOperandSpec {
   param2?: number;
   offset?: number;
   value?: number;
+  expr?: string;
 }
 
 export interface VisualCondition {
+  kind?: 'formula' | 'structured';
+  expression?: string;
   left: VisualOperandSpec;
   operator: string;
   right: VisualOperandSpec;
@@ -312,8 +315,11 @@ export interface BacktestRunSummary {
 
 export interface BacktestTradeRow {
   symbol?: string;
+  side?: 'LONG' | 'SHORT';
   entry_date: string;
   exit_date: string;
+  entry_bar_idx?: number;
+  exit_bar_idx?: number;
   qty: number;
   entry_price: number;
   exit_price: number;
@@ -326,6 +332,12 @@ export interface BacktestTradeRow {
 
 export interface BacktestFullResult extends BacktestRunSummary {
   ok: boolean;
+  side?: 'LONG' | 'SHORT';
+  holding_type?: string;
+  start_time?: string | null;
+  end_time?: string | null;
+  indicator_columns?: string[];
+  has_ohlcv_export?: boolean;
   cagr_pct: number;
   sharpe_ratio: number;
   profit_factor: number;

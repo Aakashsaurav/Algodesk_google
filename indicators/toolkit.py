@@ -505,6 +505,7 @@ class IndicatorToolkit:
         self.closes = [float(c["close"]) for c in candles]
         self.volumes = [float(c.get("volume") or 0) for c in candles]
         self._cache: Dict[Tuple[Any, ...], Any] = {}
+        self.recorded_series: Dict[str, List[Optional[float]]] = {}
 
         self._talib = _try_import("talib")
         self._pta = _try_import("pandas_ta")
@@ -560,6 +561,13 @@ class IndicatorToolkit:
             return self.backend_pref == lib_name
         return True
 
+    def _record_series(self, label: str, values: List[Optional[float]]) -> None:
+        if label not in self.recorded_series:
+            self.recorded_series[label] = values
+
+    def get_recorded_series(self) -> Dict[str, List[Optional[float]]]:
+        return dict(self.recorded_series)
+
     def sma(self, period: int = 20) -> List[Optional[float]]:
         key = ("sma", period)
         if key in self._cache:
@@ -577,6 +585,7 @@ class IndicatorToolkit:
         if out is None:
             out = compute_sma_series(self.closes, period)
         self._cache[key] = out
+        self._record_series(f"SMA({period})", out)
         return out
 
     def ema(self, period: int = 20) -> List[Optional[float]]:
@@ -596,6 +605,7 @@ class IndicatorToolkit:
         if out is None:
             out = compute_ema_series(self.closes, period)
         self._cache[key] = out
+        self._record_series(f"EMA({period})", out)
         return out
 
     def rsi(self, period: int = 14) -> List[Optional[float]]:
@@ -615,6 +625,7 @@ class IndicatorToolkit:
         if out is None:
             out = compute_rsi_wilder_series(self.closes, period)
         self._cache[key] = out
+        self._record_series(f"RSI({period})", out)
         return out
 
     def atr(self, period: int = 14) -> Tuple[List[Optional[float]], List[Optional[float]]]:
@@ -650,6 +661,8 @@ class IndicatorToolkit:
         if atr_vals is None:
             res = compute_atr_series(self.candles, period)
             self._cache[key] = res
+            self._record_series(f"ATR({period})", res[0])
+            self._record_series(f"ATR_Pct({period})", res[1])
             return res
         atr_pct = [
             ((atr_vals[i] / self.closes[i]) * 100.0 if (atr_vals[i] is not None and self.closes[i] > 0) else None)
@@ -657,6 +670,8 @@ class IndicatorToolkit:
         ]
         res = (atr_vals, atr_pct)
         self._cache[key] = res
+        self._record_series(f"ATR({period})", atr_vals)
+        self._record_series(f"ATR_Pct({period})", atr_pct)
         return res
 
     def macd(self, fast: int = 12, slow: int = 26, signal: int = 9) -> Dict[str, List[Optional[float]]]:
@@ -699,6 +714,9 @@ class IndicatorToolkit:
         if out is None:
             out = compute_macd_series(self.closes, fast=fast, slow=slow, signal=signal)
         self._cache[key] = out
+        self._record_series(f"MACD({fast},{slow},{signal})", out["macd"])
+        self._record_series(f"MACD_Signal({fast},{slow},{signal})", out["signal"])
+        self._record_series(f"MACD_Hist({fast},{slow},{signal})", out["hist"])
         return out
 
     def bbands(self, period: int = 20, std_dev: float = 2.0) -> Dict[str, List[Optional[float]]]:
@@ -740,6 +758,9 @@ class IndicatorToolkit:
         if out is None:
             out = compute_bbands_series(self.closes, period=period, std_dev=std_dev)
         self._cache[key] = out
+        self._record_series(f"BB_Upper({period},{std_dev:g})", out["upper"])
+        self._record_series(f"BB_Middle({period},{std_dev:g})", out["middle"])
+        self._record_series(f"BB_Lower({period},{std_dev:g})", out["lower"])
         return out
 
     def supertrend(self, period: int = 10, multiplier: float = 3.0) -> Tuple[List[int], List[Optional[float]]]:
@@ -748,6 +769,8 @@ class IndicatorToolkit:
             return self._cache[key]
         res = compute_supertrend_series(self.candles, period=period, multiplier=multiplier)
         self._cache[key] = res
+        self._record_series(f"Supertrend_Dir({period},{multiplier:g})", [float(d) if d != 0 else None for d in res[0]])
+        self._record_series(f"Supertrend({period},{multiplier:g})", res[1])
         return res
 
     def adx(self, period: int = 14) -> Dict[str, List[Optional[float]]]:
@@ -779,6 +802,9 @@ class IndicatorToolkit:
         if out is None:
             out = compute_adx_series(self.candles, period=period)
         self._cache[key] = out
+        self._record_series(f"ADX({period})", out["adx"])
+        self._record_series(f"Plus_DI({period})", out["plus_di"])
+        self._record_series(f"Minus_DI({period})", out["minus_di"])
         return out
 
     def stoch(self, k_period: int = 14, d_period: int = 3) -> Dict[str, List[Optional[float]]]:
@@ -787,6 +813,8 @@ class IndicatorToolkit:
             return self._cache[key]
         res = compute_stoch_series(self.candles, k_period=k_period, d_period=d_period)
         self._cache[key] = res
+        self._record_series(f"Stoch_K({k_period},{d_period})", res["k"])
+        self._record_series(f"Stoch_D({k_period},{d_period})", res["d"])
         return res
 
     def roc(self, period: int = 10) -> List[Optional[float]]:
@@ -802,18 +830,21 @@ class IndicatorToolkit:
         if out is None:
             out = compute_roc_series(self.closes, period=period)
         self._cache[key] = out
+        self._record_series(f"ROC({period})", out)
         return out
 
     def rolling_high(self, window: int) -> List[Optional[float]]:
         key = ("rolling_high", window)
         if key not in self._cache:
             self._cache[key] = rolling_extrema(self.highs, window, find_max=True)
+            self._record_series(f"RollingHigh({window})", self._cache[key])
         return self._cache[key]
 
     def rolling_low(self, window: int) -> List[Optional[float]]:
         key = ("rolling_low", window)
         if key not in self._cache:
             self._cache[key] = rolling_extrema(self.lows, window, find_max=False)
+            self._record_series(f"RollingLow({window})", self._cache[key])
         return self._cache[key]
 
     def vcp(self) -> Dict[str, Optional[float]]:

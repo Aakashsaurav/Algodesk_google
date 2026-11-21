@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from backtest.base import BacktestStrategy
 from config import IST_TZ, config
 from indicators.toolkit import IndicatorToolkit
+from rules.formula import evaluate_formula_condition, evaluate_formula_series
 from screener.base import BaseScreen, ColumnSpec, ParamSpec, ScreenMatch
 
 
@@ -61,6 +62,7 @@ SUPPORTED_OPERANDS: List[Dict[str, Any]] = [
     {"id": "rolling_high", "label": "Rolling High", "kind": "indicator", "default_period": 20},
     {"id": "rolling_low", "label": "Rolling Low", "kind": "indicator", "default_period": 20},
     {"id": "vol_sma", "label": "Volume SMA", "kind": "volume", "default_period": 20},
+    {"id": "formula", "label": "Formula (Math Expr)", "kind": "formula", "default_period": None},
 ]
 
 SUPPORTED_OPERATORS: List[Dict[str, str]] = [
@@ -170,6 +172,14 @@ def _compute_operand_series(
     param2 = float(spec.get("param2") or 0.0)
 
     series: List[Optional[float]]
+    if op_type == "formula":
+        expr = str(spec.get("expr") or spec.get("expression") or "").strip()
+        if not expr:
+            return [None] * n
+        series, _ = evaluate_formula_series(expr, candles, tk)
+        if mult != 1.0:
+            series = [v * mult if v is not None else None for v in series]
+        return series
     if op_type == "number":
         val = float(spec.get("value") or 0.0)
         return [val] * n
@@ -266,6 +276,9 @@ def _series_val(series: List[Optional[float]], idx: int, offset: int = 0) -> Opt
 
 def _operand_label(spec: Dict[str, Any]) -> str:
     op = str(spec.get("type") or "close").strip().lower()
+    if op == "formula":
+        expr = str(spec.get("expr") or spec.get("expression") or "formula").strip()
+        return expr[:48]
     if op == "number":
         return str(spec.get("value", 0))
     period = spec.get("period")
@@ -291,9 +304,22 @@ def _estimate_required_bars_for_group(group: Optional[Dict[str, Any]]) -> int:
         if "conditions" in cond:
             req = max(req, _estimate_required_bars_for_group(cond))
             continue
+        if (
+            str(cond.get("kind") or cond.get("type") or "").strip().lower() == "formula"
+            or (isinstance(cond.get("expression"), str) and cond.get("expression", "").strip())
+        ):
+            nums = [int(m) for m in re.findall(r"\b(\d{1,3})\b", str(cond.get("expression") or ""))]
+            max_n = max(nums) if nums else 20
+            req = max(req, min(max_n * 2 + 20, 220))
+            continue
         for side_key in ("left", "right"):
             side = cond.get(side_key) or {}
             op = str(side.get("type") or "").lower()
+            if op == "formula":
+                nums = [int(m) for m in re.findall(r"\b(\d{1,3})\b", str(side.get("expr") or ""))]
+                max_n = max(nums) if nums else 20
+                req = max(req, min(max_n * 2 + 20, 220))
+                continue
             per = int(side.get("period") or 0)
             off = abs(int(side.get("offset") or 0))
             if op in {"ema", "rsi", "rsi_ma", "adx", "atr", "macd", "macd_signal", "macd_hist"}:
@@ -325,19 +351,43 @@ class _PreparedConditionGroup:
                     self._compiled.append(("group", sub))
                     self.watched_series.update(sub.watched_series)
                 continue
+            # Full mathematical formula condition row: e.g. High(-2) > Max(6, High(0))
+            if (
+                str(cond.get("kind") or cond.get("type") or "").strip().lower() == "formula"
+                or (isinstance(cond.get("expression"), str) and cond.get("expression", "").strip())
+            ):
+                expr_str = str(cond.get("expression") or cond.get("formula") or "").strip()
+                if not expr_str:
+                    continue
+                flags, watched = evaluate_formula_condition(expr_str, candles, tk)
+                self._compiled.append(("formula_bool", flags))
+                self.watched_series.update(watched)
+                continue
             left_spec = cond.get("left") or {"type": "close"}
             right_spec = cond.get("right") or {"type": "number", "value": 0}
             operator = str(cond.get("operator") or ">").strip().lower()
             pct = float(cond.get("pct") or 0.0)
-            left_s = _compute_operand_series(left_spec, candles, tk)
-            right_s = _compute_operand_series(right_spec, candles, tk)
-            left_off = int(left_spec.get("offset") or 0)
-            right_off = int(right_spec.get("offset") or 0)
+            left_watched: Dict[str, List[Optional[float]]] = {}
+            right_watched: Dict[str, List[Optional[float]]] = {}
+            if str(left_spec.get("type") or "").lower() == "formula":
+                expr_l = str(left_spec.get("expr") or left_spec.get("expression") or "").strip()
+                left_s, left_watched = evaluate_formula_series(expr_l, candles, tk) if expr_l else ([None] * len(candles), {})
+            else:
+                left_s = _compute_operand_series(left_spec, candles, tk)
+            if str(right_spec.get("type") or "").lower() == "formula":
+                expr_r = str(right_spec.get("expr") or right_spec.get("expression") or "").strip()
+                right_s, right_watched = evaluate_formula_series(expr_r, candles, tk) if expr_r else ([None] * len(candles), {})
+            else:
+                right_s = _compute_operand_series(right_spec, candles, tk)
+            left_off = int(left_spec.get("offset") or 0) if str(left_spec.get("type") or "").lower() != "formula" else 0
+            right_off = int(right_spec.get("offset") or 0) if str(right_spec.get("type") or "").lower() != "formula" else 0
             self._compiled.append(("leaf", left_s, left_off, operator, right_s, right_off, pct))
             if str(left_spec.get("type") or "").lower() != "number":
                 self.watched_series[_operand_label(left_spec)] = left_s
+                self.watched_series.update(left_watched)
             if str(right_spec.get("type") or "").lower() != "number":
                 self.watched_series[_operand_label(right_spec)] = right_s
+                self.watched_series.update(right_watched)
 
     def is_empty(self) -> bool:
         return len(self._compiled) == 0
@@ -349,6 +399,10 @@ class _PreparedConditionGroup:
         for item in self._compiled:
             if item[0] == "group":
                 results.append(item[1].eval_at(idx))
+                continue
+            if item[0] == "formula_bool":
+                flags = item[1]
+                results.append(bool(0 <= idx < len(flags) and flags[idx]))
                 continue
             _, ls, loff, op, rs, roff, pct = item
             lv = _series_val(ls, idx, loff)
@@ -430,6 +484,20 @@ class CompiledVisualScreen(BaseScreen):
                 if "conditions" in cond:
                     _walk(cond)
                     continue
+                if (
+                    str(cond.get("kind") or cond.get("type") or "").strip().lower() == "formula"
+                    or (isinstance(cond.get("expression"), str) and cond.get("expression", "").strip())
+                ):
+                    expr_str = str(cond.get("expression") or "").strip()
+                    if expr_str:
+                        from rules.formula import validate_formula
+                        v = validate_formula(expr_str, expect_boolean=True)
+                        for lbl in (v.get("series_keys") or []):
+                            key = re.sub(r"[^a-z0-9]+", "_", str(lbl).lower()).strip("_")
+                            if key and key not in seen:
+                                seen.add(key)
+                                cols.append(ColumnSpec(key=key, label=str(lbl), fmt="number", decimals=2))
+                    continue
                 for side_k in ("left", "right"):
                     side = cond.get(side_k) or {}
                     if str(side.get("type") or "").lower() in {"number", "close", "open", "high", "low"}:
@@ -497,6 +565,16 @@ class CompiledVisualStrategy(BacktestStrategy):
         enter_sig = self._entry_prep.eval_at(index) if self._entry_prep else False
         exit_sig = self._exit_prep.eval_at(index) if (self._exit_prep and not self._exit_prep.is_empty()) else False
         return enter_sig, exit_sig
+
+    def get_indicator_series(self) -> Dict[str, List[Optional[float]]]:
+        out: Dict[str, List[Optional[float]]] = {}
+        if self._entry_prep:
+            out.update(self._entry_prep.watched_series)
+        if self._exit_prep:
+            for k, v in self._exit_prep.watched_series.items():
+                if k not in out:
+                    out[k] = v
+        return out
 
 
 def compile_visual_screen(rule_def: Dict[str, Any]) -> CompiledVisualScreen:
@@ -988,15 +1066,38 @@ class VisualRuleStore:
 
     def __init__(self, store_file: Optional[Path] = None) -> None:
         self._file = store_file or (config.DATA_DIR / "visual_rules.json")
+        self._tombstone_file = self._file.with_name(f"{self._file.stem}_deleted.json")
         self._lock = threading.RLock()
         self._ensure_seeded()
+
+    def _read_deleted_ids_locked(self) -> set[str]:
+        try:
+            if self._tombstone_file.exists():
+                raw = json.loads(self._tombstone_file.read_text(encoding="utf-8"))
+                if isinstance(raw, list):
+                    return {str(x).strip().lower() for x in raw if x}
+        except Exception:
+            pass
+        return set()
+
+    def _write_deleted_ids_locked(self, ids: set[str]) -> None:
+        try:
+            self._tombstone_file.parent.mkdir(parents=True, exist_ok=True)
+            self._tombstone_file.write_text(json.dumps(sorted(ids), indent=2), encoding="utf-8")
+        except Exception:
+            pass
 
     def _ensure_seeded(self) -> None:
         with self._lock:
             now_ist = datetime.now(tz=IST_TZ).isoformat(timespec="seconds")
+            deleted = self._read_deleted_ids_locked()
             if not self._file.exists():
                 self._file.parent.mkdir(parents=True, exist_ok=True)
-                seeded = [{**r, "seeded": True, "updated_at_ist": now_ist} for r in _SEED_VISUAL_RULES]
+                seeded = [
+                    {**r, "seeded": True, "updated_at_ist": now_ist}
+                    for r in _SEED_VISUAL_RULES
+                    if r["id"].lower() not in deleted
+                ]
                 self._file.write_text(json.dumps(seeded, indent=2), encoding="utf-8")
                 return
             # Gently backfill new curated Streak presets if upgrading from an earlier 3-item seed file
@@ -1004,10 +1105,11 @@ class VisualRuleStore:
                 raw = json.loads(self._file.read_text(encoding="utf-8"))
                 if isinstance(raw, list):
                     existing_ids = {str(r.get("id") or "").lower() for r in raw if isinstance(r, dict)}
-                    if "vis_scan_top_gainers" not in existing_ids:
+                    if "vis_scan_top_gainers" not in existing_ids and "vis_scan_top_gainers" not in deleted:
                         added = False
                         for seed in _SEED_VISUAL_RULES:
-                            if seed["id"].lower() not in existing_ids:
+                            sid = seed["id"].lower()
+                            if sid not in existing_ids and sid not in deleted:
                                 raw.append({**seed, "seeded": True, "updated_at_ist": now_ist})
                                 added = True
                         if added:
@@ -1070,6 +1172,10 @@ class VisualRuleStore:
             items = [r for r in self._read_all_locked() if str(r.get("id") or "").lower() != rid]
             items.insert(0, record)
             self._write_all_locked(items)
+            deleted = self._read_deleted_ids_locked()
+            if rid in deleted:
+                deleted.discard(rid)
+                self._write_deleted_ids_locked(deleted)
         return record
 
     def delete(self, rule_id: str) -> Dict[str, Any]:
@@ -1079,6 +1185,10 @@ class VisualRuleStore:
             kept = [r for r in items if str(r.get("id") or "").lower() != clean]
             removed = len(items) - len(kept)
             self._write_all_locked(kept)
+            if clean:
+                deleted = self._read_deleted_ids_locked()
+                deleted.add(clean)
+                self._write_deleted_ids_locked(deleted)
         return {"ok": True, "removed": removed, "id": clean}
 
 

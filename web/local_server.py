@@ -510,6 +510,23 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
             self._send_json(200, hub_service.list_backtest_runs(limit=limit))
             return
 
+        if len(parts) == 5 and parts[0] == "api" and parts[1] == "streak" and parts[2] == "backtest" and parts[4] == "ohlcv.csv":
+            try:
+                sym = query.get("symbol", [None])[0]
+                filename, csv_body = hub_service.export_backtest_ohlcv_csv(run_id=parts[3], symbol=sym)
+                raw = csv_body.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/csv; charset=utf-8")
+                self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+                self.send_header("Content-Length", str(len(raw)))
+                self.end_headers()
+                self.wfile.write(raw)
+            except KeyError as exc:
+                self._send_json(404, {"detail": str(exc)})
+            except Exception as exc:
+                self._send_json(400, {"detail": str(exc)})
+            return
+
         if path == "/api/streak/deployments":
             self._send_json(200, hub_service.list_deployments())
             return
@@ -877,6 +894,16 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
                 )
                 return
 
+            if path == "/api/streak/formula/validate":
+                self._send_json(
+                    200,
+                    hub_service.validate_formula_expr(
+                        str(body.get("expression") or body.get("expr") or ""),
+                        expect_boolean=bool(body.get("expect_boolean", False)),
+                    ),
+                )
+                return
+
             if path == "/api/streak/backtest":
                 query = parse_qs(parsed.query)
                 async_q = query.get("async_job", [None])[0]
@@ -895,6 +922,11 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
                         timeframe=str(body.get("timeframe", "1day")),
                         from_date=body.get("from_date"),
                         to_date=body.get("to_date"),
+                        start_time=body.get("start_time"),
+                        end_time=body.get("end_time"),
+                        holding_type=body.get("holding_type"),
+                        strategy_cycle=int(body["strategy_cycle"]) if body.get("strategy_cycle") not in (None, "", "-") else None,
+                        side=body.get("side"),
                         initial_capital=float(body.get("initial_capital", 500000.0) or 500000.0),
                         allocation_mode=str(body.get("allocation_mode", "shared_pool")),
                         max_open_positions=int(body.get("max_open_positions", 5) or 5),

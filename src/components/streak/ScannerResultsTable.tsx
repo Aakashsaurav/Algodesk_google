@@ -1,5 +1,5 @@
 import { useMemo, useState } from 'react';
-import { BarChart2, Download, Filter, Radio, Search } from 'lucide-react';
+import { ArrowDown, ArrowUp, ArrowUpDown, BarChart2, Download, Filter, Radio, Search } from 'lucide-react';
 import type { QuickOrderTarget } from './QuickOrderModal';
 import type { ScannerColumnSpec, ScannerResultRow } from './types';
 
@@ -68,26 +68,79 @@ export function ScannerResultsTable({
 }: ScannerResultsTableProps) {
   const [search, setSearch] = useState('');
   const [matchedOnly, setMatchedOnly] = useState(false);
+  const [sortKey, setSortKey] = useState<string | null>(null);
+  const [sortDir, setSortDir] = useState<'asc' | 'desc' | null>(null);
+
+  const toggleSort = (key: string, defaultDir: 'asc' | 'desc' = 'desc') => {
+    if (sortKey !== key) {
+      setSortKey(key);
+      setSortDir(defaultDir);
+    } else if (sortDir === defaultDir) {
+      setSortDir(defaultDir === 'desc' ? 'asc' : 'desc');
+    } else {
+      setSortKey(null);
+      setSortDir(null);
+    }
+  };
 
   // Filter out standard columns so we don't duplicate Symbol/LTP/Change/Volume
   const extraCols = useMemo(() => {
     const skip = new Set(['symbol', 'exchange', 'close', 'ltp', 'change_pct', 'volume', 'matched']);
-    return columns.filter((c) => !skip.has(c.key.toLowerCase())).slice(0, 4);
+    return columns.filter((c) => !skip.has(c.key.toLowerCase())).slice(0, 6);
   }, [columns]);
 
   const filteredRows = useMemo(() => {
     const q = search.trim().toUpperCase();
-    return rows.filter((r) => {
+    const base = rows.filter((r) => {
       if (matchedOnly && r.matched === false) return false;
       if (q && !r.symbol.toUpperCase().includes(q)) return false;
       return true;
     });
-  }, [rows, search, matchedOnly]);
+    if (!sortKey || !sortDir) return base;
+
+    const getVal = (r: ScannerResultRow, key: string): unknown => {
+      if (key === 'symbol') return r.symbol || '';
+      if (key === 'ltp') return Number(r.ltp ?? r.close ?? NaN);
+      if (key === 'change_pct') return Number(r.change_pct ?? NaN);
+      if (key === 'volume') return Number(r.volume ?? NaN);
+      return r[key];
+    };
+
+    const dirMul = sortDir === 'asc' ? 1 : -1;
+    return [...base].sort((a, b) => {
+      const va = getVal(a, sortKey);
+      const vb = getVal(b, sortKey);
+      const aEmpty = va === null || va === undefined || va === '' || (typeof va === 'number' && Number.isNaN(va));
+      const bEmpty = vb === null || vb === undefined || vb === '' || (typeof vb === 'number' && Number.isNaN(vb));
+      if (aEmpty && bEmpty) return 0;
+      if (aEmpty) return 1; // nulls always last
+      if (bEmpty) return -1;
+
+      const na = typeof va === 'number' ? va : Number(va);
+      const nb = typeof vb === 'number' ? vb : Number(vb);
+      if (sortKey !== 'symbol' && Number.isFinite(na) && Number.isFinite(nb)) {
+        if (na === nb) return a.symbol.localeCompare(b.symbol);
+        return (na - nb) * dirMul;
+      }
+      return String(va).localeCompare(String(vb), undefined, { numeric: true, sensitivity: 'base' }) * dirMul;
+    });
+  }, [rows, search, matchedOnly, sortKey, sortDir]);
 
   const matchedCount = useMemo(
     () => rows.filter((r) => r.matched !== false).length,
     [rows]
   );
+
+  const renderSortIcon = (key: string) => {
+    if (sortKey !== key || !sortDir) {
+      return <ArrowUpDown className="h-3 w-3 opacity-40 group-hover:opacity-90" />;
+    }
+    return sortDir === 'asc' ? (
+      <ArrowUp className="h-3 w-3 text-sky-400" />
+    ) : (
+      <ArrowDown className="h-3 w-3 text-sky-400" />
+    );
+  };
 
   const handleExportCsv = () => {
     if (!filteredRows.length) return;
@@ -213,13 +266,66 @@ export function ScannerResultsTable({
           <table className="w-full border-collapse text-left">
             <thead className="sticky top-0 z-10 border-b border-slate-800 bg-[#0b1120] text-[11px] font-semibold uppercase tracking-wide text-slate-400">
               <tr>
-                <th className="px-4 py-2.5">Symbol</th>
-                <th className="px-3 py-2.5 text-right">LTP</th>
-                <th className="px-3 py-2.5 text-right">Change %</th>
-                <th className="px-3 py-2.5 text-right">Volume</th>
+                <th className="px-4 py-2.5">
+                  <button
+                    type="button"
+                    onClick={() => toggleSort('symbol', 'asc')}
+                    className={`group inline-flex items-center gap-1 uppercase tracking-wide transition-colors hover:text-slate-100 ${
+                      sortKey === 'symbol' ? 'text-sky-300' : ''
+                    }`}
+                  >
+                    <span>Symbol</span>
+                    {renderSortIcon('symbol')}
+                  </button>
+                </th>
+                <th className="px-3 py-2.5 text-right">
+                  <button
+                    type="button"
+                    onClick={() => toggleSort('ltp', 'desc')}
+                    className={`group inline-flex items-center justify-end gap-1 uppercase tracking-wide transition-colors hover:text-slate-100 ${
+                      sortKey === 'ltp' ? 'text-sky-300' : ''
+                    }`}
+                  >
+                    <span>LTP</span>
+                    {renderSortIcon('ltp')}
+                  </button>
+                </th>
+                <th className="px-3 py-2.5 text-right">
+                  <button
+                    type="button"
+                    onClick={() => toggleSort('change_pct', 'desc')}
+                    className={`group inline-flex items-center justify-end gap-1 uppercase tracking-wide transition-colors hover:text-slate-100 ${
+                      sortKey === 'change_pct' ? 'text-sky-300' : ''
+                    }`}
+                  >
+                    <span>Change %</span>
+                    {renderSortIcon('change_pct')}
+                  </button>
+                </th>
+                <th className="px-3 py-2.5 text-right">
+                  <button
+                    type="button"
+                    onClick={() => toggleSort('volume', 'desc')}
+                    className={`group inline-flex items-center justify-end gap-1 uppercase tracking-wide transition-colors hover:text-slate-100 ${
+                      sortKey === 'volume' ? 'text-sky-300' : ''
+                    }`}
+                  >
+                    <span>Volume</span>
+                    {renderSortIcon('volume')}
+                  </button>
+                </th>
                 {extraCols.map((col) => (
                   <th key={col.key} className="px-3 py-2.5 text-right">
-                    {col.label}
+                    <button
+                      type="button"
+                      onClick={() => toggleSort(col.key, 'desc')}
+                      className={`group inline-flex items-center justify-end gap-1 uppercase tracking-wide transition-colors hover:text-slate-100 ${
+                        sortKey === col.key ? 'text-sky-300' : ''
+                      }`}
+                    >
+                      <span>{col.label}</span>
+                      {renderSortIcon(col.key)}
+                    </button>
                   </th>
                 ))}
                 <th className="px-4 py-2.5 text-right">Buy / Sell</th>

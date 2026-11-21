@@ -5,34 +5,37 @@ Dual-Mode (Individual & Portfolio) Multi-Symbol Backtester with Real 2026 Indian
 Brokerage & Statutory Charges (`charges.calculator`).
 
 Supports BOTH:
-- Visual No-Code Strategies (`rules.engine`) AND custom Python `.py` Strategies
-  (`backtest.registry`) via the exact same `BacktestStrategy` interface.
-- `mode="individual"`: simulates every symbol independently with its own capital
-  envelope, producing per-symbol metrics + aggregated overview.
-- `mode="portfolio"`: simulates all symbols chronologically across aligned
-  timestamps sharing one portfolio cash pool with ALL THREE confirmed capital
-  allocation modes:
-    1. `shared_pool`: shared cash pool + `max_open_positions` + signal ranking
-       (`momentum` | `score` | `alphabetical`).
-    2. `equal_split`: fixed equal capital slice per slot (`initial_capital / max_slots`).
-    3. `risk_based`: stop-loss-distance position sizing
-       (`qty = floor((equity * risk_per_trade_pct / 100) / (entry_price * stop_loss_pct / 100))`).
-
-Persists compact immutable backtest run snapshots (`data/backtest_runs.json`) so
-the exact backtested artifact can be promoted 1-click into Paper Trade or Live Trade.
+- Visual No-Code Strategies (`rules.engine`, including Advance mathematical formulas)
+  AND custom Python `.py` Strategies (`backtest.registry`) via `BacktestStrategy`.
+- Next-bar open execution: signals at bar `i` close fill at bar `i + 1` open;
+  strict `exit_bar_idx > entry_bar_idx` invariant ensures BUY and SELL NEVER
+  happen on the same bar.
+- Both LONG (`side="BUY"`) and SHORT (`side="SELL"`), intraday time windows
+  (`start_time`, `end_time`), and `MIS` end-of-day square-off.
+- Complete-period OHLCV + trading symbol + all strategy indicator values CSV
+  export cached per `run_id` (`export_ohlcv_csv`).
 """
 
 from __future__ import annotations
 
+import csv
+import io
 import json
 import math
+import re
 import threading
 import uuid
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from backtest.engine import BacktestEngine, backtest_engine
+from backtest.engine import (
+    BacktestEngine,
+    backtest_engine,
+    collect_strategy_indicators,
+    format_bar_timestamp,
+    within_time_window,
+)
 from backtest.registry import StrategyRegistry, strategy_registry
 from baskets.store import basket_store
 from charges.calculator import ChargeBreakdown, ChargesConfig, charges_engine
@@ -44,12 +47,13 @@ from core.historical import (
     resolve_base_timeframe,
 )
 from core.jobs import JobCancelledError
-from indicators.toolkit import IndicatorToolkit, available_backends
+from indicators.toolkit import IndicatorToolkit, available_backends, compute_roc_series
 from screener.universes import universe_resolver
 
 
 VALID_ALLOCATION_MODES = ("shared_pool", "equal_split", "risk_based")
 VALID_SIGNAL_RANKINGS = ("momentum", "score", "alphabetical")
+_MAX_CACHED_EXPORTS = 15
 
 
 def _compute_metrics_from_curve_and_trades(
@@ -133,7 +137,7 @@ def _downsample_curve(raw_curve: List[Dict[str, Any]], max_points: int = 180) ->
 
 
 class PortfolioBacktestEngine:
-    """Unified Individual + Portfolio Backtester with 2026 Indian trading charges."""
+    """Unified Individual + Portfolio Backtester with 2026 Indian trading charges & OHLCV+Indicator export."""
 
     def __init__(
         self,
@@ -146,6 +150,8 @@ class PortfolioBacktestEngine:
         self._registry = registry or strategy_registry
         self._single = single_engine or backtest_engine
         self._runs_file = runs_file or (config.DATA_DIR / "backtest_runs.json")
+        self._exports_dir = self._runs_file.parent / "backtest_exports"
+        self._export_cache: Dict[str, Dict[str, Any]] = {}
         self._lock = threading.RLock()
 
     def _resolve_symbols(
@@ -183,6 +189,96 @@ class PortfolioBacktestEngine:
 
     def _resolve_strategy(self, strategy: str, rule_def: Optional[Dict[str, Any]] = None):
         return self._single._resolve_strategy(strategy, rule_def=rule_def)
+
+    def _store_export_bundle(self, run_id: str, bundle: Dict[str, Any]) -> None:
+        with self._lock:
+            self._export_cache[run_id] = bundle
+            while len(self._export_cache) > _MAX_CACHED_EXPORTS:
+                oldest = next(iter(self._export_cache))
+                self._export_cache.pop(oldest, None)
+            try:
+                self._exports_dir.mkdir(parents=True, exist_ok=True)
+                safe_id = re.sub(r"[^a-zA-Z0-9_-]+", "", run_id)
+                out_path = self._exports_dir / f"{safe_id}.json"
+                out_path.write_text(json.dumps(bundle), encoding="utf-8")
+                # Keep only latest _MAX_CACHED_EXPORTS files on disk
+                files = sorted(self._exports_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
+                for old_f in files[_MAX_CACHED_EXPORTS:]:
+                    try:
+                        old_f.unlink()
+                    except OSError:
+                        pass
+            except Exception:
+                pass
+
+    def _load_export_bundle(self, run_id: str) -> Optional[Dict[str, Any]]:
+        safe_id = re.sub(r"[^a-zA-Z0-9_-]+", "", run_id or "")
+        if not safe_id:
+            return None
+        with self._lock:
+            if safe_id in self._export_cache:
+                return self._export_cache[safe_id]
+            candidate = self._exports_dir / f"{safe_id}.json"
+            if candidate.exists():
+                try:
+                    data = json.loads(candidate.read_text(encoding="utf-8"))
+                    if isinstance(data, dict):
+                        self._export_cache[safe_id] = data
+                        return data
+                except Exception:
+                    return None
+        return None
+
+    def export_ohlcv_csv(self, run_id: str, symbol: Optional[str] = None) -> Tuple[str, str]:
+        """
+        Render complete-period OHLCV + trading symbol + all strategy indicator
+        values + signals/order actions as a downloadable CSV string.
+        """
+        bundle = self._load_export_bundle(run_id)
+        if not bundle:
+            raise KeyError(
+                f"OHLCV + Indicator export data for run '{run_id}' is not available. Re-run the backtest to generate it."
+            )
+
+        by_sym: Dict[str, List[Dict[str, Any]]] = bundle.get("by_symbol") or {}
+        ind_cols: List[str] = list(bundle.get("indicator_columns") or [])
+        strat_slug = re.sub(r"[^a-z0-9]+", "_", str(bundle.get("strategy") or "strategy").lower()).strip("_") or "strategy"
+
+        clean_sym = (symbol or "").strip().upper()
+        if clean_sym and clean_sym not in {"ALL", "COMBINED"}:
+            if clean_sym not in by_sym:
+                raise KeyError(f"Symbol '{clean_sym}' not found in backtest run '{run_id}'.")
+            rows = by_sym[clean_sym]
+            filename = f"{strat_slug}_{clean_sym}_ohlcv_indicators.csv"
+        else:
+            rows = []
+            for sym_k in sorted(by_sym.keys()):
+                rows.extend(by_sym[sym_k])
+            filename = f"{strat_slug}_all_symbols_ohlcv_indicators.csv"
+
+        headers = [
+            "trading_symbol",
+            "exchange",
+            "timestamp",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            *ind_cols,
+            "entry_signal",
+            "exit_signal",
+            "order_action",
+            "order_price",
+            "exit_reason",
+        ]
+
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(headers)
+        for r in rows:
+            writer.writerow([r.get("symbol", "") if h == "trading_symbol" else r.get(h, "") for h in headers])
+        return filename, buf.getvalue()
 
     def _save_run_snapshot(self, result: Dict[str, Any]) -> None:
         snapshot = {
@@ -253,6 +349,11 @@ class PortfolioBacktestEngine:
         timeframe: str = "1day",
         from_date: Optional[str] = None,
         to_date: Optional[str] = None,
+        start_time: Optional[str] = None,
+        end_time: Optional[str] = None,
+        holding_type: Optional[str] = None,
+        strategy_cycle: Optional[int] = None,
+        side: Optional[str] = None,
         initial_capital: float = 500000.0,
         allocation_mode: str = "shared_pool",
         max_open_positions: int = 5,
@@ -291,6 +392,15 @@ class PortfolioBacktestEngine:
         start_str = (from_date or "").strip() or (today_ist - timedelta(days=365)).isoformat()
         eff_provider = (provider or config.ACTIVE_DATA_CONNECTION or "yfinance").strip().lower()
 
+        eff_side = (side or (rule_def.get("side") if isinstance(rule_def, dict) else None) or "BUY").strip().upper()
+        eff_holding = (holding_type or ("MIS" if segment == "equity_intraday" else "CNC")).strip().upper()
+        eff_segment = segment
+        if holding_type:
+            if eff_holding == "CNC" and segment == "equity_intraday":
+                eff_segment = "equity_delivery"
+            elif eff_holding == "MIS" and segment == "equity_delivery":
+                eff_segment = "equity_intraday"
+
         resolved_syms, symbol_source = self._resolve_symbols(
             symbols=symbols,
             basket_id=basket_id,
@@ -298,7 +408,6 @@ class PortfolioBacktestEngine:
             exchange=clean_exch,
             timeframe=tf,
         )
-        # Cap runaway single-request portfolio sizes cleanly while allowing large NIFTY50 runs
         resolved_syms = resolved_syms[:50]
         if not resolved_syms:
             raise ValueError("At least one symbol is required to run a backtest.")
@@ -315,7 +424,7 @@ class PortfolioBacktestEngine:
             ov["slippage_bps"] = float(slippage_bps)
         charges_cfg: ChargesConfig = charges_engine.resolve_config(
             profile=charges_profile or "zerodha",
-            segment=segment or "equity_intraday",
+            segment=eff_segment or "equity_intraday",
             overrides=ov,
         )
 
@@ -339,6 +448,10 @@ class PortfolioBacktestEngine:
                 base_tf=base_tf,
                 from_date=start_str,
                 to_date=end_str,
+                start_time=start_time,
+                end_time=end_time,
+                holding_type=eff_holding,
+                side=eff_side,
                 initial_capital=cap,
                 sl_pct=sl_pct,
                 tp_pct=tp_pct,
@@ -369,6 +482,10 @@ class PortfolioBacktestEngine:
             base_tf=base_tf,
             from_date=start_str,
             to_date=end_str,
+            start_time=start_time,
+            end_time=end_time,
+            holding_type=eff_holding,
+            side=eff_side,
             initial_capital=cap,
             allocation_mode=eff_alloc,
             max_open_positions=max_pos,
@@ -403,6 +520,10 @@ class PortfolioBacktestEngine:
         base_tf: str,
         from_date: str,
         to_date: str,
+        start_time: Optional[str],
+        end_time: Optional[str],
+        holding_type: str,
+        side: str,
         initial_capital: float,
         sl_pct: float,
         tp_pct: float,
@@ -426,8 +547,9 @@ class PortfolioBacktestEngine:
         total_gross_pnl = 0.0
         total_net_pnl = 0.0
 
-        # Build an averaged/combined equity curve indexed by date across symbols
         curve_by_date: Dict[str, List[float]] = {}
+        export_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
+        export_ind_cols: List[str] = []
 
         for idx, sym in enumerate(symbols):
             if cancel_event is not None and cancel_event.is_set():
@@ -444,6 +566,10 @@ class PortfolioBacktestEngine:
                     timeframe=timeframe,
                     from_date=from_date,
                     to_date=to_date,
+                    start_time=start_time,
+                    end_time=end_time,
+                    holding_type=holding_type,
+                    side=side,
                     initial_capital=initial_capital,
                     slippage_bps=slippage_bps,
                     fee_bps=0.0,
@@ -455,9 +581,17 @@ class PortfolioBacktestEngine:
                     charges_overrides=charges_overrides,
                     provider=provider,
                     backend=backend,
+                    collect_export=True,
                     fetcher=fetcher,
                     cancel_event=cancel_event,
                 )
+                exp = res.pop("_export", None)
+                if exp:
+                    export_by_symbol[res["symbol"]] = exp.get("rows") or []
+                    for col_name in exp.get("indicator_columns") or []:
+                        if col_name not in export_ind_cols:
+                            export_ind_cols.append(col_name)
+
                 total_api_calls += int(res.get("api_calls_made", 0))
                 total_skipped += int(res.get("existing_days_skipped", 0))
                 total_gross_pnl += float(res.get("gross_pnl", 0.0))
@@ -504,13 +638,22 @@ class PortfolioBacktestEngine:
             first_err = errors[0]["error"] if errors else "No symbols produced backtest bars."
             raise ValueError(f"Individual backtest failed for all symbols: {first_err}")
 
+        self._store_export_bundle(
+            run_id,
+            {
+                "run_id": run_id,
+                "strategy": strategy_id,
+                "indicator_columns": export_ind_cols,
+                "by_symbol": export_by_symbol,
+            },
+        )
+
         total_cap = initial_capital * len(per_symbol)
         final_equity = total_cap + total_net_pnl
         raw_curve: List[Dict[str, Any]] = []
         peak = total_cap
         for dt_key in sorted(curve_by_date.keys()):
             vals = curve_by_date[dt_key]
-            # Scale average per-symbol equity to total deployed individual capital
             eq = (sum(vals) / float(len(vals))) * len(per_symbol)
             if eq > peak:
                 peak = eq
@@ -535,6 +678,10 @@ class PortfolioBacktestEngine:
             "run_id": run_id,
             "mode": "individual",
             "allocation_mode": "per_symbol_independent",
+            "side": "SHORT" if side == "SELL" else "LONG",
+            "holding_type": holding_type,
+            "start_time": start_time,
+            "end_time": end_time,
             "symbol_source": symbol_source,
             "symbols": [r["symbol"] for r in per_symbol],
             "exchange": exchange,
@@ -558,6 +705,8 @@ class PortfolioBacktestEngine:
             "charges_profile": charges_profile,
             "segment": segment,
             "charges_breakdown": agg_charges.to_dict(),
+            "indicator_columns": export_ind_cols,
+            "has_ohlcv_export": True,
             **metrics,
             "equity_curve": _downsample_curve(raw_curve),
             "per_symbol": per_symbol,
@@ -606,6 +755,10 @@ class PortfolioBacktestEngine:
         base_tf: str,
         from_date: str,
         to_date: str,
+        start_time: Optional[str],
+        end_time: Optional[str],
+        holding_type: str,
+        side: str,
         initial_capital: float,
         allocation_mode: str,
         max_open_positions: int,
@@ -622,12 +775,17 @@ class PortfolioBacktestEngine:
         progress_cb: Optional[Callable[[int, int, str], None]],
         cancel_event: Optional[threading.Event],
     ) -> Dict[str, Any]:
-        # Phase 1: Load OHLCV and pre-compute per-symbol signals ONCE (O(N) per symbol)
+        is_short = side == "SELL"
+        is_intraday_tf = timeframe not in {"1day", "1week", "1month"}
+        mis_eod_squareoff = is_intraday_tf and holding_type == "MIS"
+
+        # Phase 1: Load OHLCV and pre-compute per-symbol signals & indicator series ONCE
         sym_series: Dict[str, Dict[str, Any]] = {}
         errors: List[Dict[str, str]] = []
         total_api_calls = 0
         total_skipped = 0
         all_timestamps: set[str] = set()
+        export_ind_cols: List[str] = []
 
         for idx, sym in enumerate(symbols):
             if cancel_event is not None and cancel_event.is_set():
@@ -653,9 +811,16 @@ class PortfolioBacktestEngine:
                 strat_inst, _ = self._resolve_strategy(strategy, rule_def=rule_def)
                 tk = IndicatorToolkit(rows, backend=backend)
                 strat_inst.prepare(rows, params, tk)
-                roc_10 = tk.roc(10)
+                ind_map = collect_strategy_indicators(strat_inst, tk, len(rows))
+                for col_name in ind_map.keys():
+                    if col_name not in export_ind_cols:
+                        export_ind_cols.append(col_name)
+
+                # Compute ranking momentum directly without polluting tk.recorded_series
+                roc_10 = compute_roc_series(tk.closes, 10)
 
                 bar_by_ts: Dict[str, Tuple[int, Dict[str, Any], bool, bool, float]] = {}
+                export_rows: List[Dict[str, Any]] = []
                 for i, bar in enumerate(rows):
                     ts_key = str(bar.get("ts_ist") or bar.get("trade_date") or "")
                     enter_sig, exit_sig = strat_inst.signal_at(i, bar)
@@ -663,9 +828,30 @@ class PortfolioBacktestEngine:
                     bar_by_ts[ts_key] = (i, bar, bool(enter_sig), bool(exit_sig), mom_val)
                     all_timestamps.add(ts_key)
 
+                    rec: Dict[str, Any] = {
+                        "symbol": dl_meta["symbol"],
+                        "exchange": dl_meta["exchange"],
+                        "timestamp": format_bar_timestamp(bar, timeframe),
+                        "open": round(float(bar["open"]), 4),
+                        "high": round(float(bar["high"]), 4),
+                        "low": round(float(bar["low"]), 4),
+                        "close": round(float(bar["close"]), 4),
+                        "volume": int(float(bar.get("volume") or 0)),
+                    }
+                    for ind_k, ind_vals in ind_map.items():
+                        iv = ind_vals[i]
+                        rec[ind_k] = round(float(iv), 4) if iv is not None else ""
+                    rec["entry_signal"] = 1 if enter_sig else 0
+                    rec["exit_signal"] = 1 if exit_sig else 0
+                    rec["order_action"] = ""
+                    rec["order_price"] = ""
+                    rec["exit_reason"] = ""
+                    export_rows.append(rec)
+
                 sym_series[dl_meta["symbol"]] = {
                     "bars_count": len(rows),
                     "bar_by_ts": bar_by_ts,
+                    "export_rows": export_rows,
                     "last_close": float(rows[0]["close"]),
                 }
             except JobCancelledError:
@@ -681,9 +867,11 @@ class PortfolioBacktestEngine:
         active_syms = list(sym_series.keys())
         eff_max_slots = max(1, min(len(active_syms), max_open_positions))
 
-        # Phase 2: Chronological Portfolio Event Loop (shared cash pool + allocation modes)
+        # Phase 2: Chronological Portfolio Event Loop with NEXT-BAR OPEN execution & strict no-same-bar guard
         cash = float(initial_capital)
         positions: Dict[str, Dict[str, Any]] = {}
+        pending_entries: Dict[str, float] = {}  # sym -> ranking momentum from prior bar close
+        pending_exits: set[str] = set()
         trades: List[Dict[str, Any]] = []
         raw_curve: List[Dict[str, Any]] = []
         agg_charges = ChargeBreakdown()
@@ -698,34 +886,45 @@ class PortfolioBacktestEngine:
         def _mark_to_market_equity() -> float:
             eq = cash
             for psym, pos in positions.items():
-                eq += pos["qty"] * sym_series[psym]["last_close"]
+                cur_c = sym_series[psym]["last_close"]
+                if is_short:
+                    eq += (pos["qty"] * pos["entry_price"]) + ((pos["entry_price"] - cur_c) * pos["qty"])
+                else:
+                    eq += pos["qty"] * cur_c
             return eq
 
-        def _close_position(psym: str, exit_px: float, exit_date: str, reason: str) -> None:
+        def _close_position(psym: str, exit_px: float, exit_ts: str, exit_step_idx: int, sym_bar_idx: Optional[int], reason: str) -> None:
             nonlocal cash, total_gross_pnl
             pos = positions.pop(psym)
             qty = int(pos["qty"])
             entry_px = float(pos["entry_price"])
-            gross_pnl = (exit_px - entry_px) * qty
+            gross_pnl = (entry_px - exit_px) * qty if is_short else (exit_px - entry_px) * qty
             total_gross_pnl += gross_pnl
 
-            sell_leg = charges_engine.calculate_leg(
-                side="SELL", price=exit_px, quantity=qty, cfg=charges_cfg, include_slippage=True
+            exit_side = "BUY" if is_short else "SELL"
+            exit_leg = charges_engine.calculate_leg(
+                side=exit_side, price=exit_px, quantity=qty, cfg=charges_cfg, include_slippage=True
             )
             trade_chg = ChargeBreakdown()
             trade_chg.add(pos["entry_leg"])
-            trade_chg.add(sell_leg)
+            trade_chg.add(exit_leg)
             agg_charges.add(trade_chg)
 
             net_pnl = gross_pnl - trade_chg.total_charges
-            cash += (qty * exit_px) - sell_leg.total_charges
+            if is_short:
+                cash += (qty * entry_px) + gross_pnl - exit_leg.total_charges
+            else:
+                cash += (qty * exit_px) - exit_leg.total_charges
             ret_pct = (net_pnl / max(1.0, qty * entry_px)) * 100.0
 
             trades.append(
                 {
                     "symbol": psym,
+                    "side": "SHORT" if is_short else "LONG",
                     "entry_date": pos["entry_date"],
-                    "exit_date": exit_date,
+                    "exit_date": exit_ts,
+                    "entry_bar_idx": pos["entry_bar_idx"],
+                    "exit_bar_idx": exit_step_idx,
                     "qty": qty,
                     "entry_price": round(entry_px, 2),
                     "exit_price": round(exit_px, 2),
@@ -736,6 +935,12 @@ class PortfolioBacktestEngine:
                     "exit_reason": reason,
                 }
             )
+            if sym_bar_idx is not None and 0 <= sym_bar_idx < len(sym_series[psym]["export_rows"]):
+                er = sym_series[psym]["export_rows"][sym_bar_idx]
+                er["order_action"] = exit_side
+                er["order_price"] = round(exit_px, 4)
+                er["exit_reason"] = reason
+
             st = sym_stats[psym]
             st["trades"] += 1
             if net_pnl > 0:
@@ -749,108 +954,173 @@ class PortfolioBacktestEngine:
             if cancel_event is not None and (step_idx % 50 == 0) and cancel_event.is_set():
                 raise JobCancelledError("Portfolio backtest cancelled by operator.")
             is_last_bar = step_idx == (total_steps - 1)
-            bar_date = ts_key[:10]
+            cur_day = ts_key[:10]
+            next_day = ordered_ts[step_idx + 1][:10] if step_idx + 1 < total_steps else ""
+            is_session_last_bar = mis_eod_squareoff and (is_last_bar or next_day != cur_day)
 
-            # 1) Update last_close and process EXITS first (frees cash & slots cleanly)
-            entry_candidates: List[Tuple[str, float, float]] = []
-            for sym in active_syms:
+            # Determine formatted bar timestamp for this step
+            step_ts_label = ts_key[:10] if not is_intraday_tf else ts_key[:16].replace("T", " ")
+
+            # 1) Execute PENDING EXITS from previous bar at THIS bar's OPEN (frees cash & slots first)
+            for sym in list(pending_exits):
                 rec = sym_series[sym]["bar_by_ts"].get(ts_key)
                 if rec is None:
                     continue
-                _, bar, enter_sig, exit_sig, mom_val = rec
-                b_close = float(bar["close"])
-                b_high = float(bar["high"])
-                b_low = float(bar["low"])
-                sym_series[sym]["last_close"] = b_close
+                sym_i, bar, _, _, _ = rec
+                b_open = float(bar["open"])
+                bar_ts = format_bar_timestamp(bar, timeframe)
+                if sym in positions and step_idx > positions[sym]["entry_bar_idx"]:
+                    _close_position(sym, b_open, bar_ts, step_idx, sym_i, "STRATEGY_EXIT")
+                pending_exits.discard(sym)
 
-                if sym in positions:
-                    pos = positions[sym]
-                    if b_high > pos["highest"]:
-                        pos["highest"] = b_high
-                    reason = ""
-                    exit_px = b_close
-                    if sl_pct > 0 and b_low <= pos["entry_price"] * (1.0 - sl_pct / 100.0):
-                        exit_px = pos["entry_price"] * (1.0 - sl_pct / 100.0)
-                        reason = f"STOP_LOSS (-{sl_pct:.1f}%)"
-                    elif tsl_pct > 0 and pos["highest"] > pos["entry_price"] and b_low <= pos["highest"] * (1.0 - tsl_pct / 100.0):
-                        exit_px = pos["highest"] * (1.0 - tsl_pct / 100.0)
-                        reason = f"TRAILING_SL (-{tsl_pct:.1f}%)"
-                    elif tp_pct > 0 and b_high >= pos["entry_price"] * (1.0 + tp_pct / 100.0):
-                        exit_px = pos["entry_price"] * (1.0 + tp_pct / 100.0)
-                        reason = f"TAKE_PROFIT (+{tp_pct:.1f}%)"
-                    elif exit_sig:
-                        reason = "STRATEGY_EXIT"
-                    if reason:
-                        _close_position(sym, exit_px, bar_date, reason)
-                elif enter_sig and not is_last_bar:
-                    entry_candidates.append((sym, b_close, mom_val))
+            # 2) Execute PENDING ENTRIES from previous bar at THIS bar's OPEN (ranked by signal_ranking)
+            entered_this_step: set[str] = set()
+            if pending_entries and not is_last_bar and not is_session_last_bar and len(positions) < eff_max_slots:
+                ranked_candidates: List[Tuple[str, float, float, int, str]] = []
+                for sym, mom_val in list(pending_entries.items()):
+                    if sym in positions:
+                        pending_entries.pop(sym, None)
+                        continue
+                    rec = sym_series[sym]["bar_by_ts"].get(ts_key)
+                    if rec is None:
+                        continue
+                    sym_i, bar, _, _, _ = rec
+                    if not within_time_window(bar, start_time, end_time, timeframe):
+                        pending_entries.pop(sym, None)
+                        continue
+                    b_open = float(bar["open"])
+                    bar_ts = format_bar_timestamp(bar, timeframe)
+                    ranked_candidates.append((sym, b_open, mom_val, sym_i, bar_ts))
+                    pending_entries.pop(sym, None)
 
-            # 2) Rank & allocate ENTRIES across available portfolio slots
-            if entry_candidates and len(positions) < eff_max_slots:
                 if signal_ranking == "alphabetical":
-                    entry_candidates.sort(key=lambda c: c[0])
+                    ranked_candidates.sort(key=lambda c: c[0])
                 elif signal_ranking == "score":
-                    entry_candidates.sort(key=lambda c: (abs(c[2]), c[2], c[0]), reverse=True)
+                    ranked_candidates.sort(key=lambda c: (abs(c[2]), c[2], c[0]), reverse=True)
                 else:
-                    # Default: momentum (highest 10-bar ROC first)
-                    entry_candidates.sort(key=lambda c: (c[2], c[0]), reverse=True)
+                    ranked_candidates.sort(key=lambda c: (c[2], c[0]), reverse=True)
 
-                for sym, entry_px, _ in entry_candidates:
+                entry_side = "SELL" if is_short else "BUY"
+                for sym, entry_px, _, sym_i, bar_ts in ranked_candidates:
                     open_slots = eff_max_slots - len(positions)
                     if open_slots <= 0 or cash <= 0 or entry_px <= 0:
                         break
-
                     cur_equity = _mark_to_market_equity()
+                    est_rate = (charges_cfg.slippage_bps / 10000.0) + charges_cfg.stt_buy_pct + charges_cfg.stamp_duty_buy_pct + 0.001
                     if allocation_mode == "equal_split":
                         target_budget = min(cash, initial_capital / float(eff_max_slots))
-                        est_rate = (charges_cfg.slippage_bps / 10000.0) + charges_cfg.stt_buy_pct + charges_cfg.stamp_duty_buy_pct + 0.001
                         qty = int(max(0.0, target_budget - charges_cfg.brokerage_flat_per_order * 1.2) // (entry_px * (1.0 + est_rate)))
                     elif allocation_mode == "risk_based":
                         eff_sl = sl_pct if sl_pct > 0 else 2.0
                         risk_amt = cur_equity * (risk_per_trade_pct / 100.0)
                         risk_per_share = max(0.05, entry_px * (eff_sl / 100.0))
                         qty_by_risk = int(risk_amt // risk_per_share)
-                        # Cap single position by remaining cash & 50% of equity
                         max_cash_budget = min(cash, cur_equity * 0.50)
-                        est_rate = (charges_cfg.slippage_bps / 10000.0) + charges_cfg.stt_buy_pct + charges_cfg.stamp_duty_buy_pct + 0.001
                         qty_by_cash = int(max(0.0, max_cash_budget - charges_cfg.brokerage_flat_per_order * 1.2) // (entry_px * (1.0 + est_rate)))
                         qty = min(qty_by_risk, qty_by_cash)
                     else:
-                        # shared_pool: divide available cash across remaining free slots
                         target_budget = cash / float(open_slots)
-                        est_rate = (charges_cfg.slippage_bps / 10000.0) + charges_cfg.stt_buy_pct + charges_cfg.stamp_duty_buy_pct + 0.001
                         qty = int(max(0.0, target_budget - charges_cfg.brokerage_flat_per_order * 1.2) // (entry_px * (1.0 + est_rate)))
 
                     if qty < 1:
                         continue
-                    buy_leg = charges_engine.calculate_leg(
-                        side="BUY", price=entry_px, quantity=qty, cfg=charges_cfg, include_slippage=True
+                    entry_leg = charges_engine.calculate_leg(
+                        side=entry_side, price=entry_px, quantity=qty, cfg=charges_cfg, include_slippage=True
                     )
-                    total_outlay = (qty * entry_px) + buy_leg.total_charges
+                    total_outlay = (qty * entry_px) + entry_leg.total_charges
                     if total_outlay > cash and qty > 1:
-                        qty = max(1, int((cash - buy_leg.total_charges) // entry_px))
-                        buy_leg = charges_engine.calculate_leg(
-                            side="BUY", price=entry_px, quantity=qty, cfg=charges_cfg, include_slippage=True
+                        qty = max(1, int((cash - entry_leg.total_charges) // entry_px))
+                        entry_leg = charges_engine.calculate_leg(
+                            side=entry_side, price=entry_px, quantity=qty, cfg=charges_cfg, include_slippage=True
                         )
-                        total_outlay = (qty * entry_px) + buy_leg.total_charges
+                        total_outlay = (qty * entry_px) + entry_leg.total_charges
                     if qty >= 1 and total_outlay <= cash:
                         cash -= total_outlay
                         positions[sym] = {
                             "qty": qty,
                             "entry_price": entry_px,
-                            "entry_date": bar_date,
-                            "entry_leg": buy_leg,
-                            "highest": entry_px,
+                            "entry_date": bar_ts,
+                            "entry_bar_idx": step_idx,
+                            "entry_leg": entry_leg,
+                            "extreme": entry_px,
                         }
+                        entered_this_step.add(sym)
+                        er = sym_series[sym]["export_rows"][sym_i]
+                        er["order_action"] = entry_side
+                        er["order_price"] = round(entry_px, 4)
+            else:
+                pending_entries.clear()
 
-            # 3) Mark-to-market portfolio curve point
+            # 3) Intrabar SL/TSL/TP/MIS-EOD checks (ONLY on bars strictly AFTER entry bar) + schedule NEXT-BAR signals
+            for sym in active_syms:
+                rec = sym_series[sym]["bar_by_ts"].get(ts_key)
+                if rec is None:
+                    continue
+                sym_i, bar, enter_sig, exit_sig, mom_val = rec
+                b_open = float(bar["open"])
+                b_close = float(bar["close"])
+                b_high = float(bar["high"])
+                b_low = float(bar["low"])
+                bar_ts = format_bar_timestamp(bar, timeframe)
+                sym_series[sym]["last_close"] = b_close
+
+                if sym in positions and sym not in entered_this_step and step_idx > positions[sym]["entry_bar_idx"]:
+                    pos = positions[sym]
+                    reason = ""
+                    exit_px = b_close
+                    if not is_short:
+                        if b_high > pos["extreme"]:
+                            pos["extreme"] = b_high
+                        if sl_pct > 0 and b_low <= pos["entry_price"] * (1.0 - sl_pct / 100.0):
+                            stop_lvl = pos["entry_price"] * (1.0 - sl_pct / 100.0)
+                            exit_px = min(b_open, stop_lvl) if b_open < stop_lvl else stop_lvl
+                            reason = f"STOP_LOSS (-{sl_pct:.1f}%)"
+                        elif tsl_pct > 0 and pos["extreme"] > pos["entry_price"] and b_low <= pos["extreme"] * (1.0 - tsl_pct / 100.0):
+                            exit_px = pos["extreme"] * (1.0 - tsl_pct / 100.0)
+                            reason = f"TRAILING_SL (-{tsl_pct:.1f}%)"
+                        elif tp_pct > 0 and b_high >= pos["entry_price"] * (1.0 + tp_pct / 100.0):
+                            tp_lvl = pos["entry_price"] * (1.0 + tp_pct / 100.0)
+                            exit_px = max(b_open, tp_lvl) if b_open > tp_lvl else tp_lvl
+                            reason = f"TAKE_PROFIT (+{tp_pct:.1f}%)"
+                        elif is_session_last_bar:
+                            exit_px = b_close
+                            reason = "MIS_EOD_SQUAREOFF"
+                    else:
+                        if b_low < pos["extreme"]:
+                            pos["extreme"] = b_low
+                        if sl_pct > 0 and b_high >= pos["entry_price"] * (1.0 + sl_pct / 100.0):
+                            exit_px = pos["entry_price"] * (1.0 + sl_pct / 100.0)
+                            reason = f"STOP_LOSS (-{sl_pct:.1f}%)"
+                        elif tsl_pct > 0 and pos["extreme"] < pos["entry_price"] and b_high >= pos["extreme"] * (1.0 + tsl_pct / 100.0):
+                            exit_px = pos["extreme"] * (1.0 + tsl_pct / 100.0)
+                            reason = f"TRAILING_SL (-{tsl_pct:.1f}%)"
+                        elif tp_pct > 0 and b_low <= pos["entry_price"] * (1.0 - tp_pct / 100.0):
+                            exit_px = pos["entry_price"] * (1.0 - tp_pct / 100.0)
+                            reason = f"TAKE_PROFIT (+{tp_pct:.1f}%)"
+                        elif is_session_last_bar:
+                            exit_px = b_close
+                            reason = "MIS_EOD_SQUAREOFF"
+
+                    if reason:
+                        _close_position(sym, exit_px, bar_ts, step_idx, sym_i, reason)
+                        continue
+
+                # Schedule NEXT-BAR signals evaluated at bar close
+                if not is_last_bar:
+                    if sym in positions and exit_sig:
+                        pending_exits.add(sym)
+                    elif sym not in positions and enter_sig and not is_session_last_bar:
+                        if within_time_window(bar, start_time, end_time, timeframe):
+                            pending_entries[sym] = mom_val
+
+            # 4) Mark-to-market portfolio curve point
             eq = _mark_to_market_equity()
             if eq > peak_equity:
                 peak_equity = eq
             dd = ((peak_equity - eq) / peak_equity) * 100.0 if peak_equity > 0 else 0.0
             raw_curve.append(
                 {
-                    "date": bar_date,
+                    "date": step_ts_label,
                     "equity": round(eq, 2),
                     "drawdown_pct": round(dd, 2),
                     "open_positions": len(positions),
@@ -858,9 +1128,22 @@ class PortfolioBacktestEngine:
             )
 
         # Force-close open positions at end of window
-        last_date = ordered_ts[-1][:10] if ordered_ts else to_date
+        last_step_idx = max(0, total_steps - 1)
+        last_ts_label = (ordered_ts[-1][:10] if not is_intraday_tf else ordered_ts[-1][:16].replace("T", " ")) if ordered_ts else to_date
         for psym in list(positions.keys()):
-            _close_position(psym, sym_series[psym]["last_close"], last_date, "END_OF_WINDOW")
+            last_sym_i = sym_series[psym]["bars_count"] - 1
+            _close_position(psym, sym_series[psym]["last_close"], last_ts_label, last_step_idx, last_sym_i, "END_OF_WINDOW")
+
+        # Persist complete-period OHLCV + Indicator rows for CSV export
+        self._store_export_bundle(
+            run_id,
+            {
+                "run_id": run_id,
+                "strategy": strategy_id,
+                "indicator_columns": export_ind_cols,
+                "by_symbol": {s: sym_series[s]["export_rows"] for s in active_syms},
+            },
+        )
 
         final_equity = cash
         metrics = _compute_metrics_from_curve_and_trades(
@@ -901,6 +1184,10 @@ class PortfolioBacktestEngine:
             "run_id": run_id,
             "mode": "portfolio",
             "allocation_mode": allocation_mode,
+            "side": "SHORT" if is_short else "LONG",
+            "holding_type": holding_type,
+            "start_time": start_time,
+            "end_time": end_time,
             "max_open_positions": eff_max_slots,
             "risk_per_trade_pct": risk_per_trade_pct,
             "signal_ranking": signal_ranking,
@@ -926,6 +1213,8 @@ class PortfolioBacktestEngine:
             "charges_profile": charges_cfg.profile,
             "segment": charges_cfg.segment,
             "charges_breakdown": agg_charges.to_dict(),
+            "indicator_columns": export_ind_cols,
+            "has_ohlcv_export": True,
             **metrics,
             "equity_curve": _downsample_curve(raw_curve),
             "per_symbol": per_symbol_rows,

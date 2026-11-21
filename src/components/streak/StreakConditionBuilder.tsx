@@ -1,11 +1,14 @@
 import { useState } from 'react';
 import {
+  AlertCircle,
   Check,
+  CheckCircle2,
   Code2,
   Copy,
   ClipboardPaste,
   FileCode2,
   FolderPlus,
+  FunctionSquare,
   Plus,
   RefreshCw,
   Save,
@@ -158,8 +161,20 @@ const MTF_TFS = [
   { id: '1w', label: '1W' },
 ];
 
+const FORMULA_EXAMPLES = [
+  { label: 'High(-2) > Max(6, High(0))', expr: 'High(-2) > Max(6, High(0))' },
+  { label: 'EMA(high, 20, 0) >= Period max(14, Close(-2))', expr: 'EMA(high, 20, 0) >= Period max(14, Close(-2))' },
+  { label: 'Close(0) > SMA(20) * 1.02', expr: 'Close(0) > SMA(20) * 1.02' },
+  { label: 'Crosses_Above(EMA(20), EMA(50))', expr: 'Crosses_Above(EMA(20), EMA(50))' },
+  { label: 'RSI(14) > 60 and Volume(0) > Vol_SMA(20) * 1.5', expr: 'RSI(14) > 60 and Volume(0) > Vol_SMA(20) * 1.5' },
+];
+
 function isConditionGroup(node: VisualCondition | VisualConditionGroup): node is VisualConditionGroup {
   return 'conditions' in node && Array.isArray(node.conditions);
+}
+
+function isFormulaCondition(node: VisualCondition): boolean {
+  return node.kind === 'formula' || (typeof node.expression === 'string' && node.expression.trim().length > 0);
 }
 
 function defaultCondition(tf = '1day'): VisualCondition {
@@ -167,6 +182,18 @@ function defaultCondition(tf = '1day'): VisualCondition {
     left: { type: 'close', offset: 0 },
     operator: '>',
     right: { type: 'ema', period: 20, offset: 0 },
+    enabled: true,
+    timeframe: tf,
+  };
+}
+
+function defaultFormulaCondition(tf = '1day', expr = 'High(-2) > Max(6, High(0))'): VisualCondition {
+  return {
+    kind: 'formula',
+    expression: expr,
+    left: { type: 'close', offset: 0 },
+    operator: '>',
+    right: { type: 'number', value: 0 },
     enabled: true,
     timeframe: tf,
   };
@@ -335,6 +362,9 @@ export function StreakConditionBuilder({
 
   const [clipboardNode, setClipboardNode] = useState<string>('');
   const [pasteNotice, setPasteNotice] = useState('');
+  const [formulaStatus, setFormulaStatus] = useState<
+    Record<string, { checking?: boolean; valid?: boolean; error?: string; series?: string[] }>
+  >({});
 
   // Python code editor state
   const [pyEditorOpen, setPyEditorOpen] = useState(false);
@@ -347,6 +377,36 @@ export function StreakConditionBuilder({
   const isMtfPlugin =
     kind === 'screen' &&
     Boolean((selectedPlugin as ScreenSpecMeta | undefined)?.supports_multi_timeframe || selectedPythonId === 'support_resistance');
+
+  const validateFormulaExpr = async (key: string, expression: string, expectBoolean: boolean) => {
+    const trimmed = expression.trim();
+    if (!trimmed) {
+      setFormulaStatus((prev) => ({ ...prev, [key]: { valid: false, error: 'Formula cannot be empty.' } }));
+      return;
+    }
+    setFormulaStatus((prev) => ({ ...prev, [key]: { checking: true } }));
+    try {
+      const res = await fetch('/api/streak/formula/validate', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ expression: trimmed, expect_boolean: expectBoolean }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (body.valid) {
+        setFormulaStatus((prev) => ({
+          ...prev,
+          [key]: { valid: true, series: Array.isArray(body.series_keys) ? body.series_keys : [] },
+        }));
+      } else {
+        setFormulaStatus((prev) => ({
+          ...prev,
+          [key]: { valid: false, error: body.error || body.detail || 'Invalid formula syntax.' },
+        }));
+      }
+    } catch {
+      setFormulaStatus((prev) => ({ ...prev, [key]: { valid: false, error: 'Validation request failed.' } }));
+    }
+  };
 
   const updateConditionAt = (idx: number, patch: Partial<VisualCondition>) => {
     const next = [...group.conditions];
@@ -363,7 +423,14 @@ export function StreakConditionBuilder({
     let nextSide: VisualOperandSpec = { ...prevSide, ...patch };
     if (patch.type && patch.type !== prevSide.type) {
       const meta = opList.find((o) => o.id === patch.type);
-      if (patch.type === 'number') {
+      if (patch.type === 'formula') {
+        nextSide = {
+          type: 'formula',
+          expr:
+            prevSide.expr ||
+            (side === 'left' ? 'EMA(high, 20, 0)' : 'Period max(14, Close(-2))'),
+        };
+      } else if (patch.type === 'number') {
         nextSide = { type: 'number', value: prevSide.value ?? 50 };
       } else if (meta?.default_period) {
         nextSide = { type: patch.type, period: meta.default_period, offset: prevSide.offset ?? 0 };
@@ -393,6 +460,10 @@ export function StreakConditionBuilder({
       ? (JSON.parse(JSON.stringify({ ...preset, timeframe: defaultTimeframe })) as VisualCondition)
       : defaultCondition(defaultTimeframe);
     onGroupChange({ ...group, conditions: [...group.conditions, cond] });
+  };
+
+  const addFormulaCondition = (expr = 'High(-2) > Max(6, High(0))') => {
+    onGroupChange({ ...group, conditions: [...group.conditions, defaultFormulaCondition(defaultTimeframe, expr)] });
   };
 
   const addNestedGroup = () => {
@@ -477,15 +548,59 @@ export function StreakConditionBuilder({
   const renderOperandControls = (
     spec: VisualOperandSpec,
     onChange: (patch: Partial<VisualOperandSpec>) => void,
-    compact = false
+    compact = false,
+    allowFormula = false,
+    statusKey?: string
   ) => {
-    const meta = opList.find((o) => o.id === spec.type);
-    const isNum = spec.type === 'number';
+    const safeSpec: VisualOperandSpec = spec || { type: 'close', offset: 0 };
+    const isFormula = safeSpec.type === 'formula';
+    const meta = opList.find((o) => o.id === safeSpec.type);
+    const isNum = safeSpec.type === 'number';
     const needsPeriod = Boolean(meta?.default_period);
+    const st = statusKey ? formulaStatus[statusKey] : undefined;
+
+    if (isFormula) {
+      return (
+        <div className={`flex flex-1 flex-col gap-1 ${compact ? '' : 'min-w-[180px]'}`}>
+          <div className="flex items-center gap-1">
+            <span className="shrink-0 rounded bg-sky-950/80 px-1.5 py-0.5 font-mono text-[10px] font-bold text-sky-300">
+              fx
+            </span>
+            <input
+              type="text"
+              value={safeSpec.expr || ''}
+              onChange={(e) => onChange({ expr: e.target.value })}
+              onBlur={() => {
+                if (statusKey && safeSpec.expr?.trim()) {
+                  void validateFormulaExpr(statusKey, safeSpec.expr, false);
+                }
+              }}
+              placeholder="e.g. Period max(14, Close(-2))"
+              aria-label="Formula expression operand"
+              className="min-h-[32px] w-full flex-1 rounded-md border border-slate-700 bg-[#0b1120] px-2 font-mono text-xs text-sky-200 placeholder-slate-500 focus:border-sky-400 focus:outline-none"
+            />
+            <button
+              type="button"
+              onClick={() => onChange({ type: 'close', offset: 0 })}
+              title="Switch back to dropdown operand"
+              className="shrink-0 rounded border border-slate-700 bg-[#0b1120] px-1.5 py-1 text-[10px] font-semibold text-slate-400 hover:border-sky-400 hover:text-slate-100"
+            >
+              Block
+            </button>
+          </div>
+          {st && !st.checking && (
+            <div className={`font-mono text-[10px] ${st.valid ? 'text-emerald-400' : 'text-red-400'}`}>
+              {st.valid ? 'Valid expression' : st.error}
+            </div>
+          )}
+        </div>
+      );
+    }
+
     return (
       <div className={`flex flex-wrap items-center gap-1.5 ${compact ? '' : 'flex-1'}`}>
         <select
-          value={spec.type}
+          value={safeSpec.type}
           onChange={(e) => onChange({ type: e.target.value })}
           className="min-h-[34px] min-w-[112px] flex-1 rounded-md border border-slate-700 bg-[#0b1120] px-2 text-xs font-medium text-slate-100 focus:border-sky-400 focus:outline-none"
         >
@@ -494,12 +609,13 @@ export function StreakConditionBuilder({
               {op.label}
             </option>
           ))}
+          {allowFormula && <option value="formula">Formula (Math Expr)</option>}
         </select>
         {isNum ? (
           <input
             type="number"
             step="0.5"
-            value={spec.value ?? 0}
+            value={safeSpec.value ?? 0}
             onChange={(e) => onChange({ value: Number(e.target.value) })}
             aria-label="Constant value"
             className="min-h-[34px] w-20 rounded-md border border-slate-700 bg-[#0b1120] px-2 font-mono text-xs text-slate-100 tabular-nums focus:border-sky-400 focus:outline-none"
@@ -511,7 +627,7 @@ export function StreakConditionBuilder({
                 type="number"
                 min={1}
                 max={400}
-                value={spec.period ?? meta?.default_period ?? 14}
+                value={safeSpec.period ?? meta?.default_period ?? 14}
                 onChange={(e) => onChange({ period: Math.max(1, Number(e.target.value) || 1) })}
                 title="Period"
                 aria-label="Indicator period"
@@ -519,7 +635,7 @@ export function StreakConditionBuilder({
               />
             )}
             <select
-              value={String(spec.offset ?? 0)}
+              value={String(safeSpec.offset ?? 0)}
               onChange={(e) => onChange({ offset: Number(e.target.value) })}
               title="Candle offset (0 = current, -1 = previous)"
               aria-label="Candle offset"
@@ -533,6 +649,16 @@ export function StreakConditionBuilder({
               <option value="-6">(-6)</option>
             </select>
           </>
+        )}
+        {allowFormula && (
+          <button
+            type="button"
+            onClick={() => onChange({ type: 'formula' })}
+            title="Switch to math formula expression (e.g. Period max(14, Close(-2)))"
+            className="min-h-[30px] shrink-0 rounded border border-slate-700 bg-[#0b1120] px-1.5 font-mono text-[10px] font-bold text-sky-400 hover:border-sky-400"
+          >
+            fx
+          </button>
         )}
       </div>
     );
@@ -600,6 +726,38 @@ export function StreakConditionBuilder({
                       >
                         <Trash2 className="h-3.5 w-3.5" />
                       </button>
+                    </div>
+                  );
+                }
+                if (isFormulaCondition(node)) {
+                  return (
+                    <div
+                      key={`basic-formula-${idx}`}
+                      className="flex items-center justify-between gap-2 rounded-lg border border-sky-800/60 bg-sky-950/20 px-3 py-2 text-xs text-sky-200"
+                    >
+                      <div className="flex min-w-0 items-center gap-2">
+                        <span className="rounded bg-sky-900/70 px-1.5 py-0.5 font-mono text-[10px] font-bold text-sky-300">
+                          fx
+                        </span>
+                        <span className="truncate font-mono">{node.expression}</span>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => onModeChange('advance')}
+                          className="text-[11px] font-semibold text-sky-400 hover:underline"
+                        >
+                          Edit in Advance
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => removeNodeAt(idx)}
+                          className="text-slate-400 hover:text-red-400"
+                          aria-label="Remove formula condition"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
                     </div>
                   );
                 }
@@ -804,7 +962,11 @@ export function StreakConditionBuilder({
             }
 
             const enabled = node.enabled !== false;
+            const isFormulaRow = isFormulaCondition(node);
             const isPctOp = node.operator === 'up_by_pct' || node.operator === 'down_by_pct';
+            const rowKey = `adv-row-${idx}`;
+            const rowStatus = formulaStatus[rowKey];
+
             return (
               <div key={`adv-${idx}`} className="space-y-2">
                 {idx > 0 && (
@@ -816,106 +978,230 @@ export function StreakConditionBuilder({
                     {group.logic.toLowerCase()}
                   </button>
                 )}
-                <div
-                  className={`flex flex-wrap items-center gap-2 rounded-lg border p-2.5 transition-opacity ${
-                    enabled ? 'border-slate-700 bg-[#0b1120]/80' : 'border-slate-800/60 bg-[#0b1120]/30 opacity-50'
-                  }`}
-                >
-                  {/* Timeframe badge */}
-                  <select
-                    value={node.timeframe || defaultTimeframe}
-                    onChange={(e) => updateConditionAt(idx, { timeframe: e.target.value })}
-                    aria-label="Condition timeframe"
-                    className="min-h-[34px] rounded-md border border-slate-700 bg-[#111827] px-2 font-mono text-[11px] text-slate-300 focus:border-sky-400 focus:outline-none"
+
+                {isFormulaRow ? (
+                  <div
+                    className={`space-y-2 rounded-lg border p-3 transition-opacity ${
+                      enabled
+                        ? 'border-sky-700/70 bg-[#0b1120]/90'
+                        : 'border-slate-800/60 bg-[#0b1120]/30 opacity-50'
+                    }`}
                   >
-                    {ADVANCE_TFS.map((t) => (
-                      <option key={t.id} value={t.id}>
-                        {t.label}
-                      </option>
-                    ))}
-                  </select>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <select
+                        value={node.timeframe || defaultTimeframe}
+                        onChange={(e) => updateConditionAt(idx, { timeframe: e.target.value })}
+                        aria-label="Formula condition timeframe"
+                        className="min-h-[34px] rounded-md border border-slate-700 bg-[#111827] px-2 font-mono text-[11px] text-slate-300 focus:border-sky-400 focus:outline-none"
+                      >
+                        {ADVANCE_TFS.map((t) => (
+                          <option key={t.id} value={t.id}>
+                            {t.label}
+                          </option>
+                        ))}
+                      </select>
 
-                  {/* Left expression (dashed Streak style) */}
-                  <div className="flex flex-1 items-center gap-1 rounded-md border border-dashed border-slate-700 bg-[#111827]/70 p-1">
-                    {renderOperandControls(node.left, (p) => updateOperandAt(idx, 'left', p))}
+                      <span className="inline-flex items-center gap-1 rounded bg-sky-950/80 px-2 py-1 font-mono text-[11px] font-bold text-sky-300">
+                        <FunctionSquare className="h-3.5 w-3.5" />
+                        <span>Formula</span>
+                      </span>
+
+                      <input
+                        type="text"
+                        value={node.expression || ''}
+                        onChange={(e) => updateConditionAt(idx, { kind: 'formula', expression: e.target.value })}
+                        onBlur={() => void validateFormulaExpr(rowKey, node.expression || '', true)}
+                        placeholder="High(-2) > Max(6, High(0))"
+                        aria-label="Mathematical formula expression"
+                        className="min-h-[36px] min-w-[220px] flex-1 rounded-md border border-dashed border-sky-700/80 bg-[#111827] px-3 font-mono text-xs text-sky-200 placeholder-slate-500 focus:border-sky-400 focus:outline-none"
+                      />
+
+                      <button
+                        type="button"
+                        onClick={() => void validateFormulaExpr(rowKey, node.expression || '', true)}
+                        disabled={rowStatus?.checking}
+                        className="inline-flex min-h-[34px] items-center gap-1 rounded-md border border-slate-700 bg-[#111827] px-2.5 text-[11px] font-semibold text-slate-200 hover:border-sky-400"
+                      >
+                        <Check className="h-3 w-3 text-sky-400" />
+                        <span>{rowStatus?.checking ? 'Checking...' : 'Validate'}</span>
+                      </button>
+
+                      {/* Row controls */}
+                      <div className="flex items-center gap-1">
+                        <button
+                          type="button"
+                          role="switch"
+                          aria-checked={enabled}
+                          title={enabled ? 'Disable condition' : 'Enable condition'}
+                          onClick={() => updateConditionAt(idx, { enabled: !enabled })}
+                          className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
+                            enabled ? 'bg-sky-500' : 'bg-slate-700'
+                          }`}
+                        >
+                          <span
+                            className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
+                              enabled ? 'translate-x-4' : 'translate-x-1'
+                            }`}
+                          />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => duplicateNodeAt(idx)}
+                          title="Duplicate formula"
+                          className="flex h-7 w-7 items-center justify-center rounded text-slate-400 hover:bg-slate-800 hover:text-slate-100"
+                        >
+                          <Copy className="h-3.5 w-3.5" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => removeNodeAt(idx)}
+                          title="Delete formula"
+                          className="flex h-7 w-7 items-center justify-center rounded text-slate-400 hover:bg-red-950/60 hover:text-red-400"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
+                    </div>
+
+                    {rowStatus && !rowStatus.checking && (
+                      <div
+                        className={`flex items-center gap-1.5 font-mono text-[11px] ${
+                          rowStatus.valid ? 'text-emerald-400' : 'text-red-400'
+                        }`}
+                      >
+                        {rowStatus.valid ? (
+                          <>
+                            <CheckCircle2 className="h-3.5 w-3.5 shrink-0" />
+                            <span>
+                              Valid formula
+                              {rowStatus.series && rowStatus.series.length > 0
+                                ? ` · Indicators: ${rowStatus.series.join(', ')}`
+                                : ''}
+                            </span>
+                          </>
+                        ) : (
+                          <>
+                            <AlertCircle className="h-3.5 w-3.5 shrink-0" />
+                            <span>{rowStatus.error}</span>
+                          </>
+                        )}
+                      </div>
+                    )}
                   </div>
-
-                  {/* Comparator */}
-                  <div className="flex items-center gap-1 rounded-md border border-dashed border-slate-700 bg-[#111827]/70 p-1">
+                ) : (
+                  <div
+                    className={`flex flex-wrap items-center gap-2 rounded-lg border p-2.5 transition-opacity ${
+                      enabled ? 'border-slate-700 bg-[#0b1120]/80' : 'border-slate-800/60 bg-[#0b1120]/30 opacity-50'
+                    }`}
+                  >
+                    {/* Timeframe badge */}
                     <select
-                      value={node.operator}
-                      onChange={(e) => {
-                        const op = e.target.value;
-                        updateConditionAt(idx, {
-                          operator: op,
-                          pct: op === 'up_by_pct' || op === 'down_by_pct' ? (node.pct ?? 1.0) : undefined,
-                        });
-                      }}
-                      className="min-h-[32px] bg-transparent px-1.5 text-xs font-medium text-amber-300 focus:outline-none"
+                      value={node.timeframe || defaultTimeframe}
+                      onChange={(e) => updateConditionAt(idx, { timeframe: e.target.value })}
+                      aria-label="Condition timeframe"
+                      className="min-h-[34px] rounded-md border border-slate-700 bg-[#111827] px-2 font-mono text-[11px] text-slate-300 focus:border-sky-400 focus:outline-none"
                     >
-                      {cmpList.map((c) => (
-                        <option key={c.id} value={c.id} className="bg-[#111827]">
-                          {c.label}
+                      {ADVANCE_TFS.map((t) => (
+                        <option key={t.id} value={t.id}>
+                          {t.label}
                         </option>
                       ))}
                     </select>
-                    {isPctOp && (
-                      <input
-                        type="number"
-                        step="0.25"
-                        value={node.pct ?? 1}
-                        onChange={(e) => updateConditionAt(idx, { pct: Number(e.target.value) })}
-                        className="w-12 rounded border border-slate-700 bg-[#0b1120] px-1.5 py-1 font-mono text-xs text-slate-100"
-                      />
-                    )}
-                  </div>
 
-                  {/* Right expression */}
-                  <div className="flex flex-1 items-center gap-1 rounded-md border border-dashed border-slate-700 bg-[#111827]/70 p-1">
-                    {renderOperandControls(node.right, (p) => updateOperandAt(idx, 'right', p))}
-                  </div>
+                    {/* Left expression (dashed Streak style with fx math support) */}
+                    <div className="flex flex-1 items-center gap-1 rounded-md border border-dashed border-slate-700 bg-[#111827]/70 p-1">
+                      {renderOperandControls(
+                        node.left,
+                        (p) => updateOperandAt(idx, 'left', p),
+                        false,
+                        true,
+                        `${rowKey}-left`
+                      )}
+                    </div>
 
-                  {/* Row controls: Enable toggle, Duplicate, Copy, Delete */}
-                  <div className="flex items-center gap-1">
-                    <button
-                      type="button"
-                      role="switch"
-                      aria-checked={enabled}
-                      title={enabled ? 'Disable condition' : 'Enable condition'}
-                      onClick={() => updateConditionAt(idx, { enabled: !enabled })}
-                      className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
-                        enabled ? 'bg-sky-500' : 'bg-slate-700'
-                      }`}
-                    >
-                      <span
-                        className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
-                          enabled ? 'translate-x-4' : 'translate-x-1'
+                    {/* Comparator */}
+                    <div className="flex items-center gap-1 rounded-md border border-dashed border-slate-700 bg-[#111827]/70 p-1">
+                      <select
+                        value={node.operator}
+                        onChange={(e) => {
+                          const op = e.target.value;
+                          updateConditionAt(idx, {
+                            operator: op,
+                            pct: op === 'up_by_pct' || op === 'down_by_pct' ? (node.pct ?? 1.0) : undefined,
+                          });
+                        }}
+                        className="min-h-[32px] bg-transparent px-1.5 text-xs font-medium text-amber-300 focus:outline-none"
+                      >
+                        {cmpList.map((c) => (
+                          <option key={c.id} value={c.id} className="bg-[#111827]">
+                            {c.label}
+                          </option>
+                        ))}
+                      </select>
+                      {isPctOp && (
+                        <input
+                          type="number"
+                          step="0.25"
+                          value={node.pct ?? 1}
+                          onChange={(e) => updateConditionAt(idx, { pct: Number(e.target.value) })}
+                          className="w-12 rounded border border-slate-700 bg-[#0b1120] px-1.5 py-1 font-mono text-xs text-slate-100"
+                        />
+                      )}
+                    </div>
+
+                    {/* Right expression (dashed Streak style with fx math support) */}
+                    <div className="flex flex-1 items-center gap-1 rounded-md border border-dashed border-slate-700 bg-[#111827]/70 p-1">
+                      {renderOperandControls(
+                        node.right,
+                        (p) => updateOperandAt(idx, 'right', p),
+                        false,
+                        true,
+                        `${rowKey}-right`
+                      )}
+                    </div>
+
+                    {/* Row controls: Enable toggle, Duplicate, Delete */}
+                    <div className="flex items-center gap-1">
+                      <button
+                        type="button"
+                        role="switch"
+                        aria-checked={enabled}
+                        title={enabled ? 'Disable condition' : 'Enable condition'}
+                        onClick={() => updateConditionAt(idx, { enabled: !enabled })}
+                        className={`relative inline-flex h-5 w-9 shrink-0 items-center rounded-full transition-colors ${
+                          enabled ? 'bg-sky-500' : 'bg-slate-700'
                         }`}
-                      />
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => duplicateNodeAt(idx)}
-                      title="Duplicate condition"
-                      className="flex h-7 w-7 items-center justify-center rounded text-slate-400 hover:bg-slate-800 hover:text-slate-100"
-                    >
-                      <Copy className="h-3.5 w-3.5" />
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => removeNodeAt(idx)}
-                      title="Delete condition"
-                      className="flex h-7 w-7 items-center justify-center rounded text-slate-400 hover:bg-red-950/60 hover:text-red-400"
-                    >
-                      <Trash2 className="h-3.5 w-3.5" />
-                    </button>
+                      >
+                        <span
+                          className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
+                            enabled ? 'translate-x-4' : 'translate-x-1'
+                          }`}
+                        />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => duplicateNodeAt(idx)}
+                        title="Duplicate condition"
+                        className="flex h-7 w-7 items-center justify-center rounded text-slate-400 hover:bg-slate-800 hover:text-slate-100"
+                      >
+                        <Copy className="h-3.5 w-3.5" />
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => removeNodeAt(idx)}
+                        title="Delete condition"
+                        className="flex h-7 w-7 items-center justify-center rounded text-slate-400 hover:bg-red-950/60 hover:text-red-400"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </button>
+                    </div>
                   </div>
-                </div>
+                )}
               </div>
             );
           })}
 
-          {/* Advance bottom action bar matching Streak screenshot */}
+          {/* Advance bottom action bar matching Streak + Mathematical Formula support */}
           <div className="flex flex-wrap items-center gap-2 pt-1">
             <button
               type="button"
@@ -924,6 +1210,14 @@ export function StreakConditionBuilder({
             >
               <Plus className="h-3.5 w-3.5" />
               <span>and / or</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => addFormulaCondition()}
+              className="inline-flex min-h-[34px] items-center gap-1 rounded-lg border border-sky-600/80 bg-sky-500/15 px-3 text-xs font-semibold text-sky-200 hover:border-sky-400 hover:bg-sky-500/25"
+            >
+              <FunctionSquare className="h-3.5 w-3.5 text-sky-400" />
+              <span>+ Math Formula</span>
             </button>
             <button
               type="button"
@@ -950,6 +1244,30 @@ export function StreakConditionBuilder({
               <span>Paste All</span>
             </button>
             {pasteNotice && <span className="text-xs text-emerald-400">{pasteNotice}</span>}
+          </div>
+
+          {/* Mathematical Formula quick-insert reference bar */}
+          <div className="rounded-lg border border-slate-800 bg-[#0b1120]/60 p-3">
+            <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-400">
+              <span className="font-semibold text-slate-300">
+                Mathematical Formula Templates (click to insert)
+              </span>
+              <span className="font-mono text-[10px] text-slate-500">
+                Supports High(-2), Max(6, High(0)), Period max(14, Close(-2)), EMA(high, 20, 0), SMA, RSI, ATR, VWAP, +, -, *, /
+              </span>
+            </div>
+            <div className="mt-2 flex flex-wrap gap-1.5">
+              {FORMULA_EXAMPLES.map((ex) => (
+                <button
+                  key={ex.label}
+                  type="button"
+                  onClick={() => addFormulaCondition(ex.expr)}
+                  className="rounded border border-slate-700 bg-[#111827] px-2 py-1 font-mono text-[11px] text-sky-300 hover:border-sky-500 hover:text-sky-200"
+                >
+                  {ex.label}
+                </button>
+              ))}
+            </div>
           </div>
         </div>
       )}

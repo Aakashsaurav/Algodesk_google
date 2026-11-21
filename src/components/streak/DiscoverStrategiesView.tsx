@@ -71,8 +71,10 @@ export function DiscoverStrategiesView({
   // Full result drill-down mode
   const [fullViewResult, setFullViewResult] = useState<BacktestFullResult | null>(null);
 
-  // Modals
+  // Modals & Delete confirmation
   const [myStrategiesOpen, setMyStrategiesOpen] = useState(false);
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
 
   const allStrategies = useMemo<UnifiedStrategyItem[]>(() => {
     const visuals: UnifiedStrategyItem[] = (meta.visual_rules || [])
@@ -146,7 +148,7 @@ export function DiscoverStrategiesView({
 
       const payload: Record<string, unknown> = {
         mode: 'portfolio',
-        allocation_mode: 'equal_weight',
+        allocation_mode: 'shared_pool',
         strategy_mode: item.engine === 'python' ? 'python' : 'visual',
         strategy: item.engine === 'python' ? item.id : `visual:${item.id}`,
         rule_def: item.engine !== 'python' ? item.rule : undefined,
@@ -155,6 +157,8 @@ export function DiscoverStrategiesView({
         timeframe: item.timeframe,
         from_date: fromIso,
         to_date: toIso,
+        side: item.rule?.side || 'BUY',
+        holding_type: item.segment === 'equity_intraday' ? 'MIS' : 'CNC',
         initial_capital: 500000,
         stop_loss_pct: item.rule?.stop_loss_pct ?? 2.0,
         take_profit_pct: item.rule?.take_profit_pct ?? 4.0,
@@ -202,6 +206,27 @@ export function DiscoverStrategiesView({
   }, [activeResult, previewSymbol]);
 
   const stats = useMemo(() => computeTradeAnalytics(activeTrades, true), [activeTrades]);
+
+  const handleDeleteRule = async (ruleIdToDelete: string) => {
+    setDeletingId(ruleIdToDelete);
+    setError('');
+    try {
+      const res = await fetch(`/api/streak/rules/${encodeURIComponent(ruleIdToDelete)}`, {
+        method: 'DELETE',
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.detail || 'Could not delete strategy.');
+      setConfirmDeleteId(null);
+      if (selected?.rule?.id === ruleIdToDelete) {
+        setSelectedKey('');
+      }
+      onRefreshMeta();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Delete failed.');
+    } finally {
+      setDeletingId(null);
+    }
+  };
 
   const openStrategyInBuilder = (item: UnifiedStrategyItem, isCopy: boolean) => {
     onOpenInCreateStrategy({
@@ -354,6 +379,38 @@ export function DiscoverStrategiesView({
                 </div>
 
                 <div className="flex flex-wrap items-center gap-2">
+                  {selected.rule?.id && (
+                    confirmDeleteId === selected.rule.id ? (
+                      <div className="inline-flex items-center gap-1.5 rounded-lg border border-red-800/80 bg-red-950/50 px-2.5 py-1">
+                        <span className="text-[11px] text-red-200">Delete?</span>
+                        <button
+                          type="button"
+                          disabled={deletingId === selected.rule.id}
+                          onClick={() => void handleDeleteRule(selected.rule!.id!)}
+                          className="rounded bg-red-600 px-2 py-0.5 text-[11px] font-semibold text-white hover:bg-red-500 disabled:opacity-50"
+                        >
+                          {deletingId === selected.rule.id ? '...' : 'Confirm'}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setConfirmDeleteId(null)}
+                          className="text-[11px] text-slate-300 hover:text-white"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={() => setConfirmDeleteId(selected.rule!.id!)}
+                        className="inline-flex min-h-[34px] items-center gap-1.5 rounded-lg border border-red-900/70 bg-red-950/30 px-2.5 text-xs font-semibold text-red-300 hover:border-red-500 hover:text-red-200"
+                        title="Delete strategy"
+                      >
+                        <Trash2 className="h-3.5 w-3.5" />
+                        <span>Delete</span>
+                      </button>
+                    )
+                  )}
                   <button
                     type="button"
                     onClick={() => openStrategyInBuilder(selected, false)}
@@ -629,17 +686,35 @@ export function DiscoverStrategiesView({
                     >
                       Edit
                     </button>
-                    {r.id && !r.seeded && (
-                      <button
-                        type="button"
-                        onClick={async () => {
-                          await fetch(`/api/streak/rules/${encodeURIComponent(r.id!)}`, { method: 'DELETE' });
-                          onRefreshMeta();
-                        }}
-                        className="rounded-lg border border-slate-700 p-1.5 text-slate-400 hover:border-red-700 hover:text-red-400"
-                      >
-                        <Trash2 className="h-3.5 w-3.5" />
-                      </button>
+                    {r.id && (
+                      confirmDeleteId === r.id ? (
+                        <div className="inline-flex items-center gap-1">
+                          <button
+                            type="button"
+                            disabled={deletingId === r.id}
+                            onClick={() => void handleDeleteRule(r.id!)}
+                            className="rounded-md bg-red-600 px-2.5 py-1 text-[11px] font-semibold text-white hover:bg-red-500 disabled:opacity-50"
+                          >
+                            {deletingId === r.id ? '...' : 'Delete'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setConfirmDeleteId(null)}
+                            className="rounded-md border border-slate-700 px-2 py-1 text-[11px] text-slate-300 hover:text-white"
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => setConfirmDeleteId(r.id!)}
+                          aria-label={`Delete ${r.name}`}
+                          className="rounded-lg border border-slate-700 p-1.5 text-slate-400 hover:border-red-700 hover:text-red-400"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                      )
                     )}
                   </div>
                 </div>

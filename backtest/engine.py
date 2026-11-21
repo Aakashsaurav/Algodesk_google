@@ -3,6 +3,16 @@ backtest/engine.py
 ==================
 Single-pass O(N) backtester loading hot-reloaded `.py` strategies from
 `StrategyRegistry`, powered by Hybrid Parquet/SQLite OHLCV storage and IndicatorToolkit.
+
+Execution realism:
+- Signals evaluated at the close of bar `i` execute on the NEXT bar `i + 1` at
+  `bar[i + 1]["open"]` (zero look-ahead bias).
+- Strict `exit_bar_idx > entry_bar_idx` invariant: BUY and SELL never occur on
+  the same bar.
+- Supports both LONG (`side="BUY"`) and SHORT (`side="SELL"`), intraday session
+  time windows (`start_time` / `end_time`), and `MIS` end-of-day square-off.
+- Optionally collects complete-period OHLCV + symbol + strategy indicator values
+  for CSV export.
 """
 
 from __future__ import annotations
@@ -10,7 +20,7 @@ from __future__ import annotations
 import math
 import threading
 from datetime import date, datetime, timedelta
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from backtest.registry import StrategyRegistry, strategy_registry
 from config import IST_TZ, config
@@ -24,8 +34,67 @@ from core.jobs import JobCancelledError
 from indicators.toolkit import IndicatorToolkit, available_backends
 
 
+def format_bar_timestamp(bar: Dict[str, Any], timeframe: str) -> str:
+    """Format candle timestamp preserving HH:MM for intraday timeframes."""
+    tf = (timeframe or "1day").strip().lower()
+    ts_raw = str(bar.get("ts_ist") or "").strip()
+    td_raw = str(bar.get("trade_date") or "").strip()
+    if tf in {"1day", "1week", "1month"}:
+        return (td_raw or ts_raw)[:10]
+    if "T" in ts_raw:
+        return ts_raw[:16].replace("T", " ")
+    if len(ts_raw) >= 16:
+        return ts_raw[:16]
+    return (td_raw or ts_raw)[:10]
+
+
+def extract_hhmm(bar: Dict[str, Any]) -> Optional[str]:
+    ts_raw = str(bar.get("ts_ist") or "").strip()
+    if "T" in ts_raw and len(ts_raw) >= 16:
+        return ts_raw[11:16]
+    if " " in ts_raw and len(ts_raw) >= 16:
+        return ts_raw[11:16]
+    return None
+
+
+def within_time_window(bar: Dict[str, Any], start_time: Optional[str], end_time: Optional[str], timeframe: str) -> bool:
+    if (timeframe or "1day").strip().lower() in {"1day", "1week", "1month"}:
+        return True
+    if not start_time and not end_time:
+        return True
+    hhmm = extract_hhmm(bar)
+    if not hhmm:
+        return True
+    if start_time and hhmm < start_time:
+        return False
+    if end_time and hhmm > end_time:
+        return False
+    return True
+
+
+def collect_strategy_indicators(
+    strat_inst: Any,
+    tk: IndicatorToolkit,
+    n_bars: int,
+) -> Dict[str, List[Optional[float]]]:
+    """Merge strategy-declared indicator series with IndicatorToolkit recorded series."""
+    merged: Dict[str, List[Optional[float]]] = {}
+    if hasattr(strat_inst, "get_indicator_series"):
+        try:
+            custom = strat_inst.get_indicator_series() or {}
+            for k, v in custom.items():
+                if isinstance(v, list) and len(v) == n_bars:
+                    merged[str(k)] = v
+        except Exception:
+            pass
+    for k, v in tk.get_recorded_series().items():
+        if k not in merged and isinstance(v, list) and len(v) == n_bars:
+            merged[str(k)] = v
+    return merged
+
+
 class BacktestEngine:
-    """Single-pass O(N) backtester with slippage, fees, SL/TP, and equity curve."""
+    """Single-pass O(N) backtester with next-bar open fills, slippage, fees, SL/TP, and equity curve."""
 
     def __init__(
         self,
@@ -71,9 +140,13 @@ class BacktestEngine:
 
     def _resolve_strategy(
         self,
-        strategy: str,
+        strategy: Any,
         rule_def: Optional[Dict[str, Any]] = None,
     ):
+        from backtest.base import BacktestStrategy
+
+        if isinstance(strategy, BacktestStrategy):
+            return strategy, "python"
         if rule_def is not None:
             from rules.engine import compile_visual_strategy
 
@@ -99,6 +172,10 @@ class BacktestEngine:
         timeframe: str = "1day",
         from_date: Optional[str] = None,
         to_date: Optional[str] = None,
+        start_time: Optional[str] = None,
+        end_time: Optional[str] = None,
+        holding_type: Optional[str] = None,
+        side: Optional[str] = None,
         initial_capital: float = 500000.0,
         slippage_bps: float = 5.0,
         fee_bps: float = 5.0,
@@ -112,6 +189,7 @@ class BacktestEngine:
         backend: str = "auto",
         instrument_type: Optional[str] = None,
         instrument_key: Optional[str] = None,
+        collect_export: bool = False,
         fetcher: Optional[Callable[..., List[Dict[str, Any]]]] = None,
         progress_cb: Optional[Callable[[int, int, str], None]] = None,
         cancel_event: Optional[threading.Event] = None,
@@ -122,9 +200,15 @@ class BacktestEngine:
         clean_exch = (exchange or "NSE").strip().upper()
         tf = normalize_timeframe(timeframe)
         base_tf = resolve_base_timeframe(tf)
+        is_intraday_tf = tf not in {"1day", "1week", "1month"}
 
         strat_inst, strat_mode = self._resolve_strategy(strategy, rule_def=rule_def)
         resolved_params = strat_inst.resolve_params(params)
+
+        eff_side = (side or (rule_def.get("side") if isinstance(rule_def, dict) else None) or "BUY").strip().upper()
+        is_short = eff_side == "SELL"
+        eff_holding = (holding_type or ("MIS" if segment == "equity_intraday" else "CNC")).strip().upper()
+        mis_eod_squareoff = is_intraday_tf and eff_holding == "MIS"
 
         cap = max(1000.0, float(initial_capital or 500000.0))
         cost_rate = max(0.0, (float(slippage_bps or 0.0) + float(fee_bps or 0.0)) / 10000.0)
@@ -182,19 +266,30 @@ class BacktestEngine:
 
         tk = IndicatorToolkit(rows, backend=backend)
         strat_inst.prepare(rows, resolved_params, tk)
+        indicator_series = collect_strategy_indicators(strat_inst, tk, len(rows)) if collect_export else {}
 
         if progress_cb:
-            progress_cb(70, 100, f"Simulating {strat_inst.name}...")
+            progress_cb(70, 100, f"Simulating {strat_inst.name} (next-bar open fills)...")
 
         cash = cap
         shares = 0
         entry_price = 0.0
         entry_date = ""
+        entry_bar_idx = -1
         entry_cost = 0.0
         entry_leg_charges = None
-        highest_since_entry = 0.0
+        extreme_since_entry = 0.0  # highest for LONG, lowest for SHORT
+        pending_entry = False
+        pending_exit = False
         trades: List[Dict[str, Any]] = []
         raw_curve: List[Dict[str, Any]] = []
+
+        # Per-bar audit trail for OHLCV + Indicators CSV export
+        bar_entry_sigs = [0] * len(rows)
+        bar_exit_sigs = [0] * len(rows)
+        bar_order_action = [""] * len(rows)
+        bar_order_price: List[Optional[float]] = [None] * len(rows)
+        bar_exit_reason = [""] * len(rows)
 
         peak_equity = cap
         max_drawdown_pct = 0.0
@@ -202,31 +297,96 @@ class BacktestEngine:
         prev_equity = cap
         gross_pnl_total = 0.0
 
-        def _close_trade(exit_px_raw: float, exit_date_str: str, reason: str) -> None:
-            nonlocal cash, shares, entry_price, entry_date, entry_cost, entry_leg_charges, highest_since_entry, gross_pnl_total
-            gross_trade_pnl = (exit_px_raw - entry_price) * shares
+        def _mark_equity(close_px: float) -> float:
+            if shares <= 0:
+                return cash
+            if is_short:
+                return cash + (shares * entry_price) + ((entry_price - close_px) * shares)
+            return cash + (shares * close_px)
+
+        def _open_trade(fill_px: float, bar_ts: str, bar_i: int) -> bool:
+            nonlocal cash, shares, entry_price, entry_date, entry_bar_idx, entry_cost, entry_leg_charges, extreme_since_entry
+            if fill_px <= 0 or cash <= 0:
+                return False
+            entry_side = "SELL" if is_short else "BUY"
+            if use_real_charges and charges_cfg is not None:
+                from charges.calculator import charges_engine
+
+                est_rate = (charges_cfg.slippage_bps / 10000.0) + charges_cfg.stt_buy_pct + charges_cfg.stamp_duty_buy_pct + 0.001
+                qty = int(max(0.0, cash - charges_cfg.brokerage_flat_per_order * 1.2) // (fill_px * (1.0 + est_rate)))
+                if qty < 1:
+                    return False
+                leg = charges_engine.calculate_leg(
+                    side=entry_side, price=fill_px, quantity=qty, cfg=charges_cfg, include_slippage=True
+                )
+                total_outlay = (qty * fill_px) + leg.total_charges
+                if total_outlay > cash and qty > 1:
+                    qty = max(1, int((cash - leg.total_charges) // fill_px))
+                    leg = charges_engine.calculate_leg(
+                        side=entry_side, price=fill_px, quantity=qty, cfg=charges_cfg, include_slippage=True
+                    )
+                    total_outlay = (qty * fill_px) + leg.total_charges
+                if qty < 1 or total_outlay > cash:
+                    return False
+                shares = qty
+                entry_price = fill_px
+                entry_date = bar_ts
+                entry_bar_idx = bar_i
+                entry_cost = leg.total_charges
+                entry_leg_charges = leg
+                extreme_since_entry = fill_px
+                cash -= total_outlay
+            else:
+                buy_eff = fill_px * (1.0 + cost_rate)
+                qty = int(cash // buy_eff)
+                if qty < 1:
+                    return False
+                shares = qty
+                entry_price = fill_px
+                entry_date = bar_ts
+                entry_bar_idx = bar_i
+                gross = shares * fill_px
+                entry_cost = gross * cost_rate
+                extreme_since_entry = fill_px
+                cash -= gross + entry_cost
+            bar_order_action[bar_i] = entry_side
+            bar_order_price[bar_i] = round(fill_px, 4)
+            return True
+
+        def _close_trade(exit_px_raw: float, exit_date_str: str, exit_bar_i: int, reason: str) -> None:
+            nonlocal cash, shares, entry_price, entry_date, entry_bar_idx, entry_cost, entry_leg_charges, extreme_since_entry, gross_pnl_total
+            gross_trade_pnl = (
+                (entry_price - exit_px_raw) * shares if is_short else (exit_px_raw - entry_price) * shares
+            )
             gross_pnl_total += gross_trade_pnl
+            exit_side = "BUY" if is_short else "SELL"
             if use_real_charges and charges_cfg is not None:
                 from charges.calculator import ChargeBreakdown, charges_engine
 
-                sell_leg = charges_engine.calculate_leg(
-                    side="SELL", price=exit_px_raw, quantity=shares, cfg=charges_cfg, include_slippage=True
+                exit_leg = charges_engine.calculate_leg(
+                    side=exit_side, price=exit_px_raw, quantity=shares, cfg=charges_cfg, include_slippage=True
                 )
                 trade_chg = ChargeBreakdown()
                 if entry_leg_charges is not None:
                     trade_chg.add(entry_leg_charges)
-                trade_chg.add(sell_leg)
+                trade_chg.add(exit_leg)
                 if total_charges_acc is not None:
                     total_charges_acc.add(trade_chg)
                 net_trade_pnl = gross_trade_pnl - trade_chg.total_charges
-                proceeds = (shares * exit_px_raw) - sell_leg.total_charges
+                if is_short:
+                    proceeds = (shares * entry_price) + gross_trade_pnl - exit_leg.total_charges
+                else:
+                    proceeds = (shares * exit_px_raw) - exit_leg.total_charges
                 cash += proceeds
                 ret_pct = (net_trade_pnl / max(1.0, shares * entry_price)) * 100.0
                 trades.append(
                     {
                         "symbol": dl_meta["symbol"],
+                        "side": "SHORT" if is_short else "LONG",
                         "entry_date": entry_date,
                         "exit_date": exit_date_str,
+                        "entry_bar_idx": entry_bar_idx,
+                        "exit_bar_idx": exit_bar_i,
                         "qty": shares,
                         "entry_price": round(entry_price, 2),
                         "exit_price": round(exit_px_raw, 2),
@@ -238,98 +398,116 @@ class BacktestEngine:
                     }
                 )
             else:
-                sell_px = exit_px_raw * (1.0 - cost_rate)
-                proceeds = shares * sell_px
-                pnl = proceeds - (shares * entry_price) - entry_cost
-                ret_pct = ((sell_px - entry_price) / entry_price) * 100.0 if entry_price > 0 else 0.0
-                cash += proceeds
+                exit_cost = (shares * exit_px_raw) * cost_rate
+                pnl = gross_trade_pnl - entry_cost - exit_cost
+                ret_pct = (pnl / max(1.0, shares * entry_price)) * 100.0
+                cash += (shares * entry_price) + gross_trade_pnl - exit_cost
                 trades.append(
                     {
                         "symbol": dl_meta["symbol"],
+                        "side": "SHORT" if is_short else "LONG",
                         "entry_date": entry_date,
                         "exit_date": exit_date_str,
+                        "entry_bar_idx": entry_bar_idx,
+                        "exit_bar_idx": exit_bar_i,
                         "qty": shares,
                         "entry_price": round(entry_price, 2),
                         "exit_price": round(exit_px_raw, 2),
                         "gross_pnl": round(gross_trade_pnl, 2),
-                        "charges": round(gross_trade_pnl - pnl, 2),
+                        "charges": round(entry_cost + exit_cost, 2),
                         "pnl": round(pnl, 2),
                         "return_pct": round(ret_pct, 2),
                         "exit_reason": reason,
                     }
                 )
+            bar_order_action[exit_bar_i] = exit_side
+            bar_order_price[exit_bar_i] = round(exit_px_raw, 4)
+            bar_exit_reason[exit_bar_i] = reason
             shares = 0
             entry_price = 0.0
             entry_date = ""
+            entry_bar_idx = -1
             entry_cost = 0.0
             entry_leg_charges = None
-            highest_since_entry = 0.0
+            extreme_since_entry = 0.0
 
+        n_rows = len(rows)
         for i, bar in enumerate(rows):
             if cancel_event is not None and (i % 50 == 0) and cancel_event.is_set():
                 raise JobCancelledError("Backtest cancelled by operator.")
+            bar_open = float(bar["open"])
             bar_close = float(bar["close"])
             bar_high = float(bar["high"])
             bar_low = float(bar["low"])
-            bar_date = str(bar.get("trade_date") or str(bar.get("ts_ist", ""))[:10])
+            bar_ts = format_bar_timestamp(bar, tf)
+            cur_day = str(bar.get("trade_date") or bar_ts)[:10]
+            next_day = str(rows[i + 1].get("trade_date") or format_bar_timestamp(rows[i + 1], tf))[:10] if i + 1 < n_rows else ""
+            is_session_last_bar = mis_eod_squareoff and (i == n_rows - 1 or next_day != cur_day)
+            in_window = within_time_window(bar, start_time, end_time, tf)
 
-            exit_reason = ""
-            exit_px = bar_close
-            if shares > 0:
-                if bar_high > highest_since_entry:
-                    highest_since_entry = bar_high
-                if sl_pct > 0 and bar_low <= entry_price * (1.0 - sl_pct / 100.0):
-                    exit_px = entry_price * (1.0 - sl_pct / 100.0)
-                    exit_reason = f"STOP_LOSS (-{sl_pct:.1f}%)"
-                elif tsl_pct > 0 and highest_since_entry > entry_price and bar_low <= highest_since_entry * (1.0 - tsl_pct / 100.0):
-                    exit_px = highest_since_entry * (1.0 - tsl_pct / 100.0)
-                    exit_reason = f"TRAILING_SL (-{tsl_pct:.1f}%)"
-                elif tp_pct > 0 and bar_high >= entry_price * (1.0 + tp_pct / 100.0):
-                    exit_px = entry_price * (1.0 + tp_pct / 100.0)
-                    exit_reason = f"TAKE_PROFIT (+{tp_pct:.1f}%)"
+            # 1) Execute pending STRATEGY_EXIT from previous bar at THIS bar's open (strictly i > entry_bar_idx)
+            if shares > 0 and pending_exit and i > entry_bar_idx:
+                _close_trade(bar_open, bar_ts, i, "STRATEGY_EXIT")
+                pending_exit = False
+            else:
+                pending_exit = False
 
-            enter_sig, exit_sig = strat_inst.signal_at(i, bar)
+            # 2) Execute pending ENTRY from previous bar at THIS bar's open (never on last bar or EOD MIS bar)
+            entered_this_bar = False
+            if shares == 0 and pending_entry and i < n_rows - 1 and in_window and not is_session_last_bar:
+                entered_this_bar = _open_trade(bar_open, bar_ts, i)
+            pending_entry = False
 
-            if shares > 0 and (exit_reason or exit_sig):
-                _close_trade(exit_px, bar_date, exit_reason or "STRATEGY_EXIT")
-            elif shares == 0 and enter_sig and i < len(rows) - 1:
-                if use_real_charges and charges_cfg is not None:
-                    from charges.calculator import charges_engine
-
-                    est_rate = (charges_cfg.slippage_bps / 10000.0) + charges_cfg.stt_buy_pct + charges_cfg.stamp_duty_buy_pct + 0.001
-                    qty = int(max(0.0, cash - charges_cfg.brokerage_flat_per_order * 1.2) // (bar_close * (1.0 + est_rate)))
-                    if qty >= 1:
-                        buy_leg = charges_engine.calculate_leg(
-                            side="BUY", price=bar_close, quantity=qty, cfg=charges_cfg, include_slippage=True
-                        )
-                        total_outlay = (qty * bar_close) + buy_leg.total_charges
-                        if total_outlay > cash and qty > 1:
-                            qty = max(1, int((cash - buy_leg.total_charges) // bar_close))
-                            buy_leg = charges_engine.calculate_leg(
-                                side="BUY", price=bar_close, quantity=qty, cfg=charges_cfg, include_slippage=True
-                            )
-                            total_outlay = (qty * bar_close) + buy_leg.total_charges
-                        if qty >= 1 and total_outlay <= cash:
-                            shares = qty
-                            entry_price = bar_close
-                            entry_date = bar_date
-                            entry_cost = buy_leg.total_charges
-                            entry_leg_charges = buy_leg
-                            highest_since_entry = bar_close
-                            cash -= total_outlay
+            # 3) Intrabar SL / TSL / TP / MIS EOD square-off (ONLY on bars strictly AFTER entry bar!)
+            if shares > 0 and not entered_this_bar and i > entry_bar_idx:
+                exit_reason = ""
+                exit_px = bar_close
+                if not is_short:
+                    if bar_high > extreme_since_entry:
+                        extreme_since_entry = bar_high
+                    if sl_pct > 0 and bar_low <= entry_price * (1.0 - sl_pct / 100.0):
+                        exit_px = min(bar_open, entry_price * (1.0 - sl_pct / 100.0)) if bar_open < entry_price * (1.0 - sl_pct / 100.0) else entry_price * (1.0 - sl_pct / 100.0)
+                        exit_reason = f"STOP_LOSS (-{sl_pct:.1f}%)"
+                    elif tsl_pct > 0 and extreme_since_entry > entry_price and bar_low <= extreme_since_entry * (1.0 - tsl_pct / 100.0):
+                        exit_px = extreme_since_entry * (1.0 - tsl_pct / 100.0)
+                        exit_reason = f"TRAILING_SL (-{tsl_pct:.1f}%)"
+                    elif tp_pct > 0 and bar_high >= entry_price * (1.0 + tp_pct / 100.0):
+                        exit_px = max(bar_open, entry_price * (1.0 + tp_pct / 100.0)) if bar_open > entry_price * (1.0 + tp_pct / 100.0) else entry_price * (1.0 + tp_pct / 100.0)
+                        exit_reason = f"TAKE_PROFIT (+{tp_pct:.1f}%)"
+                    elif is_session_last_bar:
+                        exit_px = bar_close
+                        exit_reason = "MIS_EOD_SQUAREOFF"
                 else:
-                    buy_eff = bar_close * (1.0 + cost_rate)
-                    qty = int(cash // buy_eff)
-                    if qty >= 1:
-                        shares = qty
-                        entry_price = bar_close
-                        entry_date = bar_date
-                        gross = shares * bar_close
-                        entry_cost = gross * cost_rate
-                        highest_since_entry = bar_close
-                        cash -= gross + entry_cost
+                    if bar_low < extreme_since_entry:
+                        extreme_since_entry = bar_low
+                    if sl_pct > 0 and bar_high >= entry_price * (1.0 + sl_pct / 100.0):
+                        exit_px = entry_price * (1.0 + sl_pct / 100.0)
+                        exit_reason = f"STOP_LOSS (-{sl_pct:.1f}%)"
+                    elif tsl_pct > 0 and extreme_since_entry < entry_price and bar_high >= extreme_since_entry * (1.0 + tsl_pct / 100.0):
+                        exit_px = extreme_since_entry * (1.0 + tsl_pct / 100.0)
+                        exit_reason = f"TRAILING_SL (-{tsl_pct:.1f}%)"
+                    elif tp_pct > 0 and bar_low <= entry_price * (1.0 - tp_pct / 100.0):
+                        exit_px = entry_price * (1.0 - tp_pct / 100.0)
+                        exit_reason = f"TAKE_PROFIT (+{tp_pct:.1f}%)"
+                    elif is_session_last_bar:
+                        exit_px = bar_close
+                        exit_reason = "MIS_EOD_SQUAREOFF"
 
-            equity = cash + shares * bar_close
+                if exit_reason:
+                    _close_trade(exit_px, bar_ts, i, exit_reason)
+
+            # 4) Evaluate strategy signals at bar `i` close -> schedule for NEXT bar `i + 1` open!
+            enter_sig, exit_sig = strat_inst.signal_at(i, bar)
+            bar_entry_sigs[i] = 1 if enter_sig else 0
+            bar_exit_sigs[i] = 1 if exit_sig else 0
+
+            if i < n_rows - 1:
+                if shares > 0 and exit_sig:
+                    pending_exit = True
+                elif shares == 0 and enter_sig and in_window and not is_session_last_bar:
+                    pending_entry = True
+
+            equity = _mark_equity(bar_close)
             if equity > peak_equity:
                 peak_equity = equity
             dd_pct = ((peak_equity - equity) / peak_equity) * 100.0 if peak_equity > 0 else 0.0
@@ -338,12 +516,13 @@ class BacktestEngine:
             if prev_equity > 0:
                 daily_returns.append((equity - prev_equity) / prev_equity)
             prev_equity = equity
-            raw_curve.append({"date": bar_date, "equity": round(equity, 2), "drawdown_pct": round(dd_pct, 2)})
+            raw_curve.append({"date": bar_ts, "equity": round(equity, 2), "drawdown_pct": round(dd_pct, 2)})
 
         if shares > 0:
-            last_close = float(rows[-1]["close"])
-            last_date = str(rows[-1].get("trade_date") or str(rows[-1].get("ts_ist", ""))[:10])
-            _close_trade(last_close, last_date, "END_OF_WINDOW")
+            last_idx = n_rows - 1
+            last_close = float(rows[last_idx]["close"])
+            last_ts = format_bar_timestamp(rows[last_idx], tf)
+            _close_trade(last_close, last_ts, last_idx, "END_OF_WINDOW")
 
         final_equity = cash
         net_pnl = final_equity - cap
@@ -401,13 +580,45 @@ class BacktestEngine:
             }
         )
 
-        return {
+        export_payload = None
+        if collect_export:
+            ind_names = list(indicator_series.keys())
+            export_rows: List[Dict[str, Any]] = []
+            for i, bar in enumerate(rows):
+                rec: Dict[str, Any] = {
+                    "symbol": dl_meta["symbol"],
+                    "exchange": dl_meta["exchange"],
+                    "timestamp": format_bar_timestamp(bar, tf),
+                    "open": round(float(bar["open"]), 4),
+                    "high": round(float(bar["high"]), 4),
+                    "low": round(float(bar["low"]), 4),
+                    "close": round(float(bar["close"]), 4),
+                    "volume": int(float(bar.get("volume") or 0)),
+                }
+                for ind_k in ind_names:
+                    iv = indicator_series[ind_k][i]
+                    rec[ind_k] = round(float(iv), 4) if iv is not None else ""
+                rec["entry_signal"] = bar_entry_sigs[i]
+                rec["exit_signal"] = bar_exit_sigs[i]
+                rec["order_action"] = bar_order_action[i]
+                rec["order_price"] = bar_order_price[i] if bar_order_price[i] is not None else ""
+                rec["exit_reason"] = bar_exit_reason[i]
+                export_rows.append(rec)
+            export_payload = {
+                "symbol": dl_meta["symbol"],
+                "indicator_columns": ind_names,
+                "rows": export_rows,
+            }
+
+        out: Dict[str, Any] = {
             "ok": True,
             "symbol": dl_meta["symbol"],
             "exchange": dl_meta["exchange"],
             "strategy": strat_inst.id,
             "strategy_label": strat_inst.name,
             "strategy_mode": strat_mode,
+            "side": "SHORT" if is_short else "LONG",
+            "holding_type": eff_holding,
             "params": resolved_params,
             "timeframe": tf,
             "base_timeframe": base_tf,
@@ -456,8 +667,18 @@ class BacktestEngine:
             },
             "generated_at_ist": datetime.now(tz=IST_TZ).isoformat(timespec="seconds"),
         }
+        if export_payload is not None:
+            out["_export"] = export_payload
+        return out
 
 
 backtest_engine = BacktestEngine()
 
-__all__ = ["BacktestEngine", "backtest_engine"]
+__all__ = [
+    "BacktestEngine",
+    "backtest_engine",
+    "collect_strategy_indicators",
+    "extract_hhmm",
+    "format_bar_timestamp",
+    "within_time_window",
+]

@@ -810,6 +810,209 @@ class TestStreakScannerAndStrategyParity(unittest.TestCase):
             self.assertTrue(is_complete_spa_bundle(root))
 
 
+class TestFormulaExecutionAndExport(unittest.TestCase):
+    def test_math_formula_engine_and_security_rejection(self) -> None:
+        from rules.formula import evaluate_formula_condition, validate_formula
+
+        candles = _make_synthetic_candles(n=60, start_price=100.0, drift=0.0, wave_amp=0.0)
+        # Craft a deterministic spike at index 40 so High(-2) > Max(6, High(0)) triggers cleanly at index 42
+        for i, c in enumerate(candles):
+            c["open"] = 100.0
+            c["high"] = 105.0
+            c["low"] = 95.0
+            c["close"] = 100.0
+        candles[40]["high"] = 140.0  # at i=42, High(-2) == 140.0 > Max(6, High(0))? Wait: Max(6, High(0)) includes idx 37..42, so test High(-2) >= Max(6, High(0)) and High(-2) > Max(2, High(0))
+        candles[41]["high"] = 104.0
+        candles[42]["high"] = 103.0
+
+        tk = IndicatorToolkit(candles, backend="builtin")
+        flags, watched = evaluate_formula_condition("High(-2) > Max(2, High(0))", candles, tk)
+        self.assertTrue(flags[42])
+        self.assertFalse(flags[43])
+
+        # Streak phrasing with Period max and 3-arg EMA(high, 20, 0)
+        v1 = validate_formula("EMA(high, 20, 0) >= Period max(14, Close(-2))", expect_boolean=True)
+        self.assertTrue(v1["valid"], v1.get("error"))
+        self.assertGreaterEqual(len(v1["series_keys"]), 1)
+
+        # Arithmetic + logical formula
+        v2 = validate_formula("High(-2) > Max(6, High(0))", expect_boolean=True)
+        self.assertTrue(v2["valid"], v2.get("error"))
+
+        # Security: must strictly reject Python dunders / imports / arbitrary calls
+        bad1 = validate_formula("__import__('os').system('echo hi') > 0", expect_boolean=True)
+        self.assertFalse(bad1["valid"])
+        bad2 = validate_formula("open('/etc/passwd')", expect_boolean=False)
+        self.assertFalse(bad2["valid"])
+
+    def test_no_same_bar_buy_and_sell_execution(self) -> None:
+        from backtest.base import BacktestStrategy
+
+        class AlwaysBothStrategy(BacktestStrategy):
+            """Pathological strategy that fires BOTH enter=True and exit=True on every bar."""
+            id = "always_both_test"
+            name = "Always Both Test"
+
+            def prepare(self, candles: List[Dict[str, Any]], params: Dict[str, Any], toolkit: IndicatorToolkit) -> None:
+                self._ema5 = toolkit.ema(5)
+
+            def signal_at(self, index: int, bar: Dict[str, Any]):
+                return True, True
+
+        # Generate intraday 5-minute candles with extreme swings that also hit tight SL/TP on entry bar
+        bars: List[Dict[str, Any]] = []
+        base_day = date(2025, 6, 2)
+        for i in range(40):
+            hh = 9 + ((15 + i * 5) // 60)
+            mm = (15 + i * 5) % 60
+            o = 1000.0 + i * 2.0
+            bars.append(
+                {
+                    "ts_ist": f"{base_day.isoformat()}T{hh:02d}:{mm:02d}:00+05:30",
+                    "trade_date": base_day.isoformat(),
+                    "open": o,
+                    "high": o * 1.15,  # huge wick that would have triggered TP on same bar before fix
+                    "low": o * 0.85,   # huge wick that would have triggered SL on same bar before fix
+                    "close": o + 1.0,
+                    "volume": 50000,
+                    "oi": 0,
+                    "source": "synthetic",
+                }
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            hist = HistoricalDataManager(db_path=Path(tmp) / "hist.db")
+            engine = BacktestEngine(hist_manager=hist)
+            res = engine.run(
+                strategy=AlwaysBothStrategy(),
+                symbol="SBIN",
+                exchange="NSE",
+                timeframe="5minute",
+                from_date=base_day.isoformat(),
+                to_date=base_day.isoformat(),
+                initial_capital=100000.0,
+                stop_loss_pct=1.0,
+                take_profit_pct=1.0,
+                charges_profile="zerodha",
+                segment="equity_intraday",
+                holding_type="MIS",
+                provider="synthetic",
+                fetcher=lambda sym, exch, tf, s, e: list(bars),
+                collect_export=True,
+            )
+            self.assertTrue(res["ok"])
+            self.assertGreater(len(res["trades"]), 0)
+            for t in res["trades"]:
+                # Strict invariant: BUY and SELL NEVER execute on the same bar
+                self.assertGreater(t["exit_bar_idx"], t["entry_bar_idx"])
+                self.assertNotEqual(t["entry_date"], t["exit_date"])
+                # Intraday timestamps preserve HH:MM
+                self.assertIn(":", t["entry_date"])
+
+    def test_ohlcv_and_indicators_csv_export_for_visual_and_python_strategies(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            hist = HistoricalDataManager(db_path=Path(tmp) / "hist.db")
+            single = BacktestEngine(hist_manager=hist)
+            port = PortfolioBacktestEngine(
+                hist_manager=hist,
+                single_engine=single,
+                runs_file=Path(tmp) / "runs.json",
+            )
+            bars = _make_synthetic_candles(n=120, start_price=1000.0, wave_amp=60.0)
+
+            def _fetch(sym: str, exch: str, tf: str, s: date, e: date):
+                return [b for b in bars if s.isoformat() <= b["trade_date"] <= e.isoformat()]
+
+            # 1) Visual strategy using a mathematical formula condition
+            formula_rule = {
+                "id": "vis_formula_csv_test",
+                "kind": "strategy",
+                "mode": "visual",
+                "builder_mode": "advance",
+                "name": "Formula CSV Strategy",
+                "entry": {
+                    "logic": "AND",
+                    "conditions": [
+                        {"kind": "formula", "expression": "Close(0) > EMA(close, 10, 0) and RSI(14) > 50"}
+                    ],
+                },
+                "exit": {
+                    "logic": "OR",
+                    "conditions": [
+                        {"kind": "formula", "expression": "Close(0) < EMA(close, 10, 0)"}
+                    ],
+                },
+            }
+            res_vis = port.run(
+                mode="portfolio",
+                strategy="visual:vis_formula_csv_test",
+                rule_def=formula_rule,
+                symbols=["RELIANCE", "TCS"],
+                exchange="NSE",
+                timeframe="1day",
+                from_date="2025-01-01",
+                to_date="2025-07-01",
+                initial_capital=100000.0,
+                holding_type="CNC",
+                start_time="09:15",
+                end_time="15:30",
+                provider="synthetic",
+                fetcher=_fetch,
+            )
+            self.assertTrue(res_vis["ok"])
+            self.assertTrue(res_vis["has_ohlcv_export"])
+            self.assertGreater(len(res_vis["indicator_columns"]), 0)
+            for t in res_vis["trades"]:
+                self.assertGreater(t["exit_bar_idx"], t["entry_bar_idx"])
+
+            csv_name, csv_text = port.export_ohlcv_csv(res_vis["run_id"], symbol="RELIANCE")
+            self.assertTrue(csv_name.endswith(".csv"))
+            lines = [ln for ln in csv_text.strip().splitlines() if ln.strip()]
+            self.assertGreater(len(lines), 50)
+            header = lines[0]
+            for required_col in ("trading_symbol", "timestamp", "open", "high", "low", "close", "volume"):
+                self.assertIn(required_col, header)
+            # Indicator columns used by formula must be present in CSV header
+            self.assertIn("RSI(14)", header)
+
+            # 2) Python strategy (.py) also exports its toolkit-recorded indicators automatically
+            res_py = port.run(
+                mode="individual",
+                strategy="ema_crossover",
+                symbols=["INFY"],
+                exchange="NSE",
+                timeframe="1day",
+                from_date="2025-01-01",
+                to_date="2025-07-01",
+                initial_capital=100000.0,
+                params={"fast_period": 9, "slow_period": 21},
+                provider="synthetic",
+                fetcher=_fetch,
+            )
+            self.assertTrue(res_py["ok"])
+            _, csv_py = port.export_ohlcv_csv(res_py["run_id"], symbol="INFY")
+            py_header = csv_py.splitlines()[0]
+            self.assertIn("trading_symbol", py_header)
+            self.assertIn("EMA(9)", py_header)
+            self.assertIn("EMA(21)", py_header)
+
+    def test_delete_seeded_strategy_persists_across_reloads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store_file = Path(tmp) / "rules.json"
+            store1 = VisualRuleStore(store_file=store_file)
+            seeded_strats = [r for r in store1.list_rules(kind="strategy") if r.get("seeded")]
+            self.assertGreater(len(seeded_strats), 0)
+            victim_id = seeded_strats[0]["id"]
+            res = store1.delete(victim_id)
+            self.assertEqual(res["removed"], 1)
+            self.assertIsNone(store1.get(victim_id))
+
+            # Reloading a fresh store instance must NOT resurrect the deleted seeded strategy
+            store2 = VisualRuleStore(store_file=store_file)
+            self.assertIsNone(store2.get(victim_id))
+
+
 if __name__ == "__main__":
     unittest.main()
+
 

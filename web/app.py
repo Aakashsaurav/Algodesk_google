@@ -929,6 +929,11 @@ def create_app() -> FastAPI:
                 timeframe=str(payload.get("timeframe", "1day")),
                 from_date=payload.get("from_date"),
                 to_date=payload.get("to_date"),
+                start_time=payload.get("start_time"),
+                end_time=payload.get("end_time"),
+                holding_type=payload.get("holding_type"),
+                strategy_cycle=int(payload["strategy_cycle"]) if payload.get("strategy_cycle") not in (None, "", "-") else None,
+                side=payload.get("side"),
                 initial_capital=float(payload.get("initial_capital", 500000.0) or 500000.0),
                 allocation_mode=str(payload.get("allocation_mode", "shared_pool")),
                 max_open_positions=int(payload.get("max_open_positions", 5) or 5),
@@ -951,6 +956,30 @@ def create_app() -> FastAPI:
     @app.get("/api/streak/backtest/runs")
     def api_streak_backtest_runs(limit: int = Query(default=20)) -> dict:
         return hub_service.list_backtest_runs(limit=limit)
+
+    @app.get("/api/streak/backtest/{run_id}/ohlcv.csv")
+    def api_streak_backtest_ohlcv_csv(run_id: str, symbol: Optional[str] = Query(default=None)) -> Response:
+        try:
+            filename, csv_body = hub_service.export_backtest_ohlcv_csv(run_id=run_id, symbol=symbol)
+            return Response(
+                content=csv_body.encode("utf-8"),
+                media_type="text/csv; charset=utf-8",
+                headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+            )
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/streak/formula/validate")
+    def api_streak_formula_validate(payload: Dict[str, Any]) -> dict:
+        try:
+            return hub_service.validate_formula_expr(
+                str(payload.get("expression") or payload.get("expr") or ""),
+                expect_boolean=bool(payload.get("expect_boolean", False)),
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/api/streak/technicals")
     def api_streak_technicals(payload: Dict[str, Any]) -> dict:

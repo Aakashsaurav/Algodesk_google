@@ -1097,6 +1097,11 @@ class BrokerHubService:
         timeframe: str = "1day",
         from_date: Optional[str] = None,
         to_date: Optional[str] = None,
+        start_time: Optional[str] = None,
+        end_time: Optional[str] = None,
+        holding_type: Optional[str] = None,
+        strategy_cycle: Optional[int] = None,
+        side: Optional[str] = None,
         initial_capital: float = 500000.0,
         allocation_mode: str = "shared_pool",
         max_open_positions: int = 5,
@@ -1137,6 +1142,11 @@ class BrokerHubService:
                 timeframe=timeframe,
                 from_date=from_date,
                 to_date=to_date,
+                start_time=start_time,
+                end_time=end_time,
+                holding_type=holding_type,
+                strategy_cycle=strategy_cycle,
+                side=side,
                 initial_capital=initial_capital,
                 allocation_mode=allocation_mode,
                 max_open_positions=max_open_positions,
@@ -1164,6 +1174,14 @@ class BrokerHubService:
 
     def list_backtest_runs(self, limit: int = 20) -> Dict[str, Any]:
         return {"ok": True, "runs": portfolio_backtest_engine.list_runs(limit=limit)}
+
+    def export_backtest_ohlcv_csv(self, run_id: str, symbol: Optional[str] = None) -> tuple[str, str]:
+        return portfolio_backtest_engine.export_ohlcv_csv(run_id=run_id, symbol=symbol)
+
+    def validate_formula_expr(self, expression: str, *, expect_boolean: bool = False) -> Dict[str, Any]:
+        from rules.formula import validate_formula
+
+        return validate_formula(expression, expect_boolean=expect_boolean)
 
     def analyze_technicals(
         self,

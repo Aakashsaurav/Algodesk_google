@@ -59,6 +59,10 @@ class BacktestStrategy(BaseStrategy):
     def signal_at(self, index: int, bar: Dict[str, Any]) -> Tuple[bool, bool]:
         """Return `(enter_long, exit_long)` booleans at bar `index`."""
 
+    def get_indicator_series(self) -> Dict[str, List[Optional[float]]]:
+        """Optional map of indicator name -> per-bar series used by the strategy."""
+        return {}
+
     def on_bar(self, bar: Dict[str, Any]) -> Optional[OrderRequest]:
         """Bridge `core.runtime.BaseStrategy` for live bar-by-bar evaluation."""
         self._live_bars.append(bar)

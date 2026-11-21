@@ -104,19 +104,27 @@ export function CreateStrategyView({
   const [trailingSl, setTrailingSl] = useState(0);
   const [exitUnit, setExitUnit] = useState<'pct' | 'points' | 'pnl'>('pct');
 
-  // Backtest & Real Charges settings
+  // Backtest & Real Charges settings (also edited in Step 2: Execute Backtest modal)
   const [showAdvancedBt, setShowAdvancedBt] = useState(false);
   const [btMode, setBtMode] = useState<'portfolio' | 'individual'>('portfolio');
-  const [allocationMode, setAllocationMode] = useState('equal_weight');
-  const [initialCapital, setInitialCapital] = useState(500000);
+  const [allocationMode, setAllocationMode] = useState('shared_pool');
+  const [initialCapital, setInitialCapital] = useState(100000);
   const [chargesProfile, setChargesProfile] = useState('zerodha');
   const [segment, setSegment] = useState('equity_delivery');
+  const [holdingType, setHoldingType] = useState<'MIS' | 'CNC'>('CNC');
+  const [strategyCycle, setStrategyCycle] = useState<string>('');
+  const [startHour, setStartHour] = useState('9');
+  const [startMinute, setStartMinute] = useState('15');
+  const [startAmPm, setStartAmPm] = useState<'AM' | 'PM'>('AM');
+  const [endHour, setEndHour] = useState('3');
+  const [endMinute, setEndMinute] = useState('30');
+  const [endAmPm, setEndAmPm] = useState<'AM' | 'PM'>('PM');
   const [fromDate, setFromDate] = useState(() =>
     new Date(Date.now() - 180 * 86400_000).toISOString().slice(0, 10)
   );
   const [toDate, setToDate] = useState(() => new Date().toISOString().slice(0, 10));
 
-  // Execution & Result view
+  // Execution, Step 2 Modal, Delete confirmation & Result view
   const [saving, setSaving] = useState(false);
   const [running, setRunning] = useState(false);
   const [exportingPy, setExportingPy] = useState(false);
@@ -124,6 +132,10 @@ export function CreateStrategyView({
   const [notice, setNotice] = useState('');
   const [backtestResult, setBacktestResult] = useState<BacktestFullResult | null>(null);
   const [myStrategiesOpen, setMyStrategiesOpen] = useState(false);
+  const [executeModalOpen, setExecuteModalOpen] = useState(false);
+  const [savedRuleIdForRun, setSavedRuleIdForRun] = useState<string | undefined>(undefined);
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [deletingId, setDeletingId] = useState<string | null>(null);
 
   // Apply draft when navigated from Discover Strategies / Copy
   useEffect(() => {
@@ -134,7 +146,9 @@ export function CreateStrategyView({
     setTimeframe(draft.timeframe || draft.rule?.timeframe || '1day');
     setChartType(draft.chartType || draft.rule?.chart_type || 'candlestick');
     if (draft.segment || draft.rule?.segment) {
-      setSegment(draft.segment || draft.rule?.segment || 'equity_delivery');
+      const seg = draft.segment || draft.rule?.segment || 'equity_delivery';
+      setSegment(seg);
+      setHoldingType(seg === 'equity_intraday' ? 'MIS' : 'CNC');
     }
     if (draft.symbols && draft.symbols.length > 0) {
       setSymbols(draft.symbols);
@@ -287,26 +301,85 @@ export function CreateStrategyView({
     }
   };
 
-  const handleSaveAndBacktest = async () => {
+  const to24HourTime = (hourStr: string, minStr: string, ampm: 'AM' | 'PM') => {
+    let h = parseInt(hourStr, 10) || 9;
+    if (ampm === 'PM' && h < 12) h += 12;
+    if (ampm === 'AM' && h === 12) h = 0;
+    const m = parseInt(minStr, 10) || 0;
+    return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}`;
+  };
+
+  const applyQuickPeriod = (days: number) => {
+    const end = new Date();
+    const start = new Date(end.getTime() - days * 86400_000);
+    setFromDate(start.toISOString().slice(0, 10));
+    setToDate(end.toISOString().slice(0, 10));
+  };
+
+  const handleDeleteStrategyById = async (targetId: string) => {
+    setDeletingId(targetId);
+    setError('');
+    setNotice('');
+    try {
+      const res = await fetch(`/api/streak/rules/${encodeURIComponent(targetId)}`, { method: 'DELETE' });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.detail || 'Could not delete strategy.');
+      setConfirmDeleteId(null);
+      if (ruleId === targetId) {
+        setRuleId(undefined);
+        setName('Untitled Strategy');
+        setDescription('');
+        setEntryGroup(DEFAULT_ENTRY);
+        setUseExitConditions(false);
+        setNotice('Strategy deleted.');
+      } else {
+        setNotice('Strategy deleted from My Strategies.');
+      }
+      onRefreshMeta();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Delete failed.');
+    } finally {
+      setDeletingId(null);
+    }
+  };
+
+  // Step 1 -> Step 2: Save strategy (if visual) then open Streak's Step 2: Execute Backtest modal
+  const handleOpenExecuteModal = async () => {
+    setError('');
+    setNotice('');
+    const useUniverse = basketOrUniverse.startsWith('universe:') ? basketOrUniverse.slice(9) : undefined;
+    if (!useUniverse && symbols.length === 0) {
+      setError('Add at least one instrument before running a backtest.');
+      return;
+    }
+    let nextSavedId = ruleId;
+    if (mode !== 'python') {
+      const saved = await handleSaveStrategy();
+      if (saved?.id) nextSavedId = saved.id;
+    }
+    setSavedRuleIdForRun(nextSavedId);
+    // Sync holdingType with segment
+    setHoldingType(segment === 'equity_intraday' ? 'MIS' : 'CNC');
+    setExecuteModalOpen(true);
+  };
+
+  const handleExecuteBacktest = async () => {
     setRunning(true);
     setError('');
     setNotice('');
     try {
-      let savedId = ruleId;
-      if (mode !== 'python') {
-        const saved = await handleSaveStrategy();
-        if (saved?.id) savedId = saved.id;
-      }
       const useUniverse = basketOrUniverse.startsWith('universe:') ? basketOrUniverse.slice(9) : undefined;
       if (!useUniverse && symbols.length === 0) {
         throw new Error('Add at least one instrument before running a backtest.');
       }
+      const effRuleId = savedRuleIdForRun || ruleId;
+      const effSegment = holdingType === 'MIS' ? 'equity_intraday' : segment === 'equity_intraday' ? 'equity_delivery' : segment;
       const payload: Record<string, unknown> = {
         mode: btMode,
         allocation_mode: allocationMode,
         strategy_mode: mode === 'python' ? 'python' : 'visual',
-        strategy: mode === 'python' ? selectedPythonId : savedId ? `visual:${savedId}` : 'visual:inline',
-        rule_def: mode !== 'python' ? buildRuleDef() : undefined,
+        strategy: mode === 'python' ? selectedPythonId : effRuleId ? `visual:${effRuleId}` : 'visual:inline',
+        rule_def: mode !== 'python' ? { ...buildRuleDef(), segment: effSegment } : undefined,
         params: mode === 'python' ? pythonParams : undefined,
         symbols: useUniverse ? undefined : symbols,
         universe: useUniverse,
@@ -314,12 +387,17 @@ export function CreateStrategyView({
         timeframe,
         from_date: fromDate,
         to_date: toDate,
+        start_time: to24HourTime(startHour, startMinute, startAmPm),
+        end_time: to24HourTime(endHour, endMinute, endAmPm),
+        holding_type: holdingType,
+        strategy_cycle: strategyCycle ? Number(strategyCycle) : undefined,
+        side,
         initial_capital: initialCapital,
         stop_loss_pct: stopLoss,
         take_profit_pct: takeProfit,
         trailing_sl_pct: trailingSl,
         charges_profile: chargesProfile,
-        segment,
+        segment: effSegment,
       };
       const res = await fetch('/api/streak/backtest', {
         method: 'POST',
@@ -328,6 +406,7 @@ export function CreateStrategyView({
       });
       const body = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(body.detail || 'Backtest failed.');
+      setExecuteModalOpen(false);
       setBacktestResult(body as BacktestFullResult);
       onRefreshMeta();
     } catch (err) {
@@ -373,7 +452,38 @@ export function CreateStrategyView({
             className="min-h-[40px] w-full max-w-md rounded-lg border border-transparent bg-transparent px-2 text-xl font-bold tracking-tight text-slate-100 hover:border-slate-700 focus:border-sky-400 focus:bg-[#111827] focus:outline-none"
           />
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          {ruleId && mode !== 'python' && (
+            confirmDeleteId === ruleId ? (
+              <div className="inline-flex items-center gap-1.5 rounded-lg border border-red-800/80 bg-red-950/50 px-2.5 py-1">
+                <span className="text-[11px] font-medium text-red-200">Delete strategy?</span>
+                <button
+                  type="button"
+                  disabled={deletingId === ruleId}
+                  onClick={() => void handleDeleteStrategyById(ruleId)}
+                  className="rounded bg-red-600 px-2 py-0.5 text-[11px] font-semibold text-white hover:bg-red-500 disabled:opacity-50"
+                >
+                  {deletingId === ruleId ? 'Deleting...' : 'Confirm'}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setConfirmDeleteId(null)}
+                  className="rounded px-1.5 py-0.5 text-[11px] text-slate-300 hover:text-white"
+                >
+                  Cancel
+                </button>
+              </div>
+            ) : (
+              <button
+                type="button"
+                onClick={() => setConfirmDeleteId(ruleId)}
+                className="inline-flex min-h-[36px] items-center gap-1.5 rounded-lg border border-red-900/70 bg-red-950/30 px-3 text-xs font-semibold text-red-300 hover:border-red-500 hover:text-red-200"
+              >
+                <Trash2 className="h-3.5 w-3.5" />
+                <span>Delete</span>
+              </button>
+            )
+          )}
           <button
             type="button"
             onClick={onNavigateDiscover}
@@ -699,8 +809,8 @@ export function CreateStrategyView({
                     className="min-h-[36px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-2.5 text-slate-100"
                   >
                     {(meta.allocation_modes || [
-                      { id: 'equal_weight', label: 'Equal Weight' },
-                      { id: 'fixed_capital', label: 'Fixed Capital' },
+                      { id: 'shared_pool', label: 'Shared Capital Pool' },
+                      { id: 'equal_split', label: 'Equal Split Per Symbol' },
                       { id: 'risk_based', label: 'Risk-Based Sizing' },
                     ]).map((m) => (
                       <option key={m.id} value={m.id}>
@@ -795,12 +905,12 @@ export function CreateStrategyView({
             )}
             <button
               type="button"
-              onClick={() => void handleSaveAndBacktest()}
-              disabled={running}
+              onClick={() => void handleOpenExecuteModal()}
+              disabled={running || saving}
               className="inline-flex min-h-[38px] items-center gap-1.5 rounded-lg bg-sky-500 px-5 text-xs font-semibold text-slate-950 hover:bg-sky-400 disabled:opacity-50"
             >
               <Play className="h-3.5 w-3.5" />
-              <span>{running ? 'Running Backtest...' : 'Save & Backtest'}</span>
+              <span>{saving ? 'Saving...' : 'Save & Backtest'}</span>
             </button>
           </div>
         </div>
@@ -871,21 +981,344 @@ export function CreateStrategyView({
                     >
                       Load
                     </button>
-                    {r.id && !r.seeded && (
-                      <button
-                        type="button"
-                        onClick={async () => {
-                          await fetch(`/api/streak/rules/${encodeURIComponent(r.id!)}`, { method: 'DELETE' });
-                          onRefreshMeta();
-                        }}
-                        className="rounded-lg border border-slate-700 p-1.5 text-slate-400 hover:border-red-700 hover:text-red-400"
-                      >
-                        <Trash2 className="h-3.5 w-3.5" />
-                      </button>
+                    {r.id && (
+                      confirmDeleteId === r.id ? (
+                        <div className="inline-flex items-center gap-1">
+                          <button
+                            type="button"
+                            disabled={deletingId === r.id}
+                            onClick={() => void handleDeleteStrategyById(r.id!)}
+                            className="rounded-md bg-red-600 px-2.5 py-1 text-[11px] font-semibold text-white hover:bg-red-500 disabled:opacity-50"
+                          >
+                            {deletingId === r.id ? '...' : 'Delete'}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setConfirmDeleteId(null)}
+                            className="rounded-md border border-slate-700 px-2 py-1 text-[11px] text-slate-300 hover:text-white"
+                          >
+                            Cancel
+                          </button>
+                        </div>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => setConfirmDeleteId(r.id!)}
+                          aria-label={`Delete ${r.name}`}
+                          className="rounded-lg border border-slate-700 p-1.5 text-slate-400 hover:border-red-700 hover:text-red-400"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                      )
                     )}
                   </div>
                 </div>
               ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Step 2: Execute Backtest Modal matching Streak Backtest date selection.png */}
+      {executeModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/85 p-4 backdrop-blur-sm">
+          <div className="flex w-full max-w-3xl flex-col overflow-hidden rounded-2xl border border-slate-700 bg-[#0f172a] shadow-2xl">
+            {/* Modal Header */}
+            <div className="flex items-center justify-between border-b border-slate-800 px-6 py-4">
+              <div className="flex items-center gap-2.5">
+                <span className="text-base font-medium text-slate-400">Step 2:</span>
+                <span className="text-base font-bold text-slate-100">Execute</span>
+                <span className="rounded-md border border-slate-700 bg-[#1e293b] px-2.5 py-0.5 text-xs font-semibold text-sky-300">
+                  Backtest
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setExecuteModalOpen(false)}
+                aria-label="Close backtest period dialog"
+                className="rounded-md p-1 text-slate-400 hover:bg-slate-800 hover:text-slate-100"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+
+            {/* Modal Body */}
+            <div className="space-y-5 p-6">
+              <div className="space-y-6 rounded-xl border border-slate-800 bg-[#111827] p-6">
+                {/* Row 1: Initial Capital, Start Date, End Date */}
+                <div className="grid grid-cols-1 gap-5 sm:grid-cols-3">
+                  <div>
+                    <label className="mb-2 block text-xs font-medium text-slate-400">
+                      Initial Capital (₹)
+                    </label>
+                    <input
+                      type="number"
+                      min={1000}
+                      step={5000}
+                      value={initialCapital}
+                      onChange={(e) => setInitialCapital(Math.max(1000, Number(e.target.value) || 1000))}
+                      className="min-h-[42px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3.5 font-mono text-sm font-semibold text-slate-100 tabular-nums focus:border-sky-400 focus:outline-none"
+                    />
+                  </div>
+                  <div>
+                    <label className="mb-2 block text-xs font-medium text-slate-400">
+                      Start Date
+                    </label>
+                    <input
+                      type="date"
+                      value={fromDate}
+                      onChange={(e) => setFromDate(e.target.value)}
+                      className="min-h-[42px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3.5 font-mono text-sm text-slate-100 focus:border-sky-400 focus:outline-none"
+                    />
+                  </div>
+                  <div>
+                    <label className="mb-2 block text-xs font-medium text-slate-400">
+                      End Date
+                    </label>
+                    <input
+                      type="date"
+                      value={toDate}
+                      onChange={(e) => setToDate(e.target.value)}
+                      className="min-h-[42px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3.5 font-mono text-sm text-slate-100 focus:border-sky-400 focus:outline-none"
+                    />
+                  </div>
+                </div>
+
+                {/* Quick period selector strip */}
+                <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800/80 pb-4">
+                  <span className="text-[11px] text-slate-400">
+                    Quick Backtest Period ({timeframe} · {symbols.length || 'Universe'} instruments)
+                  </span>
+                  <div className="flex items-center gap-1.5">
+                    {[
+                      { label: '1M', days: 30 },
+                      { label: '3M', days: 90 },
+                      { label: '6M', days: 180 },
+                      { label: '1Y', days: 365 },
+                      { label: '3Y', days: 1095 },
+                    ].map((p) => (
+                      <button
+                        key={p.label}
+                        type="button"
+                        onClick={() => applyQuickPeriod(p.days)}
+                        className="rounded-md border border-slate-700 bg-[#0b1120] px-2.5 py-1 font-mono text-[11px] font-semibold text-slate-300 hover:border-sky-400 hover:text-sky-300"
+                      >
+                        {p.label}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+
+                {/* Row 2: Start Time & End Time (H : M AM/PM) */}
+                <div className="grid grid-cols-1 gap-5 sm:grid-cols-2">
+                  <div>
+                    <label className="mb-2 block text-xs font-medium text-slate-400">Start Time</label>
+                    <div className="flex items-center gap-2">
+                      <select
+                        value={startHour}
+                        onChange={(e) => setStartHour(e.target.value)}
+                        aria-label="Start hour"
+                        className="min-h-[38px] w-20 rounded-full border border-slate-700 bg-[#0b1120] px-3 font-mono text-xs text-slate-100 focus:border-sky-400 focus:outline-none"
+                      >
+                        {['9', '10', '11', '12', '1', '2', '3'].map((h) => (
+                          <option key={h} value={h}>
+                            {h}
+                          </option>
+                        ))}
+                      </select>
+                      <span className="font-mono text-slate-500">:</span>
+                      <select
+                        value={startMinute}
+                        onChange={(e) => setStartMinute(e.target.value)}
+                        aria-label="Start minute"
+                        className="min-h-[38px] w-20 rounded-full border border-slate-700 bg-[#0b1120] px-3 font-mono text-xs text-slate-100 focus:border-sky-400 focus:outline-none"
+                      >
+                        {['00', '05', '10', '15', '20', '30', '45'].map((m) => (
+                          <option key={m} value={m}>
+                            {m}
+                          </option>
+                        ))}
+                      </select>
+                      <button
+                        type="button"
+                        onClick={() => setStartAmPm((v) => (v === 'AM' ? 'PM' : 'AM'))}
+                        className="min-h-[38px] rounded-full border border-slate-700 bg-[#0b1120] px-4 font-mono text-xs font-semibold text-sky-300 hover:border-sky-400"
+                      >
+                        {startAmPm}
+                      </button>
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="mb-2 block text-xs font-medium text-slate-400">End Time</label>
+                    <div className="flex items-center gap-2">
+                      <select
+                        value={endHour}
+                        onChange={(e) => setEndHour(e.target.value)}
+                        aria-label="End hour"
+                        className="min-h-[38px] w-20 rounded-full border border-slate-700 bg-[#0b1120] px-3 font-mono text-xs text-slate-100 focus:border-sky-400 focus:outline-none"
+                      >
+                        {['9', '10', '11', '12', '1', '2', '3'].map((h) => (
+                          <option key={h} value={h}>
+                            {h}
+                          </option>
+                        ))}
+                      </select>
+                      <span className="font-mono text-slate-500">:</span>
+                      <select
+                        value={endMinute}
+                        onChange={(e) => setEndMinute(e.target.value)}
+                        aria-label="End minute"
+                        className="min-h-[38px] w-20 rounded-full border border-slate-700 bg-[#0b1120] px-3 font-mono text-xs text-slate-100 focus:border-sky-400 focus:outline-none"
+                      >
+                        {['00', '05', '10', '15', '20', '25', '30', '45'].map((m) => (
+                          <option key={m} value={m}>
+                            {m}
+                          </option>
+                        ))}
+                      </select>
+                      <button
+                        type="button"
+                        onClick={() => setEndAmPm((v) => (v === 'AM' ? 'PM' : 'AM'))}
+                        className="min-h-[38px] rounded-full border border-slate-700 bg-[#0b1120] px-4 font-mono text-xs font-semibold text-sky-300 hover:border-sky-400"
+                      >
+                        {endAmPm}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Row 3: Holding Type (Intraday MIS / Longterm CNC) + Strategy Cycle */}
+                <div className="flex flex-wrap items-end justify-between gap-4 pt-1">
+                  <div>
+                    <label className="mb-2.5 block text-xs font-medium text-slate-400">Holding Type</label>
+                    <div className="flex items-center gap-6">
+                      <label className="inline-flex cursor-pointer items-center gap-2 text-sm text-slate-200">
+                        <input
+                          type="radio"
+                          name="holding_type"
+                          checked={holdingType === 'MIS'}
+                          onChange={() => {
+                            setHoldingType('MIS');
+                            setSegment('equity_intraday');
+                          }}
+                          className="h-4 w-4 accent-sky-500"
+                        />
+                        <span className="font-medium">Intraday</span>
+                        <span className="font-mono text-xs text-slate-400">MIS</span>
+                      </label>
+                      <label className="inline-flex cursor-pointer items-center gap-2 text-sm text-slate-200">
+                        <input
+                          type="radio"
+                          name="holding_type"
+                          checked={holdingType === 'CNC'}
+                          onChange={() => {
+                            setHoldingType('CNC');
+                            setSegment('equity_delivery');
+                          }}
+                          className="h-4 w-4 accent-sky-500"
+                        />
+                        <span className="font-medium">Longterm</span>
+                        <span className="font-mono text-xs text-slate-400">CNC</span>
+                      </label>
+                    </div>
+                  </div>
+
+                  <div className="w-40">
+                    <label className="mb-2 block text-xs font-medium text-slate-400">Strategy Cycle</label>
+                    <select
+                      value={strategyCycle}
+                      onChange={(e) => setStrategyCycle(e.target.value)}
+                      className="min-h-[38px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 text-xs text-slate-200 focus:border-sky-400 focus:outline-none"
+                    >
+                      <option value="">- (Unlimited)</option>
+                      <option value="1">1 Cycle</option>
+                      <option value="2">2 Cycles</option>
+                      <option value="3">3 Cycles</option>
+                      <option value="5">5 Cycles</option>
+                      <option value="10">10 Cycles</option>
+                    </select>
+                  </div>
+                </div>
+
+                {/* Secondary Execution & Charges strip */}
+                <div className="grid grid-cols-1 gap-3 border-t border-slate-800/80 pt-4 text-xs sm:grid-cols-3">
+                  <div>
+                    <label className="mb-1 block text-[11px] text-slate-400">Backtest Mode</label>
+                    <select
+                      value={btMode}
+                      onChange={(e) => setBtMode(e.target.value as 'portfolio' | 'individual')}
+                      className="min-h-[34px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-2.5 text-slate-100"
+                    >
+                      <option value="portfolio">Portfolio (Shared Capital)</option>
+                      <option value="individual">Individual (Per Symbol)</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="mb-1 block text-[11px] text-slate-400">Allocation Mode</label>
+                    <select
+                      value={allocationMode}
+                      onChange={(e) => setAllocationMode(e.target.value)}
+                      className="min-h-[34px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-2.5 text-slate-100"
+                    >
+                      {(meta.allocation_modes || [
+                        { id: 'shared_pool', label: 'Shared Capital Pool' },
+                        { id: 'equal_split', label: 'Equal Split Per Symbol' },
+                        { id: 'risk_based', label: 'Risk-Based Sizing' },
+                      ]).map((m) => (
+                        <option key={m.id} value={m.id}>
+                          {m.label}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="mb-1 block text-[11px] text-slate-400">Broker Charges</label>
+                    <select
+                      value={chargesProfile}
+                      onChange={(e) => setChargesProfile(e.target.value)}
+                      className="min-h-[34px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-2.5 text-slate-100"
+                    >
+                      <option value="zerodha">Zerodha (Real Indian Charges)</option>
+                      <option value="upstox">Upstox (Real Indian Charges)</option>
+                      <option value="zero">Zero Charges (Gross Only)</option>
+                    </select>
+                  </div>
+                </div>
+              </div>
+
+              {error && (
+                <div className="rounded-lg border border-red-900/70 bg-red-950/40 px-4 py-2.5 text-xs text-red-200">
+                  {error}
+                </div>
+              )}
+            </div>
+
+            {/* Modal Footer matching Streak Backtest date selection.png */}
+            <div className="flex items-center justify-between border-t border-slate-800 bg-[#111827] px-6 py-4">
+              <div className="flex items-center gap-1.5" aria-label="Step 2 of 2">
+                <span className="h-1.5 w-1.5 rounded-full bg-slate-600" />
+                <span className="h-1.5 w-7 rounded-full bg-sky-500" />
+              </div>
+              <div className="flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={() => setExecuteModalOpen(false)}
+                  disabled={running}
+                  className="min-h-[38px] rounded-lg border border-slate-700 bg-[#0b1120] px-5 text-xs font-semibold text-sky-300 hover:border-sky-400 disabled:opacity-50"
+                >
+                  Back
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleExecuteBacktest()}
+                  disabled={running}
+                  className="inline-flex min-h-[38px] items-center gap-1.5 rounded-lg bg-sky-500 px-6 text-xs font-semibold text-slate-950 hover:bg-sky-400 disabled:opacity-50"
+                >
+                  <Play className="h-3.5 w-3.5" />
+                  <span>{running ? 'Running Backtest...' : 'Run Backtest'}</span>
+                </button>
+              </div>
             </div>
           </div>
         </div>
