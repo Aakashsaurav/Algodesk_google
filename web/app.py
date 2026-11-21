@@ -9,9 +9,11 @@ resident memory (~45 MB).
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import html
 import json
 import queue
+import threading
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -21,6 +23,22 @@ from pydantic import BaseModel
 
 from web.service import hub_service
 from web.spa import has_spa_bundle, render_spa_html, resolve_spa_asset
+
+_SHUTDOWN_EVENT = threading.Event()
+
+
+def request_shutdown() -> None:
+    """Signal all open WebSocket and SSE streams to exit cleanly."""
+    _SHUTDOWN_EVENT.set()
+
+
+def reset_shutdown() -> None:
+    """Clear the shutdown signal when starting a new server instance."""
+    _SHUTDOWN_EVENT.clear()
+
+
+def is_shutting_down() -> bool:
+    return _SHUTDOWN_EVENT.is_set()
 
 TEMPLATE_PATH = Path(__file__).resolve().parent / "templates" / "index.html"
 TERMINAL_TEMPLATE_PATH = Path(__file__).resolve().parent / "templates" / "terminal.html"
@@ -88,6 +106,7 @@ class LiveSubscriptionRequest(BaseModel):
 class ScreenerRequest(BaseModel):
     symbols: Optional[List[str]] = None
     universe: str = "CUSTOM"
+    basket_id: Optional[str] = None
     exchange: str = "NSE"
     timeframe: str = "1day"
     timeframes: Optional[List[str]] = None
@@ -95,6 +114,7 @@ class ScreenerRequest(BaseModel):
     as_of_date: Optional[str] = None
     screen_id: Optional[str] = None
     preset: str = "all_metrics"
+    rule_def: Optional[Dict[str, Any]] = None
     params: Optional[Dict[str, Any]] = None
     provider: Optional[str] = None
     backend: str = "auto"
@@ -107,11 +127,13 @@ class UniverseSyncRequest(BaseModel):
 
 class LiveScreenerStartRequest(BaseModel):
     symbols: Optional[List[str]] = None
+    basket_id: Optional[str] = None
     universe: str = "CUSTOM"
     exchange: str = "NSE"
     timeframe: str = "1day"
     screen_id: Optional[str] = None
     preset: str = "all_metrics"
+    rule_def: Optional[Dict[str, Any]] = None
     params: Optional[Dict[str, Any]] = None
     provider: Optional[str] = None
     backend: str = "auto"
@@ -175,10 +197,19 @@ def _render_callback_page(title: str, detail: str, broker_id: str, success: bool
 
 
 def create_app() -> FastAPI:
+    @asynccontextmanager
+    async def _lifespan(_app: FastAPI):
+        reset_shutdown()
+        try:
+            yield
+        finally:
+            request_shutdown()
+
     app = FastAPI(
         title="AlgoDesk Broker & Data Hub",
         description="Local broker connectivity status, reconnect flow, and trading/data routing.",
         version="1.0.0",
+        lifespan=_lifespan,
     )
 
     @app.get("/", response_class=HTMLResponse)
@@ -510,14 +541,20 @@ def create_app() -> FastAPI:
             try:
                 initial = hub_service.get_live_status()["feeds"]
                 yield f"data: {json.dumps({'type': 'tick_snapshot', **initial})}\n\n"
-                while True:
+                while not is_shutting_down():
                     if await request.is_disconnected():
                         break
+                    event = None
                     try:
                         event = listener_q.get_nowait()
-                        yield f"data: {json.dumps(event)}\n\n"
                     except queue.Empty:
+                        pass
+                    if event is not None:
+                        yield f"data: {json.dumps(event)}\n\n"
+                    else:
                         await asyncio.sleep(0.25)
+            except asyncio.CancelledError:
+                return
             finally:
                 hub_service.unregister_live_listener(listener_q)
 
@@ -535,15 +572,19 @@ def create_app() -> FastAPI:
         async def _sender() -> None:
             initial = hub_service.get_live_status()["feeds"]
             await websocket.send_text(json.dumps({"type": "tick_snapshot", **initial}))
-            while True:
+            while not is_shutting_down():
+                event = None
                 try:
                     event = listener_q.get_nowait()
-                    await websocket.send_text(json.dumps(event))
                 except queue.Empty:
+                    pass
+                if event is not None:
+                    await websocket.send_text(json.dumps(event))
+                else:
                     await asyncio.sleep(0.2)
 
         async def _receiver() -> None:
-            while True:
+            while not is_shutting_down():
                 raw = await websocket.receive_text()
                 try:
                     cmd = json.loads(raw) if raw.strip() else {}
@@ -578,12 +619,19 @@ def create_app() -> FastAPI:
         receiver_task = asyncio.create_task(_receiver())
         try:
             await asyncio.wait({sender_task, receiver_task}, return_when=asyncio.FIRST_COMPLETED)
-        except WebSocketDisconnect:
+        except (WebSocketDisconnect, asyncio.CancelledError):
             pass
         finally:
-            sender_task.cancel()
-            receiver_task.cancel()
+            for task in (sender_task, receiver_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(sender_task, receiver_task, return_exceptions=True)
             hub_service.unregister_live_listener(listener_q)
+            if is_shutting_down():
+                try:
+                    await websocket.close(code=1001)
+                except Exception:
+                    pass
 
     @app.post("/api/live/preflight")
     def api_live_preflight(payload: Optional[PreflightRequest] = None) -> dict:
@@ -608,15 +656,19 @@ def create_app() -> FastAPI:
         async def _sender() -> None:
             initial = hub_service.get_live_screener_status()
             await websocket.send_text(json.dumps({"type": "live_screen:state", **initial}))
-            while True:
+            while not is_shutting_down():
+                event = None
                 try:
                     event = listener_q.get_nowait()
-                    await websocket.send_text(json.dumps(event))
                 except queue.Empty:
+                    pass
+                if event is not None:
+                    await websocket.send_text(json.dumps(event))
+                else:
                     await asyncio.sleep(0.15)
 
         async def _receiver() -> None:
-            while True:
+            while not is_shutting_down():
                 raw = await websocket.receive_text()
                 try:
                     cmd = json.loads(raw) if raw.strip() else {}
@@ -651,12 +703,19 @@ def create_app() -> FastAPI:
         receiver_task = asyncio.create_task(_receiver())
         try:
             await asyncio.wait({sender_task, receiver_task}, return_when=asyncio.FIRST_COMPLETED)
-        except WebSocketDisconnect:
+        except (WebSocketDisconnect, asyncio.CancelledError):
             pass
         finally:
-            sender_task.cancel()
-            receiver_task.cancel()
+            for task in (sender_task, receiver_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(sender_task, receiver_task, return_exceptions=True)
             hub_service.unregister_live_screener_listener(listener_q)
+            if is_shutting_down():
+                try:
+                    await websocket.close(code=1001)
+                except Exception:
+                    pass
 
     @app.get("/api/analytics/meta")
     def api_analytics_meta() -> dict:
@@ -680,11 +739,13 @@ def create_app() -> FastAPI:
         try:
             return hub_service.start_live_screener(
                 symbols=req.symbols,
+                basket_id=req.basket_id,
                 universe=req.universe,
                 exchange=req.exchange,
                 timeframe=req.timeframe,
                 screen_id=req.screen_id,
                 preset=req.preset,
+                rule_def=req.rule_def,
                 params=req.params,
                 provider=req.provider,
                 backend=req.backend,
@@ -716,6 +777,7 @@ def create_app() -> FastAPI:
         try:
             return hub_service.run_screener(
                 symbols=req.symbols,
+                basket_id=req.basket_id,
                 universe=req.universe,
                 exchange=req.exchange,
                 timeframe=req.timeframe,
@@ -724,6 +786,7 @@ def create_app() -> FastAPI:
                 as_of_date=req.as_of_date,
                 screen_id=req.screen_id,
                 preset=req.preset,
+                rule_def=req.rule_def,
                 params=req.params,
                 provider=req.provider,
                 backend=req.backend,
@@ -963,23 +1026,93 @@ def create_app() -> FastAPI:
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    @app.get("/api/streak/plugins/source")
+    def api_streak_plugin_source(kind: str = Query(default="screen"), id: str = Query(default="")) -> dict:
+        try:
+            return hub_service.get_python_plugin_source(kind=kind, plugin_id=id)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/streak/plugins/python")
+    def api_streak_plugin_save(payload: Dict[str, Any]) -> dict:
+        try:
+            return hub_service.save_python_plugin(
+                kind=str(payload.get("kind", "screen")),
+                filename=str(payload.get("filename", "")),
+                code=str(payload.get("code", "")),
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/streak/scanners/alerts")
+    def api_streak_scanner_alerts(subscription_id: Optional[str] = Query(default=None)) -> dict:
+        return hub_service.list_scanner_alerts(subscription_id=subscription_id)
+
+    @app.post("/api/streak/scanners/alerts")
+    def api_streak_scanner_alerts_save(payload: Dict[str, Any]) -> dict:
+        try:
+            return hub_service.save_scanner_alert(payload)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/streak/scanners/alerts/{alert_id}/action")
+    def api_streak_scanner_alerts_action(alert_id: str, payload: Dict[str, Any]) -> dict:
+        try:
+            return hub_service.control_scanner_alert(alert_id, str(payload.get("action", "")))
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.delete("/api/streak/scanners/alerts/{alert_id}")
+    def api_streak_scanner_alerts_delete(alert_id: str) -> dict:
+        return hub_service.delete_scanner_alert(alert_id)
+
+    @app.post("/api/streak/orders/quick")
+    def api_streak_quick_order(payload: Dict[str, Any]) -> dict:
+        try:
+            return hub_service.place_quick_order(payload)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.websocket("/ws/deployments")
     async def ws_deployments(websocket: WebSocket) -> None:
         await websocket.accept()
         listener_q = hub_service.register_deployments_listener()
-        try:
+
+        async def _sender() -> None:
             initial = hub_service.list_deployments()
             await websocket.send_text(json.dumps({"type": "deployments:state", **initial}))
-            while True:
+            while not is_shutting_down():
+                event = None
                 try:
                     event = listener_q.get_nowait()
-                    await websocket.send_text(json.dumps(event))
                 except queue.Empty:
+                    pass
+                if event is not None:
+                    await websocket.send_text(json.dumps(event))
+                else:
                     await asyncio.sleep(0.2)
-        except WebSocketDisconnect:
+
+        async def _receiver() -> None:
+            while not is_shutting_down():
+                await websocket.receive_text()
+
+        sender_task = asyncio.create_task(_sender())
+        receiver_task = asyncio.create_task(_receiver())
+        try:
+            await asyncio.wait({sender_task, receiver_task}, return_when=asyncio.FIRST_COMPLETED)
+        except (WebSocketDisconnect, asyncio.CancelledError):
             pass
         finally:
+            for task in (sender_task, receiver_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(sender_task, receiver_task, return_exceptions=True)
             hub_service.unregister_deployments_listener(listener_q)
+            if is_shutting_down():
+                try:
+                    await websocket.close(code=1001)
+                except Exception:
+                    pass
 
     @app.get("/{full_path:path}")
     def spa_static_or_fallback(full_path: str) -> Response:

@@ -155,10 +155,30 @@ class ScreenRegistry:
                 raise ValueError(f"Unknown screen '{screen_id}'. Available: {avail}")
             return self._screens[clean_id]
 
+    def get_source_path(self, screen_id: str) -> Optional[Path]:
+        self.refresh_if_changed()
+        clean_id = (screen_id or "all_metrics").strip().lower()
+        clean_id = _SCREEN_ALIASES.get(clean_id, clean_id)
+        with self._lock:
+            for fpath, ids in self._file_to_ids.items():
+                if clean_id in ids:
+                    return fpath
+        return None
+
     def list_screens(self) -> List[Dict[str, Any]]:
         self.refresh_if_changed()
         with self._lock:
-            items = [scr.metadata() for scr in self._screens.values()]
+            id_to_file = {
+                sid: fpath.name
+                for fpath, ids in self._file_to_ids.items()
+                for sid in ids
+            }
+            items = []
+            for sid, scr in self._screens.items():
+                meta = dict(scr.metadata())
+                if sid in id_to_file:
+                    meta["source_file"] = id_to_file[sid]
+                items.append(meta)
         # Put 'all_metrics' first, then sort alphabetically by name
         items.sort(key=lambda x: (0 if x["id"] == "all_metrics" else 1, x["name"].lower()))
         return items

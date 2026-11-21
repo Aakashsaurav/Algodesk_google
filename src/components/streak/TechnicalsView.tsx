@@ -1,5 +1,9 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Search, RefreshCw } from 'lucide-react';
+
+interface TechnicalsViewProps {
+  initialSymbol?: string;
+}
 
 interface TechnicalsResult {
   ok: boolean;
@@ -49,8 +53,8 @@ const TF_OPTIONS = [
   { id: '1week', label: '1W' },
 ];
 
-export function TechnicalsView() {
-  const [symbol, setSymbol] = useState('RELIANCE');
+export function TechnicalsView({ initialSymbol }: TechnicalsViewProps = {}) {
+  const [symbol, setSymbol] = useState(initialSymbol || 'RELIANCE');
   const [exchange, setExchange] = useState('NSE');
   const [timeframe, setTimeframe] = useState('1day');
   const [data, setData] = useState<TechnicalsResult | null>(null);
@@ -77,6 +81,15 @@ export function TechnicalsView() {
       setLoading(false);
     }
   };
+
+  useEffect(() => {
+    if (initialSymbol) {
+      const clean = initialSymbol.trim().toUpperCase();
+      setSymbol(clean);
+      void runAnalysis(timeframe, clean);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialSymbol]);
 
   const signalColor = (sig: string) => {
     const u = sig.toUpperCase();

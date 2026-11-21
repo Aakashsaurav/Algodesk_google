@@ -1,0 +1,911 @@
+import { useMemo, useState } from 'react';
+import {
+  ArrowLeft,
+  Bell,
+  Copy,
+  Download,
+  Eye,
+  Receipt,
+  Rocket,
+  X,
+} from 'lucide-react';
+import { CandlestickChartPanel } from './CandlestickChartPanel';
+import type { QuickOrderTarget } from './QuickOrderModal';
+import type { BacktestFullResult, BacktestTradeRow } from './types';
+
+interface BacktestResultsViewProps {
+  result: BacktestFullResult;
+  onBack?: () => void;
+  onViewStrategy?: () => void;
+  onCopyStrategy?: () => void;
+  onDeployed?: () => void;
+  onQuickOrder?: (target: QuickOrderTarget) => void;
+}
+
+const WEEKDAYS = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday'];
+const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
+
+export function computeTradeAnalytics(trades: BacktestTradeRow[], includeCharges: boolean) {
+  let totalPnl = 0;
+  let wins = 0;
+  let losses = 0;
+  let maxGain = 0;
+  let maxLoss = 0;
+  let winSum = 0;
+  let lossSum = 0;
+  let curW = 0;
+  let curL = 0;
+  let maxWStreak = 0;
+  let maxLStreak = 0;
+
+  let peak = 0;
+  let cum = 0;
+  let maxDdAbs = 0;
+
+  const dayBuckets: Record<number, number[]> = { 1: [], 2: [], 3: [], 4: [], 5: [] };
+  const monthBuckets: Record<number, { pnl: number; retSum: number; count: number }> = {};
+  for (let m = 0; m < 12; m += 1) monthBuckets[m] = { pnl: 0, retSum: 0, count: 0 };
+
+  const cumSeries: Array<{ label: string; pnl: number }> = [{ label: 'Start', pnl: 0 }];
+
+  for (const t of trades) {
+    const val = includeCharges ? Number(t.pnl ?? 0) : Number(t.gross_pnl ?? t.pnl ?? 0);
+    const notional = Math.max(1, Number(t.entry_price || 0) * Math.max(1, Number(t.qty || 1)));
+    const retPct = (val / notional) * 100;
+
+    totalPnl += val;
+    cum += val;
+    if (cum > peak) peak = cum;
+    const dd = peak - cum;
+    if (dd > maxDdAbs) maxDdAbs = dd;
+    cumSeries.push({ label: (t.exit_date || t.entry_date || '').slice(0, 10), pnl: cum });
+
+    if (val >= 0) {
+      wins += 1;
+      winSum += val;
+      if (val > maxGain) maxGain = val;
+      curW += 1;
+      curL = 0;
+      if (curW > maxWStreak) maxWStreak = curW;
+    } else {
+      losses += 1;
+      lossSum += val;
+      if (val < maxLoss) maxLoss = val;
+      curL += 1;
+      curW = 0;
+      if (curL > maxLStreak) maxLStreak = curL;
+    }
+
+    const dtStr = (t.exit_date || t.entry_date || '').slice(0, 10);
+    if (dtStr.length === 10) {
+      const dt = new Date(`${dtStr}T00:00:00Z`);
+      if (!Number.isNaN(dt.getTime())) {
+        const dow = dt.getUTCDay();
+        if (dayBuckets[dow]) dayBuckets[dow].push(retPct);
+        const mo = dt.getUTCMonth();
+        if (monthBuckets[mo]) {
+          monthBuckets[mo].pnl += val;
+          monthBuckets[mo].retSum += retPct;
+          monthBuckets[mo].count += 1;
+        }
+      }
+    }
+  }
+
+  const dailySummary = WEEKDAYS.map((day, i) => {
+    const arr = dayBuckets[i + 1] || [];
+    if (!arr.length) return { day, avg: 0, maxProfit: 0, maxLoss: 0, count: 0 };
+    const avg = arr.reduce((a, b) => a + b, 0) / arr.length;
+    const maxProfit = Math.max(0, ...arr);
+    const maxLossDay = Math.min(0, ...arr);
+    return { day, avg, maxProfit, maxLoss: maxLossDay, count: arr.length };
+  });
+
+  const monthlySummary = MONTHS.map((label, m) => ({
+    label,
+    pnl: monthBuckets[m].pnl,
+    retPct: monthBuckets[m].retSum,
+    count: monthBuckets[m].count,
+  }));
+
+  return {
+    totalPnl,
+    wins,
+    losses,
+    totalTrades: trades.length,
+    maxWStreak,
+    maxLStreak,
+    maxGain,
+    maxLoss,
+    winAvg: wins > 0 ? winSum / wins : 0,
+    lossAvg: losses > 0 ? lossSum / losses : 0,
+    maxDdAbs,
+    dailySummary,
+    monthlySummary,
+    cumSeries,
+  };
+}
+
+export function BacktestResultsView({
+  result,
+  onBack,
+  onViewStrategy,
+  onCopyStrategy,
+  onDeployed,
+  onQuickOrder,
+}: BacktestResultsViewProps) {
+  const [selectedSymbol, setSelectedSymbol] = useState<string>('COMBINED');
+  const [includeCharges, setIncludeCharges] = useState<boolean>(true);
+  const [showChargesBreakdown, setShowChargesBreakdown] = useState<boolean>(false);
+  const [showAllTrades, setShowAllTrades] = useState<boolean>(false);
+
+  // Deploy modal state
+  const [deployOpen, setDeployOpen] = useState(false);
+  const [deployExecMode, setDeployExecMode] = useState<'live_alert' | 'paper' | 'live_auto'>('live_alert');
+  const [deployName, setDeployName] = useState(`${result.strategy_label} — Live`);
+  const [deployBusy, setDeployBusy] = useState(false);
+  const [deployMsg, setDeployMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+
+  const combinedStats = useMemo(
+    () => computeTradeAnalytics(result.trades || [], includeCharges),
+    [result.trades, includeCharges]
+  );
+
+  const activeTrades = useMemo(() => {
+    const all = result.trades || [];
+    if (selectedSymbol === 'COMBINED') return all;
+    return all.filter((t) => (t.symbol || '').toUpperCase() === selectedSymbol.toUpperCase());
+  }, [result.trades, selectedSymbol]);
+
+  const activeStats = useMemo(
+    () => computeTradeAnalytics(activeTrades, includeCharges),
+    [activeTrades, includeCharges]
+  );
+
+  const chartSymbol = useMemo(() => {
+    if (selectedSymbol !== 'COMBINED') return selectedSymbol;
+    return result.per_symbol?.[0]?.symbol || result.symbols?.[0] || 'RELIANCE';
+  }, [selectedSymbol, result.per_symbol, result.symbols]);
+
+  const activeSymbolRow = useMemo(
+    () => (result.per_symbol || []).find((s) => s.symbol === selectedSymbol),
+    [result.per_symbol, selectedSymbol]
+  );
+
+  const maxDdPctDisplay = useMemo(() => {
+    if (selectedSymbol === 'COMBINED') return result.max_drawdown_pct ?? 0;
+    if (activeSymbolRow?.max_drawdown_pct !== undefined) return activeSymbolRow.max_drawdown_pct;
+    return result.initial_capital > 0 ? (activeStats.maxDdAbs / result.initial_capital) * 100 : 0;
+  }, [selectedSymbol, result.max_drawdown_pct, result.initial_capital, activeSymbolRow, activeStats.maxDdAbs]);
+
+  const yearLabel = (result.to_date || result.from_date || new Date().toISOString()).slice(0, 4);
+
+  const handleDownloadCsv = () => {
+    if (!activeTrades.length) return;
+    const headers = [
+      'Symbol',
+      'Entry Date',
+      'Exit Date',
+      'Qty',
+      'Entry Price',
+      'Exit Price',
+      'Gross P&L',
+      'Charges',
+      'Net P&L',
+      'Return %',
+      'Exit Reason',
+    ];
+    const lines = [headers.join(',')];
+    for (const t of activeTrades) {
+      lines.push(
+        [
+          t.symbol || chartSymbol,
+          t.entry_date,
+          t.exit_date,
+          t.qty,
+          t.entry_price.toFixed(2),
+          t.exit_price.toFixed(2),
+          t.gross_pnl.toFixed(2),
+          t.charges.toFixed(2),
+          t.pnl.toFixed(2),
+          t.return_pct.toFixed(2),
+          `"${(t.exit_reason || '').replace(/"/g, '""')}"`,
+        ].join(',')
+      );
+    }
+    const blob = new Blob([lines.join('\n')], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `trade_log_${result.strategy}_${selectedSymbol}.csv`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const handleDeploySubmit = async () => {
+    setDeployBusy(true);
+    setDeployMsg(null);
+    try {
+      const res = await fetch('/api/streak/deployments', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          name: deployName.trim() || `${result.strategy_label} Live`,
+          exec_mode: deployExecMode,
+          spec: result.deploy_spec,
+        }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.detail || 'Deployment failed.');
+      setDeployMsg({ type: 'ok', text: `Deployed "${deployName}" in ${deployExecMode.replace('_', ' ')} mode.` });
+      window.setTimeout(() => {
+        setDeployOpen(false);
+        setDeployMsg(null);
+        onDeployed?.();
+      }, 700);
+    } catch (err) {
+      setDeployMsg({ type: 'err', text: err instanceof Error ? err.message : 'Deployment failed.' });
+    } finally {
+      setDeployBusy(false);
+    }
+  };
+
+  // Zero-line P&L Chart SVG math
+  const pnlSvg = useMemo(() => {
+    const pts = activeStats.cumSeries;
+    const w = 760;
+    const h = 210;
+    const padL = 14;
+    const padR = 64;
+    const padT = 16;
+    const padB = 24;
+    const plotW = w - padL - padR;
+    const plotH = h - padT - padB;
+    const vals = pts.map((p) => p.pnl);
+    const rawMin = Math.min(0, ...vals);
+    const rawMax = Math.max(0, ...vals);
+    const span = Math.max(10, rawMax - rawMin);
+    const minV = rawMin - span * 0.1;
+    const maxV = rawMax + span * 0.1;
+    const yFor = (v: number) => padT + ((maxV - v) / Math.max(1, maxV - minV)) * plotH;
+    const xFor = (i: number) => padL + (i / Math.max(1, pts.length - 1)) * plotW;
+    const zeroY = yFor(0);
+    const linePath = pts
+      .map((p, i) => `${i === 0 ? 'M' : 'L'}${xFor(i).toFixed(1)},${yFor(p.pnl).toFixed(1)}`)
+      .join(' ');
+    const areaPath =
+      pts.length > 1
+        ? `${linePath} L${xFor(pts.length - 1).toFixed(1)},${zeroY.toFixed(1)} L${xFor(0).toFixed(1)},${zeroY.toFixed(1)} Z`
+        : '';
+    return { w, h, padL, padR, zeroY, minV, maxV, yFor, xFor, linePath, areaPath, pts };
+  }, [activeStats.cumSeries]);
+
+  const displayedTrades = showAllTrades ? activeTrades : activeTrades.slice(0, 15);
+  const cb = result.charges_breakdown;
+
+  return (
+    <div className="space-y-4">
+      {/* Top Header matching Streak Backtest Result-1.png */}
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex items-center gap-3">
+          {onBack && (
+            <button
+              type="button"
+              onClick={onBack}
+              className="flex h-9 w-9 items-center justify-center rounded-lg border border-slate-700 bg-[#111827] text-slate-300 hover:border-sky-400 hover:text-slate-100"
+              title="Back to editor"
+            >
+              <ArrowLeft className="h-4 w-4" />
+            </button>
+          )}
+          <div>
+            <div className="flex flex-wrap items-center gap-2">
+              <h2 className="text-xl font-bold tracking-tight text-slate-100">
+                {result.strategy_label}
+              </h2>
+              <span className="font-mono text-xs text-slate-400">
+                · {result.mode === 'portfolio' ? `Portfolio (${result.allocation_mode || 'equal'})` : 'Individual'} · {result.timeframe}
+              </span>
+            </div>
+            <p className="mt-0.5 font-mono text-xs text-slate-400">
+              {result.from_date} to {result.to_date} · Capital ₹{result.initial_capital.toLocaleString('en-IN')} · Charges: {result.charges_profile.toUpperCase()} ({result.segment})
+            </p>
+          </div>
+        </div>
+
+        <div className="flex flex-wrap items-center gap-2">
+          {onViewStrategy && (
+            <button
+              type="button"
+              onClick={onViewStrategy}
+              className="inline-flex min-h-[36px] items-center gap-1.5 rounded-lg border border-slate-700 bg-[#111827] px-3.5 text-xs font-semibold text-sky-300 hover:border-sky-400"
+            >
+              <Eye className="h-3.5 w-3.5" />
+              <span>View Strategy</span>
+            </button>
+          )}
+          {onCopyStrategy && (
+            <button
+              type="button"
+              onClick={onCopyStrategy}
+              className="inline-flex min-h-[36px] items-center gap-1.5 rounded-lg border border-sky-700/70 bg-sky-950/30 px-3.5 text-xs font-semibold text-sky-300 hover:border-sky-400"
+            >
+              <Copy className="h-3.5 w-3.5" />
+              <span>Copy Strategy</span>
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => setDeployOpen(true)}
+            className="inline-flex min-h-[36px] items-center gap-1.5 rounded-lg bg-sky-500 px-4 text-xs font-semibold text-slate-950 hover:bg-sky-400"
+          >
+            <Bell className="h-3.5 w-3.5" />
+            <span>Notification Based Trading</span>
+          </button>
+        </div>
+      </div>
+
+      {/* Main Split Grid: Left Combined + Instrument List (3 cols) | Right Analytics & Charts (9 cols) */}
+      <div className="grid grid-cols-1 gap-4 lg:grid-cols-12">
+        {/* Left Instrument Rail */}
+        <div className="flex flex-col gap-3 lg:col-span-3">
+          {/* Combined Results Card */}
+          <button
+            type="button"
+            onClick={() => setSelectedSymbol('COMBINED')}
+            className={`w-full rounded-xl border p-4 text-left transition-colors ${
+              selectedSymbol === 'COMBINED'
+                ? 'border-sky-500/80 bg-sky-950/30'
+                : 'border-slate-800 bg-[#111827] hover:border-slate-700'
+            }`}
+          >
+            <div className="flex items-baseline justify-between gap-2">
+              <span className="text-sm font-bold text-slate-100">Combined Results</span>
+              <span
+                className={`font-mono text-sm font-bold tabular-nums ${
+                  combinedStats.totalPnl >= 0 ? 'text-emerald-400' : 'text-red-400'
+                }`}
+              >
+                {combinedStats.totalPnl >= 0 ? '+' : ''}
+                {combinedStats.totalPnl.toLocaleString('en-IN', { maximumFractionDigits: 2 })} ₹
+              </span>
+            </div>
+            <div className="mt-2 flex items-center justify-between font-mono text-xs text-slate-400">
+              <span>
+                Wins: <strong className="text-emerald-400">{combinedStats.wins}</strong>, Losses:{' '}
+                <strong className="text-red-400">{combinedStats.losses}</strong>
+              </span>
+              <span>
+                Trades: <strong className="text-slate-200">{combinedStats.totalTrades}</strong>
+              </span>
+            </div>
+          </button>
+
+          {/* Per-Instrument P&L List */}
+          <div className="flex flex-col overflow-hidden rounded-xl border border-slate-800 bg-[#111827]">
+            <div className="flex items-center justify-between border-b border-slate-800 bg-[#0b1120] px-4 py-2.5 text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+              <span>Instrument</span>
+              <span>P&amp;L</span>
+            </div>
+            <div className="max-h-[680px] divide-y divide-slate-800/70 overflow-y-auto">
+              {(result.per_symbol || []).map((row) => {
+                const pnl = includeCharges ? row.net_pnl : row.gross_pnl;
+                const isSel = selectedSymbol === row.symbol;
+                return (
+                  <button
+                    key={row.symbol}
+                    type="button"
+                    onClick={() => setSelectedSymbol(row.symbol)}
+                    className={`flex w-full items-center justify-between px-4 py-3 text-left transition-colors ${
+                      isSel ? 'bg-sky-950/40' : 'hover:bg-slate-800/40'
+                    }`}
+                  >
+                    <div>
+                      <div className={`font-mono text-xs font-semibold ${isSel ? 'text-sky-300' : 'text-slate-100'}`}>
+                        {row.symbol}
+                      </div>
+                      <div className="mt-0.5 font-mono text-[10px] text-slate-500">
+                        {row.trades} trades · {row.win_rate_pct.toFixed(0)}% win
+                      </div>
+                    </div>
+                    <span
+                      className={`font-mono text-xs font-semibold tabular-nums ${
+                        pnl >= 0 ? 'text-emerald-400' : 'text-red-400'
+                      }`}
+                    >
+                      {pnl >= 0 ? '+' : ''}
+                      {pnl.toLocaleString('en-IN', { maximumFractionDigits: 2 })}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        </div>
+
+        {/* Right Detailed Analytics Pane */}
+        <div className="space-y-4 lg:col-span-9">
+          {/* Header + Trading Charges Gross/Net Toggle + 9-Column Metrics Strip */}
+          <div className="overflow-hidden rounded-xl border border-slate-800 bg-[#111827]">
+            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 px-5 py-3.5">
+              <div className="flex items-center gap-2.5">
+                <h3 className="font-mono text-base font-bold text-slate-100">
+                  {selectedSymbol === 'COMBINED' ? 'COMBINED PORTFOLIO' : selectedSymbol}
+                </h3>
+                <span className="text-xs text-slate-500">NSE</span>
+                <span className="font-mono text-xs text-slate-400">
+                  · {includeCharges ? 'Net (After Real Charges)' : 'Gross (Before Charges)'}
+                </span>
+              </div>
+
+              <div className="flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={() => setShowChargesBreakdown((v) => !v)}
+                  className="inline-flex items-center gap-1 font-mono text-xs text-slate-400 hover:text-sky-300"
+                >
+                  <Receipt className="h-3.5 w-3.5" />
+                  <span>Charges: ₹{(result.total_charges || 0).toLocaleString('en-IN', { maximumFractionDigits: 2 })}</span>
+                </button>
+                <div className="flex items-center gap-2">
+                  <span className="text-xs font-medium text-slate-300">Trading Charges</span>
+                  <button
+                    type="button"
+                    role="switch"
+                    aria-checked={includeCharges}
+                    onClick={() => setIncludeCharges((v) => !v)}
+                    className={`relative inline-flex h-5 w-9 items-center rounded-full transition-colors ${
+                      includeCharges ? 'bg-sky-500' : 'bg-slate-700'
+                    }`}
+                  >
+                    <span
+                      className={`inline-block h-3.5 w-3.5 transform rounded-full bg-white transition-transform ${
+                        includeCharges ? 'translate-x-4' : 'translate-x-1'
+                      }`}
+                    />
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {showChargesBreakdown && cb && (
+              <div className="grid grid-cols-2 gap-3 border-b border-slate-800 bg-[#0b1120] px-5 py-3 font-mono text-[11px] sm:grid-cols-4 lg:grid-cols-7">
+                <div>
+                  <span className="text-slate-500">Brokerage</span>
+                  <div className="text-slate-200">₹{cb.brokerage.toFixed(2)}</div>
+                </div>
+                <div>
+                  <span className="text-slate-500">STT</span>
+                  <div className="text-slate-200">₹{cb.stt.toFixed(2)}</div>
+                </div>
+                <div>
+                  <span className="text-slate-500">Exchange Txn</span>
+                  <div className="text-slate-200">₹{cb.exchange_txn.toFixed(2)}</div>
+                </div>
+                <div>
+                  <span className="text-slate-500">SEBI Fee</span>
+                  <div className="text-slate-200">₹{cb.sebi_fee.toFixed(2)}</div>
+                </div>
+                <div>
+                  <span className="text-slate-500">GST</span>
+                  <div className="text-slate-200">₹{cb.gst.toFixed(2)}</div>
+                </div>
+                <div>
+                  <span className="text-slate-500">Stamp + DP</span>
+                  <div className="text-slate-200">₹{(cb.stamp_duty + cb.dp_charges).toFixed(2)}</div>
+                </div>
+                <div>
+                  <span className="text-slate-500">Slippage</span>
+                  <div className="text-slate-200">₹{cb.slippage_cost.toFixed(2)}</div>
+                </div>
+              </div>
+            )}
+
+            {/* 9-Metric Streak Strip */}
+            <div className="grid grid-cols-3 gap-4 px-5 py-4 sm:grid-cols-5 lg:grid-cols-9">
+              <div>
+                <div className="text-[11px] text-slate-400">Total P&amp;L</div>
+                <div
+                  className={`mt-1 font-mono text-sm font-bold tabular-nums ${
+                    activeStats.totalPnl >= 0 ? 'text-emerald-400' : 'text-red-400'
+                  }`}
+                >
+                  {activeStats.totalPnl >= 0 ? '+' : ''}
+                  {activeStats.totalPnl.toLocaleString('en-IN', { maximumFractionDigits: 2 })} ₹
+                </div>
+              </div>
+              <div>
+                <div className="text-[11px] text-slate-400">W / L Count</div>
+                <div className="mt-1 font-mono text-sm font-semibold tabular-nums">
+                  <span className="text-emerald-400">{activeStats.wins}</span>
+                  <span className="mx-1 text-slate-600">/</span>
+                  <span className="text-red-400">{activeStats.losses}</span>
+                </div>
+              </div>
+              <div>
+                <div className="text-[11px] text-slate-400">Trades</div>
+                <div className="mt-1 font-mono text-sm font-semibold text-slate-100 tabular-nums">
+                  {activeStats.totalTrades}
+                </div>
+              </div>
+              <div>
+                <div className="text-[11px] text-slate-400">W / L Streak</div>
+                <div className="mt-1 font-mono text-sm font-semibold tabular-nums">
+                  <span className="text-emerald-400">{activeStats.maxWStreak}</span>
+                  <span className="mx-1 text-slate-600">/</span>
+                  <span className="text-red-400">{activeStats.maxLStreak}</span>
+                </div>
+              </div>
+              <div>
+                <div className="text-[11px] text-slate-400">Max Gain</div>
+                <div className="mt-1 font-mono text-sm font-semibold text-emerald-400 tabular-nums">
+                  {activeStats.maxGain.toFixed(2)}
+                </div>
+              </div>
+              <div>
+                <div className="text-[11px] text-slate-400">Max Loss</div>
+                <div className="mt-1 font-mono text-sm font-semibold text-red-400 tabular-nums">
+                  {activeStats.maxLoss.toFixed(2)}
+                </div>
+              </div>
+              <div>
+                <div className="text-[11px] text-slate-400">Winning Avg.</div>
+                <div className="mt-1 font-mono text-sm font-semibold text-slate-100 tabular-nums">
+                  {activeStats.winAvg.toFixed(2)}
+                </div>
+              </div>
+              <div>
+                <div className="text-[11px] text-slate-400">Losing Avg.</div>
+                <div className="mt-1 font-mono text-sm font-semibold text-slate-100 tabular-nums">
+                  {activeStats.lossAvg.toFixed(2)}
+                </div>
+              </div>
+              <div>
+                <div className="text-[11px] text-slate-400">Max DD</div>
+                <div className="mt-1 font-mono text-sm font-semibold text-amber-300 tabular-nums">
+                  {maxDdPctDisplay.toFixed(2)}%
+                </div>
+              </div>
+            </div>
+          </div>
+
+          {/* Hypothetical Daily Summary + Hypothetical Monthly Performance */}
+          <div className="grid grid-cols-1 gap-4 xl:grid-cols-2">
+            {/* Daily Summary */}
+            <div className="overflow-hidden rounded-xl border border-slate-800 bg-[#111827] p-4">
+              <h4 className="mb-3 text-xs font-semibold text-slate-300">Hypothetical Daily Summary</h4>
+              <div className="overflow-hidden rounded-lg border border-slate-800">
+                <table className="w-full border-collapse text-center text-xs">
+                  <thead className="bg-[#0b1120] text-[11px] font-semibold text-slate-400">
+                    <tr>
+                      <th className="px-3 py-2 text-left">Day</th>
+                      <th className="px-3 py-2">Avg. Return %</th>
+                      <th className="px-3 py-2">Max Profit %</th>
+                      <th className="px-3 py-2">Max Loss %</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-800/70 font-mono tabular-nums">
+                    {activeStats.dailySummary.map((d) => (
+                      <tr key={d.day} className="hover:bg-slate-800/30">
+                        <td className="px-3 py-2 text-left font-sans font-medium text-slate-300">{d.day}</td>
+                        <td
+                          className={`px-3 py-2 font-semibold ${
+                            d.avg > 0 ? 'text-emerald-400' : d.avg < 0 ? 'text-red-400' : 'text-slate-400'
+                          }`}
+                        >
+                          {d.avg >= 0 ? '+' : ''}
+                          {d.avg.toFixed(2)}%
+                        </td>
+                        <td className="px-3 py-2 text-emerald-400">{d.maxProfit.toFixed(2)}%</td>
+                        <td className="px-3 py-2 text-red-400">{d.maxLoss.toFixed(2)}%</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            {/* Monthly Performance Heatmap */}
+            <div className="overflow-hidden rounded-xl border border-slate-800 bg-[#111827] p-4">
+              <div className="mb-3 flex items-center justify-between">
+                <h4 className="text-xs font-semibold text-slate-300">Hypothetical Monthly Performance</h4>
+                <span className="font-mono text-xs font-semibold text-slate-400">{yearLabel}</span>
+              </div>
+              <div className="grid grid-cols-6 gap-2.5">
+                {activeStats.monthlySummary.map((m) => {
+                  const hasData = m.count > 0;
+                  const pos = m.retPct >= 0;
+                  const bg = !hasData
+                    ? 'border-slate-800 bg-[#0b1120] text-slate-600'
+                    : pos
+                      ? 'border-emerald-700/70 bg-emerald-600/25 text-emerald-300'
+                      : 'border-red-800/70 bg-red-600/25 text-red-300';
+                  return (
+                    <div key={m.label} className="flex flex-col items-center gap-1">
+                      <div
+                        className={`flex h-12 w-full items-center justify-center rounded-lg border font-mono text-[11px] font-bold tabular-nums ${bg}`}
+                        title={`${m.label}: ${m.count} trades, ₹${m.pnl.toFixed(2)}`}
+                      >
+                        {hasData ? `${pos ? '+' : ''}${m.retPct.toFixed(1)}%` : '—'}
+                      </div>
+                      <span className="text-[11px] text-slate-400">{m.label}</span>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          </div>
+
+          {/* Chart / Trade Log Section */}
+          <div className="space-y-3 rounded-xl border border-slate-800 bg-[#111827] p-4">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h4 className="text-xs font-semibold text-slate-200">Chart / Trade Log ({chartSymbol})</h4>
+              <button
+                type="button"
+                onClick={handleDownloadCsv}
+                disabled={activeTrades.length === 0}
+                className="inline-flex min-h-[32px] items-center gap-1.5 rounded-lg border border-sky-700/70 bg-sky-950/30 px-3 text-xs font-semibold text-sky-300 hover:border-sky-400 disabled:opacity-40"
+              >
+                <Download className="h-3.5 w-3.5" />
+                <span>Download Trade Log</span>
+              </button>
+            </div>
+
+            <CandlestickChartPanel
+              symbols={result.symbols || [chartSymbol]}
+              activeSymbol={chartSymbol}
+              onSelectSymbol={(sym) => setSelectedSymbol(sym)}
+              timeframe={result.timeframe || '1day'}
+              trades={activeTrades}
+              onQuickOrder={onQuickOrder}
+              height={320}
+              compactHeader
+            />
+
+            {/* Trade Log Table */}
+            <div className="overflow-x-auto rounded-lg border border-slate-800">
+              <table className="w-full border-collapse text-left text-xs">
+                <thead className="border-b border-slate-800 bg-[#0b1120] text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+                  <tr>
+                    <th className="px-3 py-2.5">Symbol</th>
+                    <th className="px-3 py-2.5">Entry Date</th>
+                    <th className="px-3 py-2.5">Exit Date</th>
+                    <th className="px-3 py-2.5">Signal</th>
+                    <th className="px-3 py-2.5 text-right">Qty</th>
+                    <th className="px-3 py-2.5 text-right">Entry</th>
+                    <th className="px-3 py-2.5 text-right">Exit</th>
+                    <th className="px-3 py-2.5 text-right">Charges</th>
+                    <th className="px-3 py-2.5 text-right">P&amp;L</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-800/70 font-mono tabular-nums">
+                  {displayedTrades.length === 0 ? (
+                    <tr>
+                      <td colSpan={9} className="px-4 py-6 text-center font-sans text-slate-500">
+                        No trades executed for this selection.
+                      </td>
+                    </tr>
+                  ) : (
+                    displayedTrades.map((tr, i) => {
+                      const pnl = includeCharges ? tr.pnl : tr.gross_pnl;
+                      const reason = (tr.exit_reason || 'EXIT').toUpperCase();
+                      const tagColor = reason.includes('TP') || reason.includes('TARGET')
+                        ? 'text-emerald-400'
+                        : reason.includes('SL') || reason.includes('STOP')
+                          ? 'text-red-400'
+                          : 'text-sky-300';
+                      return (
+                        <tr key={`${tr.symbol}-${tr.entry_date}-${i}`} className="hover:bg-slate-800/40">
+                          <td className="px-3 py-2 font-semibold text-slate-100">{tr.symbol || chartSymbol}</td>
+                          <td className="px-3 py-2 text-slate-400">{tr.entry_date.slice(0, 16).replace('T', ' ')}</td>
+                          <td className="px-3 py-2 text-slate-400">{tr.exit_date.slice(0, 16).replace('T', ' ')}</td>
+                          <td className={`px-3 py-2 font-semibold ${tagColor}`}>{reason}</td>
+                          <td className="px-3 py-2 text-right text-slate-300">{tr.qty}</td>
+                          <td className="px-3 py-2 text-right text-slate-200">{tr.entry_price.toFixed(2)}</td>
+                          <td className="px-3 py-2 text-right text-slate-200">{tr.exit_price.toFixed(2)}</td>
+                          <td className="px-3 py-2 text-right text-slate-400">₹{tr.charges.toFixed(2)}</td>
+                          <td
+                            className={`px-3 py-2 text-right font-semibold ${
+                              pnl >= 0 ? 'text-emerald-400' : 'text-red-400'
+                            }`}
+                          >
+                            {pnl >= 0 ? '+' : ''}₹{pnl.toFixed(2)}
+                          </td>
+                        </tr>
+                      );
+                    })
+                  )}
+                </tbody>
+              </table>
+            </div>
+
+            {activeTrades.length > 15 && (
+              <div className="text-right">
+                <button
+                  type="button"
+                  onClick={() => setShowAllTrades((v) => !v)}
+                  className="text-xs font-semibold text-sky-400 hover:text-sky-300"
+                >
+                  {showAllTrades ? 'Show Top 15 Trades' : `See All Transactions (${activeTrades.length})`}
+                </button>
+              </div>
+            )}
+          </div>
+
+          {/* P&L Chart (Zero-Line Green/Red Curve matching Backtest Result-4.png) */}
+          <div className="rounded-xl border border-slate-800 bg-[#111827] p-4">
+            <div className="mb-3 flex items-center justify-between">
+              <h4 className="text-xs font-semibold text-slate-200">
+                Cumulative P&amp;L Chart ({includeCharges ? 'Net' : 'Gross'})
+              </h4>
+              <span
+                className={`font-mono text-xs font-bold tabular-nums ${
+                  activeStats.totalPnl >= 0 ? 'text-emerald-400' : 'text-red-400'
+                }`}
+              >
+                {activeStats.totalPnl >= 0 ? '+' : ''}₹{activeStats.totalPnl.toLocaleString('en-IN', { maximumFractionDigits: 2 })}
+              </span>
+            </div>
+            <div className="overflow-hidden rounded-lg border border-slate-800 bg-[#0b1120] p-2">
+              <svg viewBox={`0 0 ${pnlSvg.w} ${pnlSvg.h}`} className="block w-full">
+                <defs>
+                  <clipPath id="pnl-above-zero">
+                    <rect x={pnlSvg.padL} y={0} width={pnlSvg.w - pnlSvg.padL - pnlSvg.padR} height={pnlSvg.zeroY} />
+                  </clipPath>
+                  <clipPath id="pnl-below-zero">
+                    <rect x={pnlSvg.padL} y={pnlSvg.zeroY} width={pnlSvg.w - pnlSvg.padL - pnlSvg.padR} height={pnlSvg.h - pnlSvg.zeroY} />
+                  </clipPath>
+                </defs>
+                {/* Zero baseline */}
+                <line
+                  x1={pnlSvg.padL}
+                  y1={pnlSvg.zeroY}
+                  x2={pnlSvg.w - pnlSvg.padR}
+                  y2={pnlSvg.zeroY}
+                  stroke="#334155"
+                  strokeDasharray="3 3"
+                  strokeWidth="1"
+                />
+                <text
+                  x={pnlSvg.w - pnlSvg.padR + 6}
+                  y={pnlSvg.zeroY + 3}
+                  fill="#64748b"
+                  fontSize="10"
+                  fontFamily="IBM Plex Mono, monospace"
+                >
+                  0.0
+                </text>
+                <text
+                  x={pnlSvg.w - pnlSvg.padR + 6}
+                  y={18}
+                  fill="#10b981"
+                  fontSize="10"
+                  fontFamily="IBM Plex Mono, monospace"
+                >
+                  {pnlSvg.maxV.toFixed(0)}
+                </text>
+                <text
+                  x={pnlSvg.w - pnlSvg.padR + 6}
+                  y={pnlSvg.h - 24}
+                  fill="#ef4444"
+                  fontSize="10"
+                  fontFamily="IBM Plex Mono, monospace"
+                >
+                  {pnlSvg.minV.toFixed(0)}
+                </text>
+
+                {pnlSvg.areaPath && (
+                  <>
+                    <path d={pnlSvg.areaPath} fill="rgba(16, 185, 129, 0.22)" clipPath="url(#pnl-above-zero)" />
+                    <path d={pnlSvg.areaPath} fill="rgba(239, 68, 68, 0.22)" clipPath="url(#pnl-below-zero)" />
+                    <path d={pnlSvg.linePath} fill="none" stroke="#10b981" strokeWidth="1.8" clipPath="url(#pnl-above-zero)" />
+                    <path d={pnlSvg.linePath} fill="none" stroke="#ef4444" strokeWidth="1.8" clipPath="url(#pnl-below-zero)" />
+                  </>
+                )}
+              </svg>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Deploy / Notification Based Trading Modal */}
+      {deployOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 p-4 backdrop-blur-sm">
+          <div className="w-full max-w-md rounded-xl border border-slate-700 bg-[#111827] shadow-2xl">
+            <div className="flex items-center justify-between border-b border-slate-800 px-5 py-4">
+              <div className="flex items-center gap-2">
+                <Rocket className="h-4 w-4 text-sky-400" />
+                <h3 className="text-sm font-semibold text-slate-100">Deploy Strategy Live</h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setDeployOpen(false)}
+                className="text-slate-400 hover:text-slate-100"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+            <div className="space-y-4 p-5 text-xs">
+              <div>
+                <label className="mb-1.5 block font-semibold text-slate-300">Deployment Name</label>
+                <input
+                  type="text"
+                  value={deployName}
+                  onChange={(e) => setDeployName(e.target.value)}
+                  className="min-h-[38px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 text-xs text-slate-100 focus:border-sky-400 focus:outline-none"
+                />
+              </div>
+
+              <div>
+                <label className="mb-1.5 block font-semibold text-slate-300">Execution Workflow</label>
+                <div className="space-y-2">
+                  {[
+                    {
+                      id: 'live_alert' as const,
+                      title: 'Notification Based Trading (1-Click Alerts)',
+                      desc: 'Generates actionable BUY/SELL alerts; you approve execution in 1 click.',
+                    },
+                    {
+                      id: 'paper' as const,
+                      title: 'Paper Trading (Virtual Portfolio)',
+                      desc: 'Simulates real-time fills with Zerodha/Upstox real trading charges.',
+                    },
+                    {
+                      id: 'live_auto' as const,
+                      title: 'Gated Auto-Execute (Broker Live)',
+                      desc: 'Routes orders automatically after passing Kill Switch, Risk Limits & 6-Gate Preflight.',
+                    },
+                  ].map((opt) => (
+                    <button
+                      key={opt.id}
+                      type="button"
+                      onClick={() => setDeployExecMode(opt.id)}
+                      className={`w-full rounded-lg border p-3 text-left transition-colors ${
+                        deployExecMode === opt.id
+                          ? 'border-sky-500 bg-sky-950/40'
+                          : 'border-slate-800 bg-[#0b1120] hover:border-slate-700'
+                      }`}
+                    >
+                      <div className="font-semibold text-slate-100">{opt.title}</div>
+                      <div className="mt-0.5 text-[11px] text-slate-400">{opt.desc}</div>
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {deployMsg && (
+                <div
+                  className={`rounded-lg border px-3 py-2 text-xs ${
+                    deployMsg.type === 'ok'
+                      ? 'border-emerald-800 bg-emerald-950/40 text-emerald-200'
+                      : 'border-red-900 bg-red-950/40 text-red-200'
+                  }`}
+                >
+                  {deployMsg.text}
+                </div>
+              )}
+
+              <div className="flex justify-end gap-2 pt-1">
+                <button
+                  type="button"
+                  onClick={() => setDeployOpen(false)}
+                  className="min-h-[36px] rounded-lg border border-slate-700 px-4 font-semibold text-slate-300"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void handleDeploySubmit()}
+                  disabled={deployBusy}
+                  className="min-h-[36px] rounded-lg bg-sky-500 px-5 font-semibold text-slate-950 hover:bg-sky-400 disabled:opacity-50"
+                >
+                  {deployBusy ? 'Deploying...' : 'Take Live'}
+                </button>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}

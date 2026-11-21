@@ -179,35 +179,38 @@ export function VisualRuleBuilder({ rule, onChange, operands, operators, onSaved
           </p>
         ) : (
           <div className="space-y-2">
-            {group.conditions.map((cond, idx) => (
-              <div
-                key={idx}
-                className="flex flex-wrap items-center gap-2 rounded-md border border-slate-800 bg-[#111827] p-2.5"
-              >
-                <span className="w-6 font-mono text-[11px] text-slate-500">{idx + 1}.</span>
-                {renderOperandEditor(cond.left, (nextLeft) => updateCondition(section, idx, { left: nextLeft }))}
-                <select
-                  value={cond.operator}
-                  onChange={(e) => updateCondition(section, idx, { operator: e.target.value })}
-                  className="h-9 rounded-md border border-sky-500/40 bg-[#0b1120] px-2.5 text-xs font-semibold text-sky-300 focus:border-sky-400 focus:outline-none"
+            {group.conditions.map((cond, idx) => {
+              if ('conditions' in cond) return null;
+              return (
+                <div
+                  key={idx}
+                  className="flex flex-wrap items-center gap-2 rounded-md border border-slate-800 bg-[#111827] p-2.5"
                 >
-                  {operators.map((op) => (
-                    <option key={op.id} value={op.id}>
-                      {op.label}
-                    </option>
-                  ))}
-                </select>
-                {renderOperandEditor(cond.right, (nextRight) => updateCondition(section, idx, { right: nextRight }))}
-                <button
-                  type="button"
-                  onClick={() => removeCondition(section, idx)}
-                  className="ml-auto rounded-md p-1.5 text-slate-500 hover:bg-red-950/50 hover:text-red-400"
-                  title="Remove condition"
-                >
-                  <Trash2 className="h-3.5 w-3.5" />
-                </button>
-              </div>
-            ))}
+                  <span className="w-6 font-mono text-[11px] text-slate-500">{idx + 1}.</span>
+                  {renderOperandEditor(cond.left, (nextLeft) => updateCondition(section, idx, { left: nextLeft }))}
+                  <select
+                    value={cond.operator}
+                    onChange={(e) => updateCondition(section, idx, { operator: e.target.value })}
+                    className="h-9 rounded-md border border-sky-500/40 bg-[#0b1120] px-2.5 text-xs font-semibold text-sky-300 focus:border-sky-400 focus:outline-none"
+                  >
+                    {operators.map((op) => (
+                      <option key={op.id} value={op.id}>
+                        {op.label}
+                      </option>
+                    ))}
+                  </select>
+                  {renderOperandEditor(cond.right, (nextRight) => updateCondition(section, idx, { right: nextRight }))}
+                  <button
+                    type="button"
+                    onClick={() => removeCondition(section, idx)}
+                    className="ml-auto rounded-md p-1.5 text-slate-500 hover:bg-red-950/50 hover:text-red-400"
+                    title="Remove condition"
+                  >
+                    <Trash2 className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              );
+            })}
           </div>
         )}
       </div>

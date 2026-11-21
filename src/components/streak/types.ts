@@ -42,26 +42,39 @@ export interface VisualCondition {
   left: VisualOperandSpec;
   operator: string;
   right: VisualOperandSpec;
+  pct?: number;
+  enabled?: boolean;
+  timeframe?: string;
 }
 
 export interface VisualConditionGroup {
   logic: 'AND' | 'OR';
-  conditions: VisualCondition[];
+  conditions: Array<VisualCondition | VisualConditionGroup>;
+  enabled?: boolean;
 }
 
 export interface VisualRuleDef {
   id?: string;
   kind: 'strategy' | 'screen';
   mode?: 'visual';
+  builder_mode?: 'basic' | 'advance';
+  category?: string;
   name: string;
   description?: string;
+  universe?: string;
+  basket_id?: string;
+  default_symbols?: string[];
   timeframe?: string;
+  chart_type?: 'candlestick' | 'heikin_ashi';
+  side?: 'BUY' | 'SELL';
   segment?: string;
   stop_loss_pct?: number;
   take_profit_pct?: number;
   trailing_sl_pct?: number;
+  exit_unit?: 'pct' | 'points' | 'pnl';
   entry: VisualConditionGroup;
   exit?: VisualConditionGroup;
+  seeded?: boolean;
   updated_at_ist?: string;
 }
 
@@ -91,21 +104,35 @@ export interface DiscoverItem {
   default_lot_size?: number;
 }
 
+export interface ParamSpecMeta {
+  name: string;
+  label: string;
+  kind: string;
+  default: number | string | boolean;
+  min?: number;
+  max?: number;
+  step?: number;
+  options?: string[];
+  help?: string;
+}
+
+export interface ScreenSpecMeta {
+  id: string;
+  name: string;
+  description: string;
+  source_file?: string;
+  min_bars?: number;
+  supports_multi_timeframe?: boolean;
+  default_timeframes?: string[];
+  params?: ParamSpecMeta[];
+}
+
 export interface StrategySpecMeta {
   id: string;
   name: string;
   description: string;
   source_file?: string;
-  params: Array<{
-    name: string;
-    label: string;
-    kind: string;
-    default: number | string | boolean;
-    min?: number;
-    max?: number;
-    step?: number;
-    options?: string[];
-  }>;
+  params: ParamSpecMeta[];
 }
 
 export interface UniverseMeta {
@@ -118,7 +145,7 @@ export interface UniverseMeta {
 export interface StreakMetaPayload {
   ok: boolean;
   selections: { trading_broker: string; data_connection: string };
-  screens: Array<{ id: string; name: string; description: string }>;
+  screens: ScreenSpecMeta[];
   strategy_specs: StrategySpecMeta[];
   universes: UniverseMeta[];
   timeframes: Array<{ id: string; label: string; base: string; resampled: boolean }>;
@@ -137,6 +164,100 @@ export interface StreakMetaPayload {
   options_templates: Array<{ id: string; name: string; outlook: string; description: string }>;
   recent_backtests: BacktestRunSummary[];
   deployments_summary: DeploymentSummary;
+}
+
+export interface ScannerColumnSpec {
+  key: string;
+  label: string;
+  fmt?: string;
+  format?: string;
+  decimals?: number;
+  digits?: number;
+  align?: 'left' | 'right';
+}
+
+export interface ScannerResultRow {
+  symbol: string;
+  exchange: string;
+  close: number;
+  ltp?: number;
+  change_pct: number;
+  volume?: number;
+  signal?: string;
+  score?: number;
+  matched?: boolean;
+  last_date?: string;
+  live_updated_ist?: string;
+  tick_direction?: 'up' | 'down' | 'flat';
+  is_live?: boolean;
+  [key: string]: unknown;
+}
+
+export interface ScannerAlertSubscription {
+  id: string;
+  name: string;
+  description: string;
+  mode: 'basic' | 'advance' | 'python' | 'visual';
+  screen_id: string;
+  rule_def?: VisualRuleDef | null;
+  params?: Record<string, unknown>;
+  universe: string;
+  basket_id?: string | null;
+  symbols: string[];
+  exchange: string;
+  timeframe: string;
+  chart_type: string;
+  frequency_sec: number;
+  status: 'ACTIVE' | 'PAUSED';
+  last_checked_ist?: string | null;
+  last_matched_symbols: string[];
+  last_matched_count: number;
+  alerts_triggered: number;
+  created_at_ist: string;
+  updated_at_ist: string;
+}
+
+export interface ScannerAlertEvent {
+  id: string;
+  subscription_id: string;
+  scanner_name: string;
+  symbol: string;
+  exchange: string;
+  transition: 'ENTERED' | 'EXITED';
+  ltp: number;
+  change_pct: number;
+  volume: number;
+  signal: string;
+  timeframe: string;
+  ts_ist: string;
+}
+
+export interface ScannerDraftPreset {
+  mode: 'basic' | 'advance' | 'python';
+  rule?: VisualRuleDef;
+  pythonScreenId?: string;
+  name?: string;
+  description?: string;
+  universe?: string;
+  basketId?: string;
+  timeframe?: string;
+  chartType?: 'candlestick' | 'heikin_ashi';
+  isCopy?: boolean;
+}
+
+export interface StrategyDraftPreset {
+  mode: 'basic' | 'advance' | 'python';
+  rule?: VisualRuleDef;
+  pythonStrategyId?: string;
+  name?: string;
+  description?: string;
+  symbols?: string[];
+  universe?: string;
+  timeframe?: string;
+  chartType?: 'candlestick' | 'heikin_ashi';
+  segment?: string;
+  isCopy?: boolean;
+  openFullResult?: BacktestFullResult | null;
 }
 
 export interface DeploySpec {
@@ -189,6 +310,20 @@ export interface BacktestRunSummary {
   generated_at_ist: string;
 }
 
+export interface BacktestTradeRow {
+  symbol?: string;
+  entry_date: string;
+  exit_date: string;
+  qty: number;
+  entry_price: number;
+  exit_price: number;
+  gross_pnl: number;
+  charges: number;
+  pnl: number;
+  return_pct: number;
+  exit_reason: string;
+}
+
 export interface BacktestFullResult extends BacktestRunSummary {
   ok: boolean;
   cagr_pct: number;
@@ -209,19 +344,7 @@ export interface BacktestFullResult extends BacktestRunSummary {
     cagr_pct?: number;
     max_drawdown_pct?: number;
   }>;
-  trades: Array<{
-    symbol?: string;
-    entry_date: string;
-    exit_date: string;
-    qty: number;
-    entry_price: number;
-    exit_price: number;
-    gross_pnl: number;
-    charges: number;
-    pnl: number;
-    return_pct: number;
-    exit_reason: string;
-  }>;
+  trades: BacktestTradeRow[];
   errors?: Array<{ symbol: string; error: string }>;
 }
 
@@ -322,12 +445,15 @@ export interface DeploymentsPayload {
 
 export type PlatformNavId =
   | 'dashboard'
-  | 'discover'
-  | 'scanners'
-  | 'strategies'
-  | 'options'
-  | 'technicals'
+  | 'discover_strategies'
+  | 'create_strategy'
   | 'deployed'
+  | 'options'
+  | 'discover_scanners'
+  | 'create_scanner'
+  | 'scanner_alerts'
+  | 'technicals'
   | 'baskets'
+  | 'risk'
   | 'terminal'
   | 'connections';

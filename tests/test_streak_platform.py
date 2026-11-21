@@ -632,5 +632,161 @@ class TestBasketsAndDiscover(unittest.TestCase):
             srv.server_close()
 
 
+class TestStreakScannerAndStrategyParity(unittest.TestCase):
+    def test_new_visual_operands_pct_operators_enabled_flag_and_heikin_ashi(self) -> None:
+        from rules.engine import to_heikin_ashi_candles
+
+        candles = _make_synthetic_candles(n=90, start_price=1000.0, drift=2.5, wave_amp=15.0)
+        # Force a clear +3.5% jump on the last candle for up_by_pct testing
+        prev_c = candles[-2]["close"]
+        candles[-1]["close"] = round(prev_c * 1.035, 2)
+        candles[-1]["high"] = max(candles[-1]["high"], candles[-1]["close"])
+
+        ha = to_heikin_ashi_candles(candles)
+        self.assertEqual(len(ha), len(candles))
+        self.assertNotEqual(ha[-1]["open"], candles[-1]["open"])
+
+        rule_def = {
+            "id": "vis_streak_parity_test",
+            "kind": "screen",
+            "name": "Streak Parity Check",
+            "chart_type": "heikin_ashi",
+            "entry": {
+                "logic": "AND",
+                "conditions": [
+                    {
+                        "left": {"type": "close", "offset": 0},
+                        "operator": "up_by_pct",
+                        "right": {"type": "close", "offset": -1},
+                        "pct": 1.0,
+                        "enabled": True,
+                    },
+                    {
+                        "left": {"type": "close", "offset": 0},
+                        "operator": ">",
+                        "right": {"type": "wma", "period": 10, "offset": 0},
+                        "enabled": True,
+                    },
+                    {
+                        "left": {"type": "vwap", "period": 14, "offset": 0},
+                        "operator": ">",
+                        "right": {"type": "number", "value": 0},
+                        "enabled": True,
+                    },
+                    {
+                        "left": {"type": "rsi_ma", "period": 14, "param2": 9, "offset": 0},
+                        "operator": ">",
+                        "right": {"type": "number", "value": 0},
+                        "enabled": True,
+                    },
+                    {
+                        # Disabled impossible condition must be skipped
+                        "left": {"type": "close", "offset": 0},
+                        "operator": "<",
+                        "right": {"type": "number", "value": -999},
+                        "enabled": False,
+                    },
+                ],
+            },
+        }
+        tk = IndicatorToolkit(candles, backend="builtin")
+        screen = compile_visual_screen(rule_def)
+        res = screen.evaluate(candles, {}, tk)
+        self.assertTrue(res.matched)
+
+    def test_inline_rule_def_scan_with_as_of_date(self) -> None:
+        from screener.engine import ScreenerEngine
+
+        with tempfile.TemporaryDirectory() as tmp:
+            hist = HistoricalDataManager(db_path=Path(tmp) / "hist.db")
+            bars = _make_synthetic_candles(n=120, start_price=800.0, drift=3.0, wave_amp=5.0)
+            target_date = bars[80]["trade_date"]
+            engine = ScreenerEngine(hist_manager=hist)
+            inline_rule = {
+                "kind": "screen",
+                "name": "Inline Above EMA",
+                "entry": {
+                    "logic": "AND",
+                    "conditions": [
+                        {
+                            "left": {"type": "close", "offset": 0},
+                            "operator": ">",
+                            "right": {"type": "ema", "period": 10, "offset": 0},
+                        }
+                    ],
+                },
+            }
+            out = engine.scan(
+                screen_id="visual:inline",
+                rule_def=inline_rule,
+                symbols=["RELIANCE", "TCS"],
+                exchange="NSE",
+                timeframe="1day",
+                as_of_date=target_date,
+                provider="synthetic",
+                fetcher=lambda sym, exch, tf, s, e: [b for b in bars if b["trade_date"] <= e.isoformat()],
+            )
+            self.assertTrue(out["ok"])
+            self.assertEqual(out["as_of_date"], target_date)
+            self.assertGreaterEqual(len(out["results"]), 1)
+            self.assertIn("ltp", out["results"][0])
+            self.assertIn("volume", out["results"][0])
+            self.assertLessEqual(out["results"][0]["last_date"], target_date)
+
+    def test_scanner_alerts_manager_lifecycle_and_diffing(self) -> None:
+        from screener.alerts import ScannerAlertsManager
+
+        with tempfile.TemporaryDirectory() as tmp:
+            calls = {"n": 0}
+
+            def fake_scan(**kwargs: Any) -> Dict[str, Any]:
+                calls["n"] += 1
+                if calls["n"] == 1:
+                    rows = [{"symbol": "RELIANCE", "exchange": "NSE", "ltp": 2500.0, "change_pct": 1.8, "volume": 100000, "signal": "BULLISH", "matched": True}]
+                else:
+                    rows = [{"symbol": "TCS", "exchange": "NSE", "ltp": 3900.0, "change_pct": 2.1, "volume": 80000, "signal": "BULLISH", "matched": True}]
+                return {"ok": True, "results": rows}
+
+            mgr = ScannerAlertsManager(store_file=Path(tmp) / "alerts.json", scan_runner=fake_scan)
+            created = mgr.create_or_update({"name": "Breakout Watch", "screen_id": "rsi_oversold", "universe": "nifty50"})
+            sub_id = created["subscription"]["id"]
+            first = mgr.control(sub_id, "scan_now")
+            self.assertEqual(first["subscription"]["last_matched_symbols"], ["RELIANCE"])
+
+            # Second scan: RELIANCE exits, TCS enters
+            mgr.control(sub_id, "scan_now")
+            snap = mgr.list_alerts()
+            transitions = {(e["symbol"], e["transition"]) for e in snap["history"]}
+            self.assertIn(("RELIANCE", "ENTERED"), transitions)
+            self.assertIn(("RELIANCE", "EXITED"), transitions)
+            self.assertIn(("TCS", "ENTERED"), transitions)
+
+            # Pause, resume, delete
+            paused = mgr.control(sub_id, "pause")
+            self.assertEqual(paused["subscription"]["status"], "PAUSED")
+            resumed = mgr.control(sub_id, "resume")
+            self.assertEqual(resumed["subscription"]["status"], "ACTIVE")
+            mgr.delete(sub_id)
+            self.assertEqual(len(mgr.list_alerts()["subscriptions"]), 0)
+
+    def test_python_plugin_save_validates_syntax_and_blocks_traversal(self) -> None:
+        from web.service import BrokerHubService
+
+        svc = BrokerHubService()
+        # Path traversal must be rejected
+        with self.assertRaises(ValueError):
+            svc.save_python_plugin(kind="screen", filename="../../evil.py", code="x = 1\n")
+
+        # Syntax error must be rejected before writing
+        with self.assertRaises(ValueError):
+            svc.save_python_plugin(kind="screen", filename="bad_syntax_test.py", code="def broken(:\n    pass\n")
+
+        # Source loader must succeed for built-in plugins
+        src = svc.get_python_plugin_source(kind="strategy", plugin_id="ema_crossover")
+        self.assertTrue(src["ok"])
+        self.assertIn("class ", src["code"])
+
+
 if __name__ == "__main__":
     unittest.main()
+

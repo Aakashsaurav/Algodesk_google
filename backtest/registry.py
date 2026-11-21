@@ -148,10 +148,29 @@ class StrategyRegistry:
                 raise ValueError(f"Unknown strategy '{strategy_id}'. Supported: {avail}")
             return cls()
 
+    def get_source_path(self, strategy_id: str) -> Optional[Path]:
+        self.refresh_if_changed()
+        clean_id = (strategy_id or "ema_crossover").strip().lower()
+        with self._lock:
+            for fpath, ids in self._file_to_ids.items():
+                if clean_id in ids:
+                    return fpath
+        return None
+
     def list_strategies(self) -> List[Dict[str, Any]]:
         self.refresh_if_changed()
         with self._lock:
-            items = [proto.metadata() for proto in self._prototypes.values()]
+            id_to_file = {
+                sid: fpath.name
+                for fpath, ids in self._file_to_ids.items()
+                for sid in ids
+            }
+            items = []
+            for sid, proto in self._prototypes.items():
+                meta = dict(proto.metadata())
+                if sid in id_to_file:
+                    meta["source_file"] = id_to_file[sid]
+                items.append(meta)
         items.sort(key=lambda x: x["name"].lower())
         return items
 

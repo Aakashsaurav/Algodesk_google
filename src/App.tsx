@@ -14,7 +14,6 @@ import {
   LayoutDashboard,
   Compass,
   Radar,
-  Blocks,
   Sliders,
   Gauge,
   Rocket,
@@ -23,12 +22,20 @@ import {
   Plug,
   PanelLeftClose,
   PanelLeftOpen,
+  Bell,
+  PlusSquare,
+  FilePlus2,
 } from 'lucide-react';
 import { LiveTerminal } from './components/LiveTerminal';
-import { AnalyticsConsole } from './components/AnalyticsConsole';
 import { PlatformDashboard } from './components/streak/PlatformDashboard';
-import { DiscoverView, BasketsView } from './components/streak/DiscoverAndBasketsView';
-import { StrategyBacktestStudio } from './components/streak/StrategyBacktestStudio';
+import { BasketsView } from './components/streak/DiscoverAndBasketsView';
+import { DiscoverScannersView } from './components/streak/DiscoverScannersView';
+import { CreateScannerView } from './components/streak/CreateScannerView';
+import { ScannerAlertsView } from './components/streak/ScannerAlertsView';
+import { DiscoverStrategiesView } from './components/streak/DiscoverStrategiesView';
+import { CreateStrategyView } from './components/streak/CreateStrategyView';
+import { RiskLimitsView } from './components/streak/RiskLimitsView';
+import { QuickOrderModal, type QuickOrderTarget } from './components/streak/QuickOrderModal';
 import { OptionsStudio } from './components/streak/OptionsStudio';
 import { TechnicalsView } from './components/streak/TechnicalsView';
 import { DeploymentsConsole } from './components/streak/DeploymentsConsole';
@@ -36,6 +43,8 @@ import type {
   BasketItem,
   DiscoverItem,
   PlatformNavId,
+  ScannerDraftPreset,
+  StrategyDraftPreset,
   StreakMetaPayload,
 } from './components/streak/types';
 
@@ -341,15 +350,18 @@ const PLATFORM_NAV_ITEMS: Array<{
   subtitle: string;
 }> = [
   { id: 'dashboard', label: 'Dashboard', group: 'workspace', subtitle: 'Command overview & quick actions' },
-  { id: 'discover', label: 'Discover', group: 'workspace', subtitle: 'Curated visual, Python & options templates' },
-  { id: 'scanners', label: 'Scanners', group: 'workspace', subtitle: 'Point-in-time, Live WS & MTF S&R scanners' },
-  { id: 'strategies', label: 'Strategies', group: 'workspace', subtitle: 'Visual blocks & Python portfolio backtester' },
+  { id: 'discover_strategies', label: 'Discover Strategies', group: 'workspace', subtitle: 'Curated visual & Python (.py) strategies with backtest preview' },
+  { id: 'create_strategy', label: 'Create Strategy', group: 'workspace', subtitle: 'Basic, Advance & Python strategy builder with candlestick chart' },
+  { id: 'deployed', label: 'Live Strategies', group: 'workspace', subtitle: 'Notification based trading, paper trade & gated auto-execute' },
   { id: 'options', label: 'Options Builder', group: 'workspace', subtitle: 'Multi-leg payoff charts & Black-Scholes Greeks' },
+  { id: 'discover_scanners', label: 'Discover Scanners', group: 'workspace', subtitle: 'Pre-built visual & Python (.py) live scanners' },
+  { id: 'create_scanner', label: 'Create Scanner', group: 'workspace', subtitle: 'Basic, Advance & Python scanners with Live & As-of-Date search' },
+  { id: 'scanner_alerts', label: 'Scanner Alerts', group: 'workspace', subtitle: 'Live ENTERED / EXITED symbol alert subscriptions' },
   { id: 'technicals', label: 'Technicals', group: 'workspace', subtitle: 'Multi-timeframe gauges, pivots & S&R zones' },
-  { id: 'deployed', label: 'Deployed', group: 'workspace', subtitle: 'Paper trade, 1-click live alerts & gated auto' },
   { id: 'baskets', label: 'Baskets', group: 'workspace', subtitle: 'Custom symbol baskets & NSE CSV universes' },
+  { id: 'risk', label: 'Risk Limits', group: 'infra', subtitle: 'Capital & drawdown caps, Kill Switch & 6-gate preflight' },
   { id: 'terminal', label: 'Live Terminal', group: 'infra', subtitle: 'Low-latency order execution & live feed' },
-  { id: 'connections', label: 'Connections & Risk', group: 'infra', subtitle: 'Broker OAuth, routing, historical cache & kill switch' },
+  { id: 'connections', label: 'Connections', group: 'infra', subtitle: 'Broker OAuth, routing & historical data cache' },
 ];
 
 function getStatusLabel(state: ConnectionState, isProbing: boolean): string {
@@ -413,13 +425,10 @@ export default function App() {
   const [activeNav, setActiveNav] = useState<PlatformNavId>('dashboard');
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [streakMeta, setStreakMeta] = useState<StreakMetaPayload | null>(null);
-  const [strategyPreset, setStrategyPreset] = useState<{
-    mode: 'visual' | 'python';
-    strategyId: string;
-    symbols?: string[];
-    timeframe?: string;
-    segment?: string;
-  } | null>(null);
+  const [scannerDraft, setScannerDraft] = useState<ScannerDraftPreset | null>(null);
+  const [strategyDraft, setStrategyDraft] = useState<StrategyDraftPreset | null>(null);
+  const [technicalsSymbol, setTechnicalsSymbol] = useState<string | undefined>(undefined);
+  const [quickOrderTarget, setQuickOrderTarget] = useState<QuickOrderTarget | null>(null);
   const [optionsPreset, setOptionsPreset] = useState<{
     id: string;
     spot?: number;
@@ -443,40 +452,71 @@ export default function App() {
     void fetchStreakMeta();
   }, [fetchStreakMeta]);
 
-  const handleOpenDiscoverItem = useCallback((item: DiscoverItem) => {
-    if (item.category === 'options') {
-      setOptionsPreset({
-        id: item.target_id,
-        spot: item.default_spot,
-        step: item.default_step,
-        lotSize: item.default_lot_size,
-      });
-      setActiveNav('options');
-      return;
-    }
-    if (item.category === 'screen') {
-      setActiveNav('scanners');
-      return;
-    }
-    setStrategyPreset({
-      mode: item.mode === 'python' ? 'python' : 'visual',
-      strategyId: item.target_id,
-      symbols: item.default_symbols,
-      timeframe: item.timeframe,
-      segment: item.segment,
-    });
-    setActiveNav('strategies');
+  const handleOpenInCreateScanner = useCallback((draft: ScannerDraftPreset) => {
+    setScannerDraft({ ...draft });
+    setActiveNav('create_scanner');
   }, []);
 
+  const handleOpenInCreateStrategy = useCallback((draft: StrategyDraftPreset) => {
+    setStrategyDraft({ ...draft });
+    setActiveNav('create_strategy');
+  }, []);
+
+  const handleOpenChart = useCallback((symbol: string) => {
+    setTechnicalsSymbol(symbol);
+    setActiveNav('technicals');
+  }, []);
+
+  const handleOpenDiscoverItem = useCallback(
+    (item: DiscoverItem) => {
+      if (item.category === 'options') {
+        setOptionsPreset({
+          id: item.target_id,
+          spot: item.default_spot,
+          step: item.default_step,
+          lotSize: item.default_lot_size,
+        });
+        setActiveNav('options');
+        return;
+      }
+      if (item.category === 'screen') {
+        const matchedRule = streakMeta?.visual_rules?.find((r) => r.id === item.target_id);
+        setScannerDraft({
+          mode: item.mode === 'python' ? 'python' : matchedRule?.builder_mode === 'advance' ? 'advance' : 'basic',
+          rule: matchedRule ? JSON.parse(JSON.stringify(matchedRule)) : undefined,
+          pythonScreenId: item.mode === 'python' ? item.target_id : undefined,
+          name: item.name,
+          description: item.tagline,
+          timeframe: item.timeframe,
+        });
+        setActiveNav('create_scanner');
+        return;
+      }
+      const matchedStrat = streakMeta?.visual_rules?.find((r) => r.id === item.target_id);
+      setStrategyDraft({
+        mode: item.mode === 'python' ? 'python' : matchedStrat?.builder_mode === 'advance' ? 'advance' : 'basic',
+        rule: matchedStrat ? JSON.parse(JSON.stringify(matchedStrat)) : undefined,
+        pythonStrategyId: item.mode === 'python' ? item.target_id : undefined,
+        name: item.name,
+        description: item.tagline,
+        symbols: item.default_symbols,
+        timeframe: item.timeframe,
+        segment: item.segment,
+      });
+      setActiveNav('create_strategy');
+    },
+    [streakMeta]
+  );
+
   const handleBacktestBasket = useCallback((basket: BasketItem) => {
-    setStrategyPreset({
-      mode: 'visual',
-      strategyId: 'vis_strat_ema_cross',
+    setStrategyDraft({
+      mode: 'basic',
+      name: `${basket.name} Strategy`,
       symbols: basket.symbols,
       timeframe: '1day',
-      segment: 'equity_intraday',
+      segment: 'equity_delivery',
     });
-    setActiveNav('strategies');
+    setActiveNav('create_strategy');
   }, []);
 
   const [tradingSelection, setTradingSelection] = useState('upstox');
@@ -1363,20 +1403,26 @@ export default function App() {
     switch (id) {
       case 'dashboard':
         return <LayoutDashboard className={cls} />;
-      case 'discover':
+      case 'discover_strategies':
         return <Compass className={cls} />;
-      case 'scanners':
-        return <Radar className={cls} />;
-      case 'strategies':
-        return <Blocks className={cls} />;
-      case 'options':
-        return <Sliders className={cls} />;
-      case 'technicals':
-        return <Gauge className={cls} />;
+      case 'create_strategy':
+        return <PlusSquare className={cls} />;
       case 'deployed':
         return <Rocket className={cls} />;
+      case 'options':
+        return <Sliders className={cls} />;
+      case 'discover_scanners':
+        return <Radar className={cls} />;
+      case 'create_scanner':
+        return <FilePlus2 className={cls} />;
+      case 'scanner_alerts':
+        return <Bell className={cls} />;
+      case 'technicals':
+        return <Gauge className={cls} />;
       case 'baskets':
         return <FolderKanban className={cls} />;
+      case 'risk':
+        return <ShieldCheck className={cls} />;
       case 'terminal':
         return <Terminal className={cls} />;
       case 'connections':
@@ -1518,7 +1564,7 @@ export default function App() {
             {liveStatus?.kill_switch?.engaged && (
               <button
                 type="button"
-                onClick={() => setActiveNav('connections')}
+                onClick={() => setActiveNav('risk')}
                 className="inline-flex h-8 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg border border-red-800 bg-red-950/60 px-2.5 text-xs font-semibold text-red-300"
               >
                 <ShieldAlert className="h-3.5 w-3.5" />
@@ -1560,35 +1606,64 @@ export default function App() {
               />
             )}
 
-            {activeNav === 'discover' && (
-              <DiscoverView
-                items={streakMeta?.discover || []}
-                onOpenStrategy={handleOpenDiscoverItem}
-                onOpenOptions={handleOpenDiscoverItem}
-                onOpenScanner={handleOpenDiscoverItem}
-              />
-            )}
-
-            {activeNav === 'scanners' && (
-              <AnalyticsConsole
-                activeDataConnection={dataSelection}
-                activeTradingBroker={tradingSelection}
-                onRiskStateChange={() => {
-                  void fetchLiveStatus();
-                  void fetchStreakMeta();
-                }}
-              />
-            )}
-
-            {activeNav === 'strategies' && (
-              <StrategyBacktestStudio
+            {activeNav === 'discover_strategies' && streakMeta && (
+              <DiscoverStrategiesView
                 meta={streakMeta}
-                initialPreset={strategyPreset}
                 onRefreshMeta={() => void fetchStreakMeta()}
+                onOpenInCreateStrategy={handleOpenInCreateStrategy}
                 onDeployed={() => {
                   void fetchStreakMeta();
                   setActiveNav('deployed');
                 }}
+                onQuickOrder={(t) => setQuickOrderTarget(t)}
+              />
+            )}
+
+            {activeNav === 'create_strategy' && streakMeta && (
+              <CreateStrategyView
+                meta={streakMeta}
+                draft={strategyDraft}
+                onRefreshMeta={() => void fetchStreakMeta()}
+                onNavigateDiscover={() => setActiveNav('discover_strategies')}
+                onDeployed={() => {
+                  void fetchStreakMeta();
+                  setActiveNav('deployed');
+                }}
+                onQuickOrder={(t) => setQuickOrderTarget(t)}
+              />
+            )}
+
+            {activeNav === 'discover_scanners' && streakMeta && (
+              <DiscoverScannersView
+                meta={streakMeta}
+                onRefreshMeta={() => void fetchStreakMeta()}
+                onOpenInCreateScanner={handleOpenInCreateScanner}
+                onNavigateAlerts={() => setActiveNav('scanner_alerts')}
+                onQuickOrder={(t) => setQuickOrderTarget(t)}
+                onOpenChart={handleOpenChart}
+              />
+            )}
+
+            {activeNav === 'create_scanner' && streakMeta && (
+              <CreateScannerView
+                meta={streakMeta}
+                draft={scannerDraft}
+                onRefreshMeta={() => void fetchStreakMeta()}
+                onNavigateDiscover={() => setActiveNav('discover_scanners')}
+                onNavigateAlerts={() => setActiveNav('scanner_alerts')}
+                onQuickOrder={(t) => setQuickOrderTarget(t)}
+                onOpenChart={handleOpenChart}
+              />
+            )}
+
+            {activeNav === 'scanner_alerts' && (
+              <ScannerAlertsView
+                onOpenCreateScanner={(d) => {
+                  if (d) setScannerDraft(d);
+                  setActiveNav('create_scanner');
+                }}
+                onQuickOrder={(t) => setQuickOrderTarget(t)}
+                onOpenChart={handleOpenChart}
               />
             )}
 
@@ -1599,10 +1674,13 @@ export default function App() {
               />
             )}
 
-            {activeNav === 'technicals' && <TechnicalsView />}
+            {activeNav === 'technicals' && <TechnicalsView initialSymbol={technicalsSymbol} />}
 
             {activeNav === 'deployed' && (
-              <DeploymentsConsole onGoToStrategies={() => setActiveNav('strategies')} />
+              <DeploymentsConsole
+                onGoToStrategies={() => setActiveNav('discover_strategies')}
+                onGoToRisk={() => setActiveNav('risk')}
+              />
             )}
 
             {activeNav === 'baskets' && (
@@ -1612,6 +1690,8 @@ export default function App() {
                 onBacktestBasket={handleBacktestBasket}
               />
             )}
+
+            {activeNav === 'risk' && <RiskLimitsView />}
 
             {activeNav === 'connections' && (
               <>
@@ -3192,6 +3272,12 @@ export default function App() {
           </div>
         </div>
       )}
+
+      <QuickOrderModal
+        target={quickOrderTarget}
+        tradingBroker={tradingSelection}
+        onClose={() => setQuickOrderTarget(null)}
+      />
     </div>
   );
 }

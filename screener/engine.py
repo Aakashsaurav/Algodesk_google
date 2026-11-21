@@ -422,6 +422,7 @@ class ScreenerEngine:
         as_of_date: Optional[str] = None,
         screen_id: Optional[str] = None,
         preset: str = "all_metrics",
+        rule_def: Optional[Dict[str, Any]] = None,
         params: Optional[Dict[str, Any]] = None,
         provider: Optional[str] = None,
         backend: str = "auto",
@@ -430,15 +431,20 @@ class ScreenerEngine:
         cancel_event: Optional[threading.Event] = None,
     ) -> Dict[str, Any]:
         target_screen_id = screen_id or preset or "all_metrics"
-        try:
-            screen = self._registry.get(target_screen_id)
-        except Exception:
-            from rules.engine import compile_visual_screen, visual_rule_store
+        if isinstance(rule_def, dict) and (rule_def.get("entry") or rule_def.get("conditions")):
+            from rules.engine import compile_visual_screen
 
-            rule_def = visual_rule_store.get(target_screen_id)
-            if rule_def is None:
-                raise
             screen = compile_visual_screen(rule_def)
+        else:
+            try:
+                screen = self._registry.get(target_screen_id)
+            except Exception:
+                from rules.engine import compile_visual_screen, visual_rule_store
+
+                stored_rule = visual_rule_store.get(target_screen_id)
+                if stored_rule is None:
+                    raise
+                screen = compile_visual_screen(stored_rule)
         resolved_params = screen.resolve_params(params)
 
         eff_exch = (exchange or "NSE").strip().upper()
@@ -561,6 +567,8 @@ class ScreenerEngine:
                     "bars": len(rows),
                     "last_date": str(last.get("trade_date") or str(last.get("ts_ist", ""))[:10]),
                     "close": round(last_close, 2),
+                    "ltp": round(last_close, 2),
+                    "volume": int(last.get("volume") or 0),
                     "change_pct": round(day_chg_pct, 2),
                     "signal": match.signal,
                     "tags": list(match.tags),

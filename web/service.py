@@ -16,8 +16,10 @@ from __future__ import annotations
 
 import logging
 import platform
+import re
 import sys
 import threading
+import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
@@ -29,7 +31,7 @@ from backtest.engine import backtest_engine
 from backtest.portfolio import VALID_ALLOCATION_MODES, VALID_SIGNAL_RANKINGS, portfolio_backtest_engine
 from backtest.registry import strategy_registry
 from baskets.store import basket_store
-from broker.base import BrokerHealthSnapshot, ConnectionState
+from broker.base import BrokerHealthSnapshot, ConnectionState, OrderRequest
 from broker.registry import BrokerRegistry, SelectionStore
 from broker.upstox.auth import auth_manager as upstox_auth_manager
 from broker.zerodha.auth import zerodha_auth_manager
@@ -57,6 +59,7 @@ from rules.engine import (
     export_rule_to_python,
     visual_rule_store,
 )
+from screener.alerts import scanner_alerts_manager
 from screener.engine import screener_engine
 from screener.live_engine import live_screener_engine
 from screener.nse_universe_sync import nse_universe_sync
@@ -772,11 +775,13 @@ class BrokerHubService:
         self,
         *,
         symbols: Optional[List[str]] = None,
+        basket_id: Optional[str] = None,
         universe: str = "CUSTOM",
         exchange: str = "NSE",
         timeframe: str = "1day",
         screen_id: Optional[str] = None,
         preset: str = "all_metrics",
+        rule_def: Optional[Dict[str, Any]] = None,
         params: Optional[Dict[str, Any]] = None,
         provider: Optional[str] = None,
         backend: str = "auto",
@@ -784,12 +789,20 @@ class BrokerHubService:
     ) -> Dict[str, Any]:
         sel = self._store.load()
         eff_provider = (provider or sel.get("data_connection") or "yfinance").strip().lower()
+        eff_symbols = symbols
+        eff_universe = (universe or "CUSTOM").strip().upper()
+        if basket_id:
+            b = basket_store.get(basket_id)
+            if b and b.get("symbols"):
+                eff_symbols = list(b["symbols"])
+                eff_universe = "CUSTOM"
         return live_screener_engine.start(
-            symbols=symbols,
-            universe=(universe or "CUSTOM").strip().upper(),
+            symbols=eff_symbols,
+            universe=eff_universe,
             exchange=exchange,
             timeframe=timeframe,
             screen_id=screen_id or preset or "all_metrics",
+            rule_def=rule_def,
             params=params,
             provider=eff_provider,
             backend=backend,
@@ -844,6 +857,7 @@ class BrokerHubService:
         self,
         *,
         symbols: Optional[List[str]] = None,
+        basket_id: Optional[str] = None,
         universe: str = "CUSTOM",
         exchange: str = "NSE",
         timeframe: str = "1day",
@@ -852,6 +866,7 @@ class BrokerHubService:
         as_of_date: Optional[str] = None,
         screen_id: Optional[str] = None,
         preset: str = "all_metrics",
+        rule_def: Optional[Dict[str, Any]] = None,
         params: Optional[Dict[str, Any]] = None,
         provider: Optional[str] = None,
         backend: str = "auto",
@@ -860,7 +875,13 @@ class BrokerHubService:
         sel = self._store.load()
         eff_provider = (provider or sel.get("data_connection") or "yfinance").strip().lower()
         target_screen = screen_id or preset or "all_metrics"
+        eff_symbols = symbols
         eff_universe = (universe or "CUSTOM").strip().upper()
+        if basket_id:
+            b = basket_store.get(basket_id)
+            if b and b.get("symbols"):
+                eff_symbols = list(b["symbols"])
+                eff_universe = "CUSTOM"
         meta = {
             "screen_id": target_screen,
             "preset": target_screen,
@@ -873,7 +894,7 @@ class BrokerHubService:
 
         def _task(progress_cb, cancel_ev):
             return screener_engine.scan(
-                symbols=symbols,
+                symbols=eff_symbols,
                 universe=eff_universe,
                 exchange=exchange,
                 timeframe=timeframe,
@@ -881,6 +902,7 @@ class BrokerHubService:
                 lookback_days=lookback_days,
                 as_of_date=as_of_date,
                 screen_id=target_screen,
+                rule_def=rule_def,
                 params=params,
                 provider=eff_provider,
                 backend=backend,
@@ -1274,6 +1296,218 @@ class BrokerHubService:
 
     def unregister_deployments_listener(self, q) -> None:
         deployment_manager.unregister_listener(q)
+
+    # ── Python Plugin Source Viewer / Safe Writer ────────────────────────
+
+    def get_python_plugin_source(self, kind: str, plugin_id: str) -> Dict[str, Any]:
+        clean_kind = (kind or "screen").strip().lower()
+        if clean_kind not in {"screen", "strategy"}:
+            raise ValueError("kind must be 'screen' or 'strategy'.")
+        base_dir = (
+            screen_registry.screens_dir.resolve()
+            if clean_kind == "screen"
+            else strategy_registry.strategies_dir.resolve()
+        )
+        if clean_kind == "screen":
+            screen_registry.refresh_if_changed(force=False)
+            try:
+                plugin_obj = screen_registry.get(plugin_id)
+            except (KeyError, ValueError):
+                plugin_obj = None
+            src_path = screen_registry.get_source_path(plugin_id)
+        else:
+            strategy_registry.refresh_if_changed(force=False)
+            try:
+                plugin_obj = strategy_registry.create(plugin_id)
+            except (KeyError, ValueError):
+                plugin_obj = None
+            src_path = strategy_registry.get_source_path(plugin_id)
+
+        if plugin_obj is None or src_path is None:
+            raise ValueError(f"Python {clean_kind} plugin '{plugin_id}' not found.")
+
+        candidate = Path(src_path).resolve()
+        if candidate.parent != base_dir and not str(candidate).startswith(str(base_dir) + "/"):
+            raise ValueError("Invalid plugin path.")
+        if not candidate.exists():
+            raise ValueError(f"Source file '{candidate.name}' does not exist.")
+        return {
+            "ok": True,
+            "kind": clean_kind,
+            "id": getattr(plugin_obj, "id", plugin_id),
+            "name": getattr(plugin_obj, "name", plugin_id),
+            "filename": candidate.name,
+            "code": candidate.read_text(encoding="utf-8"),
+        }
+
+    def save_python_plugin(
+        self,
+        *,
+        kind: str,
+        filename: str,
+        code: str,
+    ) -> Dict[str, Any]:
+        clean_kind = (kind or "screen").strip().lower()
+        if clean_kind not in {"screen", "strategy"}:
+            raise ValueError("kind must be 'screen' or 'strategy'.")
+        raw_filename = str(filename or "").strip()
+        if not raw_filename or "/" in raw_filename or "\\" in raw_filename or ".." in raw_filename:
+            raise ValueError("Invalid filename: path separators and '..' are not allowed.")
+        raw_code = str(code or "")
+        if not raw_code.strip():
+            raise ValueError("Python source code cannot be empty.")
+        if len(raw_code) > 200_000:
+            raise ValueError("Python file exceeds 200 KB safety limit.")
+
+        stem = re.sub(r"[^a-z0-9_]+", "_", Path(raw_filename).stem.strip().lower()).strip("_")
+        if not stem or stem.startswith("_"):
+            raise ValueError("Filename must start with a letter or digit (e.g. my_custom_screen.py).")
+
+        # Validate Python syntax before touching disk
+        try:
+            compile(raw_code, f"{stem}.py", "exec")
+        except SyntaxError as exc:
+            raise ValueError(f"Python syntax error on line {exc.lineno}: {exc.msg}") from exc
+
+        base_dir = (
+            screen_registry.screens_dir.resolve()
+            if clean_kind == "screen"
+            else strategy_registry.strategies_dir.resolve()
+        )
+        base_dir.mkdir(parents=True, exist_ok=True)
+        out_path = (base_dir / f"{stem}.py").resolve()
+        if out_path.parent != base_dir:
+            raise ValueError("Target filename escapes plugin directory.")
+
+        out_path.write_text(raw_code, encoding="utf-8")
+        if clean_kind == "screen":
+            screen_registry.refresh_if_changed(force=True)
+            specs = screen_registry.list_screens()
+        else:
+            strategy_registry.refresh_if_changed(force=True)
+            specs = strategy_registry.list_strategies()
+
+        return {
+            "ok": True,
+            "kind": clean_kind,
+            "filename": out_path.name,
+            "specs": specs,
+        }
+
+    # ── Streak-style Scanner Alerts ──────────────────────────────────────
+
+    def list_scanner_alerts(self, subscription_id: Optional[str] = None) -> Dict[str, Any]:
+        return scanner_alerts_manager.list_alerts(subscription_id=subscription_id)
+
+    def save_scanner_alert(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        return scanner_alerts_manager.create_or_update(payload)
+
+    def control_scanner_alert(self, alert_id: str, action: str) -> Dict[str, Any]:
+        sel = self._store.load()
+        eff_provider = (sel.get("data_connection") or "yfinance").strip().lower()
+        return scanner_alerts_manager.control(alert_id, action, provider=eff_provider)
+
+    def delete_scanner_alert(self, alert_id: str) -> Dict[str, Any]:
+        return scanner_alerts_manager.delete(alert_id)
+
+    # ── Quick Order Execution (Scanner/Strategy B/S Modal) ───────────────
+
+    def place_quick_order(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        symbol = str(payload.get("symbol") or "").strip().upper()
+        if not symbol:
+            raise ValueError("Trading symbol is required.")
+        exchange = str(payload.get("exchange") or "NSE").strip().upper()
+        side = str(payload.get("side") or "BUY").strip().upper()
+        if side not in {"BUY", "SELL"}:
+            raise ValueError("Order side must be BUY or SELL.")
+        qty = int(payload.get("quantity") or 0)
+        if qty < 1 or qty > 100_000:
+            raise ValueError("Quantity must be between 1 and 100,000.")
+        order_type = str(payload.get("order_type") or "MARKET").strip().upper()
+        if order_type not in {"MARKET", "LIMIT"}:
+            raise ValueError("Order type must be MARKET or LIMIT.")
+        price = float(payload.get("price") or 0.0)
+        if order_type == "LIMIT" and price <= 0:
+            raise ValueError("Limit price must be greater than 0.")
+        product = str(payload.get("product") or "MIS").strip().upper()
+        if product not in {"MIS", "CNC", "NRML"}:
+            product = "MIS"
+
+        # 1) Hard Kill Switch check
+        ks = kill_switch_controller.status()
+        if ks.get("engaged"):
+            raise ValueError(f"Order blocked: Emergency Kill Switch is engaged ({ks.get('reason') or 'operator stop'}).")
+
+        sel = self._store.load()
+        trading_broker = str(sel.get("trading_broker") or "upstox").strip().lower()
+
+        # 2) Portfolio Risk Limits check
+        risk_eval = risk_limit_manager.evaluate(trading_broker=trading_broker)
+        if risk_eval.get("status") == "BREACHED":
+            first_breach = (risk_eval.get("breaches") or [{}])[0].get("message", "Portfolio risk limit breached.")
+            raise ValueError(f"Order blocked by Risk Limits: {first_breach}")
+
+        # 3) 6-Gate Preflight verification
+        preflight = self.run_preflight(symbols=[symbol])
+        if not preflight.get("overall_ready"):
+            failed = [c["message"] for c in (preflight.get("checks") or []) if not c.get("passed") and c.get("severity") == "ERROR"]
+            reason_txt = failed[0] if failed else "Preflight safety gates did not pass."
+            raise ValueError(f"Order blocked by Preflight ({trading_broker.upper()}): {reason_txt}")
+
+        # 4) Route order to active Trading Broker
+        instrument_key = ""
+        try:
+            hits = instrument_index.search(q=symbol, broker_id=trading_broker, limit=5)
+            exact = next(
+                (h for h in hits if str(h.get("trading_symbol", "")).upper() == symbol and str(h.get("exchange", "")).upper() == exchange),
+                hits[0] if hits else None,
+            )
+            if exact:
+                instrument_key = str(exact.get("instrument_key") or "")
+        except Exception:
+            pass
+
+        adapter = BrokerRegistry.get(trading_broker)
+        req = OrderRequest(
+            symbol=symbol,
+            side=side,
+            quantity=qty,
+            instrument_key=instrument_key,
+            order_type=order_type,
+            price=price if order_type == "LIMIT" else None,
+            product=product,
+            tag=f"algodesk:quick:{uuid.uuid4().hex[:6]}",
+            algo_tag="ALGODESK-QUICK",
+        )
+        order = adapter.place_order(req)
+        order_id = str(getattr(order, "order_id", "") or f"ORD-{uuid.uuid4().hex[:8]}")
+        audit_trail.record(
+            event_type="QUICK_ORDER_PLACED",
+            actor="operator",
+            payload={
+                "broker": trading_broker,
+                "order_id": order_id,
+                "symbol": symbol,
+                "exchange": exchange,
+                "side": side,
+                "quantity": qty,
+                "order_type": order_type,
+                "price": price,
+                "product": product,
+            },
+        )
+        return {
+            "ok": True,
+            "broker": trading_broker,
+            "order_id": order_id,
+            "symbol": symbol,
+            "exchange": exchange,
+            "side": side,
+            "quantity": qty,
+            "order_type": order_type,
+            "product": product,
+            "message": f"{side} {qty} {symbol} ({product}) submitted to {trading_broker.upper()} (Order ID: {order_id}).",
+        }
 
 
 hub_service = BrokerHubService()

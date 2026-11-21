@@ -514,6 +514,20 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
             self._send_json(200, hub_service.list_deployments())
             return
 
+        if path == "/api/streak/plugins/source":
+            try:
+                kind = query.get("kind", ["screen"])[0]
+                pid = query.get("id", [""])[0]
+                self._send_json(200, hub_service.get_python_plugin_source(kind=kind, plugin_id=pid))
+            except Exception as exc:
+                self._send_json(400, {"detail": str(exc)})
+            return
+
+        if path == "/api/streak/scanners/alerts":
+            sub_id = query.get("subscription_id", [None])[0]
+            self._send_json(200, hub_service.list_scanner_alerts(subscription_id=sub_id))
+            return
+
         if len(parts) == 4 and parts[0] == "api" and parts[1] == "brokers" and parts[3] == "reconnect-status":
             self._send_json(200, hub_service.get_reconnect_status(parts[2]))
             return
@@ -741,11 +755,13 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
                     200,
                     hub_service.start_live_screener(
                         symbols=body.get("symbols") if isinstance(body.get("symbols"), list) else None,
+                        basket_id=body.get("basket_id"),
                         universe=str(body.get("universe", "CUSTOM")),
                         exchange=str(body.get("exchange", "NSE")),
                         timeframe=str(body.get("timeframe", "1day")),
                         screen_id=body.get("screen_id"),
                         preset=str(body.get("preset", "all_metrics")),
+                        rule_def=body.get("rule_def") if isinstance(body.get("rule_def"), dict) else None,
                         params=body.get("params") if isinstance(body.get("params"), dict) else None,
                         provider=body.get("provider"),
                         backend=str(body.get("backend", "auto")),
@@ -766,6 +782,7 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
                     200,
                     hub_service.run_screener(
                         symbols=body.get("symbols") if isinstance(body.get("symbols"), list) else None,
+                        basket_id=body.get("basket_id"),
                         universe=str(body.get("universe", "CUSTOM")),
                         exchange=str(body.get("exchange", "NSE")),
                         timeframe=str(body.get("timeframe", "1day")),
@@ -778,6 +795,7 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
                         as_of_date=body.get("as_of_date"),
                         screen_id=body.get("screen_id"),
                         preset=str(body.get("preset", "all_metrics")),
+                        rule_def=body.get("rule_def") if isinstance(body.get("rule_def"), dict) else None,
                         params=body.get("params") if isinstance(body.get("params"), dict) else None,
                         provider=body.get("provider"),
                         backend=str(body.get("backend", "auto")),
@@ -944,6 +962,29 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
                 self._send_json(200, hub_service.resolve_deployment_alert(parts[4], str(body.get("action", ""))))
                 return
 
+            if path == "/api/streak/plugins/python":
+                self._send_json(
+                    200,
+                    hub_service.save_python_plugin(
+                        kind=str(body.get("kind", "screen")),
+                        filename=str(body.get("filename", "")),
+                        code=str(body.get("code", "")),
+                    ),
+                )
+                return
+
+            if path == "/api/streak/scanners/alerts":
+                self._send_json(200, hub_service.save_scanner_alert(body))
+                return
+
+            if len(parts) == 6 and parts[0] == "api" and parts[1] == "streak" and parts[2] == "scanners" and parts[3] == "alerts" and parts[5] == "action":
+                self._send_json(200, hub_service.control_scanner_alert(parts[4], str(body.get("action", ""))))
+                return
+
+            if path == "/api/streak/orders/quick":
+                self._send_json(200, hub_service.place_quick_order(body))
+                return
+
             self._send_json(404, {"detail": "Not Found"})
         except ValueError as exc:
             self._send_json(400, {"detail": str(exc)})
@@ -962,6 +1003,9 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
                 return
             if len(parts) == 4 and parts[0] == "api" and parts[1] == "streak" and parts[2] == "deployments":
                 self._send_json(200, hub_service.control_deployment(parts[3], "delete"))
+                return
+            if len(parts) == 5 and parts[0] == "api" and parts[1] == "streak" and parts[2] == "scanners" and parts[3] == "alerts":
+                self._send_json(200, hub_service.delete_scanner_alert(parts[4]))
                 return
             self._send_json(404, {"detail": "Not Found"})
         except ValueError as exc:
@@ -982,11 +1026,28 @@ def run_server(host: str = "127.0.0.1", port: int = 8000, open_browser: bool = T
 
     try:
         import uvicorn  # type: ignore
-        from web.app import app
+        from web.app import app, request_shutdown, reset_shutdown
 
+        class _GracefulUvicornServer(uvicorn.Server):
+            def handle_exit(self, sig: int, frame: Any) -> None:
+                request_shutdown()
+                super().handle_exit(sig, frame)
+
+        reset_shutdown()
         if open_browser:
             webbrowser.open(url)
-        uvicorn.run(app, host=host, port=port, log_level="info")
+        config = uvicorn.Config(
+            app,
+            host=host,
+            port=port,
+            log_level="info",
+            timeout_graceful_shutdown=2,
+        )
+        server = _GracefulUvicornServer(config)
+        try:
+            server.run()
+        except KeyboardInterrupt:
+            request_shutdown()
         return
     except ImportError:
         logger.info("FastAPI/Uvicorn not installed; running lightweight Python stdlib server.")

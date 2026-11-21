@@ -512,6 +512,7 @@ class LiveScreenerEngine:
         timeframe: str = "1day",
         screen_id: Optional[str] = None,
         preset: str = "all_metrics",
+        rule_def: Optional[Dict[str, Any]] = None,
         params: Optional[Dict[str, Any]] = None,
         provider: Optional[str] = None,
         backend: str = "auto",
@@ -524,15 +525,20 @@ class LiveScreenerEngine:
         self.stop(silent=True)
 
         target_screen_id = screen_id or preset or "all_metrics"
-        try:
-            screen = self._registry.get(target_screen_id)
-        except Exception:
-            from rules.engine import compile_visual_screen, visual_rule_store
+        if isinstance(rule_def, dict) and (rule_def.get("entry") or rule_def.get("conditions")):
+            from rules.engine import compile_visual_screen
 
-            rule_def = visual_rule_store.get(target_screen_id)
-            if rule_def is None:
-                raise
             screen = compile_visual_screen(rule_def)
+        else:
+            try:
+                screen = self._registry.get(target_screen_id)
+            except Exception:
+                from rules.engine import compile_visual_screen, visual_rule_store
+
+                stored_rule = visual_rule_store.get(target_screen_id)
+                if stored_rule is None:
+                    raise
+                screen = compile_visual_screen(stored_rule)
         resolved_params = screen.resolve_params(params)
 
         tf = normalize_timeframe(timeframe)

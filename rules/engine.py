@@ -39,7 +39,10 @@ SUPPORTED_OPERANDS: List[Dict[str, Any]] = [
     {"id": "number", "label": "Number (Constant)", "kind": "constant", "default_period": None},
     {"id": "sma", "label": "SMA", "kind": "indicator", "default_period": 20},
     {"id": "ema", "label": "EMA", "kind": "indicator", "default_period": 20},
+    {"id": "wma", "label": "WMA", "kind": "indicator", "default_period": 20},
+    {"id": "vwap", "label": "VWAP", "kind": "indicator", "default_period": 20},
     {"id": "rsi", "label": "RSI", "kind": "indicator", "default_period": 14},
+    {"id": "rsi_ma", "label": "RSI Moving Average", "kind": "indicator", "default_period": 14},
     {"id": "atr", "label": "ATR", "kind": "indicator", "default_period": 14},
     {"id": "macd", "label": "MACD Line", "kind": "indicator", "default_period": 12},
     {"id": "macd_signal", "label": "MACD Signal", "kind": "indicator", "default_period": 9},
@@ -61,14 +64,97 @@ SUPPORTED_OPERANDS: List[Dict[str, Any]] = [
 ]
 
 SUPPORTED_OPERATORS: List[Dict[str, str]] = [
-    {"id": ">", "label": "is greater than (>)"},
-    {"id": "<", "label": "is lower than (<)"},
-    {"id": ">=", "label": "is >= "},
-    {"id": "<=", "label": "is <= "},
-    {"id": "==", "label": "equals (==)"},
+    {"id": ">", "label": "higher than (>)"},
+    {"id": "<", "label": "lower than (<)"},
+    {"id": ">=", "label": "greater or equal (>=)"},
+    {"id": "<=", "label": "lower or equal (<=)"},
+    {"id": "==", "label": "equal to (==)"},
+    {"id": "!=", "label": "not equal (!=)"},
     {"id": "crosses_above", "label": "crosses above"},
     {"id": "crosses_below", "label": "crosses below"},
+    {"id": "up_by_pct", "label": "up by % from"},
+    {"id": "down_by_pct", "label": "down by % from"},
 ]
+
+
+def to_heikin_ashi_candles(candles: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Convert OHLCV candles to Heikin-Ashi candles in O(N) without mutating inputs."""
+    if not candles:
+        return []
+    ha: List[Dict[str, Any]] = []
+    prev_ha_open: Optional[float] = None
+    prev_ha_close: Optional[float] = None
+    for c in candles:
+        o = float(c["open"])
+        h = float(c["high"])
+        l = float(c["low"])
+        cl = float(c["close"])
+        ha_close = (o + h + l + cl) / 4.0
+        if prev_ha_open is None or prev_ha_close is None:
+            ha_open = (o + cl) / 2.0
+        else:
+            ha_open = (prev_ha_open + prev_ha_close) / 2.0
+        ha_high = max(h, ha_open, ha_close)
+        ha_low = min(l, ha_open, ha_close)
+        ha.append({**c, "open": ha_open, "high": ha_high, "low": ha_low, "close": ha_close})
+        prev_ha_open = ha_open
+        prev_ha_close = ha_close
+    return ha
+
+
+def _compute_wma_series(values: List[float], period: int) -> List[Optional[float]]:
+    n = len(values)
+    p = max(1, int(period))
+    out: List[Optional[float]] = [None] * n
+    if n < p:
+        return out
+    denom = p * (p + 1) / 2.0
+    for i in range(p - 1, n):
+        acc = 0.0
+        for w in range(1, p + 1):
+            acc += values[i - p + w] * w
+        out[i] = acc / denom
+    return out
+
+
+def _compute_vwap_series(candles: List[Dict[str, Any]], period: int = 20) -> List[Optional[float]]:
+    """Session-anchored VWAP for intraday candles; rolling volume-weighted typical price for daily+."""
+    n = len(candles)
+    out: List[Optional[float]] = [None] * n
+    if n == 0:
+        return out
+    # Detect intraday by duplicate trade_dates
+    dates = [str(c.get("trade_date") or str(c.get("ts_ist", ""))[:10])[:10] for c in candles]
+    is_intraday = len(set(dates)) < n
+    if is_intraday:
+        cur_date = ""
+        cum_pv = 0.0
+        cum_v = 0.0
+        for i, c in enumerate(candles):
+            d = dates[i]
+            if d != cur_date:
+                cur_date = d
+                cum_pv = 0.0
+                cum_v = 0.0
+            tp = (float(c["high"]) + float(c["low"]) + float(c["close"])) / 3.0
+            vol = max(0.0, float(c.get("volume") or 0.0))
+            cum_pv += tp * vol
+            cum_v += vol
+            out[i] = (cum_pv / cum_v) if cum_v > 0 else tp
+        return out
+    p = max(1, int(period or 20))
+    for i in range(n):
+        start = max(0, i - p + 1)
+        pv = 0.0
+        vv = 0.0
+        for j in range(start, i + 1):
+            c = candles[j]
+            tp = (float(c["high"]) + float(c["low"]) + float(c["close"])) / 3.0
+            vol = max(0.0, float(c.get("volume") or 0.0))
+            pv += tp * vol
+            vv += vol
+        out[i] = (pv / vv) if vv > 0 else float(candles[i]["close"])
+    return out
 
 
 def _compute_operand_series(
@@ -101,8 +187,26 @@ def _compute_operand_series(
         series = tk.sma(max(1, period))
     elif op_type == "ema":
         series = tk.ema(max(1, period))
+    elif op_type == "wma":
+        closes = [float(c["close"]) for c in candles]
+        series = _compute_wma_series(closes, max(1, period))
+    elif op_type == "vwap":
+        series = _compute_vwap_series(candles, max(1, period))
     elif op_type == "rsi":
         series = tk.rsi(max(2, period))
+    elif op_type == "rsi_ma":
+        rsi_vals = tk.rsi(max(2, period))
+        ma_period = max(2, int(param2) if param2 > 0 else 9)
+        series = [None] * n
+        buf: List[float] = []
+        for i, rv in enumerate(rsi_vals):
+            if rv is None:
+                continue
+            buf.append(float(rv))
+            if len(buf) > ma_period:
+                buf.pop(0)
+            if len(buf) == ma_period:
+                series[i] = sum(buf) / float(ma_period)
     elif op_type == "atr":
         series = tk.atr(max(2, period))[0]
     elif op_type == "macd":
@@ -182,6 +286,8 @@ def _estimate_required_bars_for_group(group: Optional[Dict[str, Any]]) -> int:
     for cond in group.get("conditions") or []:
         if not isinstance(cond, dict):
             continue
+        if cond.get("enabled") is False:
+            continue
         if "conditions" in cond:
             req = max(req, _estimate_required_bars_for_group(cond))
             continue
@@ -190,10 +296,12 @@ def _estimate_required_bars_for_group(group: Optional[Dict[str, Any]]) -> int:
             op = str(side.get("type") or "").lower()
             per = int(side.get("period") or 0)
             off = abs(int(side.get("offset") or 0))
-            if op in {"ema", "rsi", "adx", "atr", "macd", "macd_signal", "macd_hist"}:
+            if op in {"ema", "rsi", "rsi_ma", "adx", "atr", "macd", "macd_signal", "macd_hist"}:
                 req = max(req, per * 3 + off + 15)
             elif per > 0:
                 req = max(req, per + off + 15)
+            else:
+                req = max(req, off + 10)
     return req
 
 
@@ -209,19 +317,23 @@ class _PreparedConditionGroup:
         for cond in self._group.get("conditions") or []:
             if not isinstance(cond, dict):
                 continue
+            if cond.get("enabled") is False:
+                continue
             if "conditions" in cond:
                 sub = _PreparedConditionGroup(cond, candles, tk)
-                self._compiled.append(("group", sub))
-                self.watched_series.update(sub.watched_series)
+                if not sub.is_empty():
+                    self._compiled.append(("group", sub))
+                    self.watched_series.update(sub.watched_series)
                 continue
             left_spec = cond.get("left") or {"type": "close"}
             right_spec = cond.get("right") or {"type": "number", "value": 0}
             operator = str(cond.get("operator") or ">").strip().lower()
+            pct = float(cond.get("pct") or 0.0)
             left_s = _compute_operand_series(left_spec, candles, tk)
             right_s = _compute_operand_series(right_spec, candles, tk)
             left_off = int(left_spec.get("offset") or 0)
             right_off = int(right_spec.get("offset") or 0)
-            self._compiled.append(("leaf", left_s, left_off, operator, right_s, right_off))
+            self._compiled.append(("leaf", left_s, left_off, operator, right_s, right_off, pct))
             if str(left_spec.get("type") or "").lower() != "number":
                 self.watched_series[_operand_label(left_spec)] = left_s
             if str(right_spec.get("type") or "").lower() != "number":
@@ -238,7 +350,7 @@ class _PreparedConditionGroup:
             if item[0] == "group":
                 results.append(item[1].eval_at(idx))
                 continue
-            _, ls, loff, op, rs, roff = item
+            _, ls, loff, op, rs, roff, pct = item
             lv = _series_val(ls, idx, loff)
             rv = _series_val(rs, idx, roff)
             if lv is None or rv is None:
@@ -254,6 +366,14 @@ class _PreparedConditionGroup:
                 results.append(lv <= rv)
             elif op == "==":
                 results.append(abs(lv - rv) <= 1e-9)
+            elif op == "!=":
+                results.append(abs(lv - rv) > 1e-9)
+            elif op == "up_by_pct":
+                # Left is higher than Right by at least `pct`% (e.g. Close(0) up by 1% from Close(-1))
+                results.append(rv > 0 and lv >= rv * (1.0 + pct / 100.0))
+            elif op == "down_by_pct":
+                # Left is lower than Right by at least `pct`% (e.g. Close(0) down by 1% from Close(-1))
+                results.append(rv > 0 and lv <= rv * (1.0 - pct / 100.0))
             elif op == "crosses_above":
                 plv = _series_val(ls, idx - 1, loff)
                 prv = _series_val(rs, idx - 1, roff)
@@ -302,23 +422,33 @@ class CompiledVisualScreen(BaseScreen):
     def get_columns(self, params: Dict[str, Any]) -> List[ColumnSpec]:
         cols: List[ColumnSpec] = []
         seen: set[str] = set()
-        for cond in (self._group.get("conditions") or []):
-            if not isinstance(cond, dict):
-                continue
-            for side_k in ("left", "right"):
-                side = cond.get(side_k) or {}
-                if str(side.get("type") or "").lower() in {"number", "close", "open", "high", "low"}:
+
+        def _walk(grp: Dict[str, Any]) -> None:
+            for cond in (grp.get("conditions") or []):
+                if not isinstance(cond, dict) or cond.get("enabled") is False:
                     continue
-                lbl = _operand_label(side)
-                key = re.sub(r"[^a-z0-9]+", "_", lbl.lower()).strip("_")
-                if key and key not in seen:
-                    seen.add(key)
-                    cols.append(ColumnSpec(key=key, label=lbl, format="number", digits=2))
+                if "conditions" in cond:
+                    _walk(cond)
+                    continue
+                for side_k in ("left", "right"):
+                    side = cond.get(side_k) or {}
+                    if str(side.get("type") or "").lower() in {"number", "close", "open", "high", "low"}:
+                        continue
+                    lbl = _operand_label(side)
+                    key = re.sub(r"[^a-z0-9]+", "_", lbl.lower()).strip("_")
+                    if key and key not in seen:
+                        seen.add(key)
+                        cols.append(ColumnSpec(key=key, label=lbl, fmt="number", decimals=2))
+
+        _walk(self._group)
         return cols[:8]
 
     def evaluate(self, candles: List[Dict[str, Any]], params: Dict[str, Any], tk: IndicatorToolkit) -> ScreenMatch:
-        prep = _PreparedConditionGroup(self._group, candles, tk)
-        idx = len(candles) - 1
+        chart_type = str(self.rule_def.get("chart_type") or "candlestick").strip().lower()
+        eval_candles = to_heikin_ashi_candles(candles) if chart_type == "heikin_ashi" else candles
+        eval_tk = IndicatorToolkit(eval_candles, backend=getattr(tk, "backend", "auto")) if chart_type == "heikin_ashi" else tk
+        prep = _PreparedConditionGroup(self._group, eval_candles, eval_tk)
+        idx = len(eval_candles) - 1
         matched = prep.eval_at(idx)
         metrics: Dict[str, Any] = {}
         for lbl, series in prep.watched_series.items():
@@ -357,8 +487,11 @@ class CompiledVisualStrategy(BacktestStrategy):
         )
 
     def prepare(self, candles: List[Dict[str, Any]], params: Dict[str, Any], toolkit: IndicatorToolkit) -> None:
-        self._entry_prep = _PreparedConditionGroup(self._entry_group, candles, toolkit)
-        self._exit_prep = _PreparedConditionGroup(self._exit_group, candles, toolkit)
+        chart_type = str(self.rule_def.get("chart_type") or "candlestick").strip().lower()
+        eval_candles = to_heikin_ashi_candles(candles) if chart_type == "heikin_ashi" else candles
+        eval_tk = IndicatorToolkit(eval_candles, backend=getattr(toolkit, "backend", "auto")) if chart_type == "heikin_ashi" else toolkit
+        self._entry_prep = _PreparedConditionGroup(self._entry_group, eval_candles, eval_tk)
+        self._exit_prep = _PreparedConditionGroup(self._exit_group, eval_candles, eval_tk)
 
     def signal_at(self, index: int, bar: Dict[str, Any]) -> Tuple[bool, bool]:
         enter_sig = self._entry_prep.eval_at(index) if self._entry_prep else False
@@ -482,28 +615,126 @@ class {class_name}(BacktestStrategy):
 
 
 _SEED_VISUAL_RULES: List[Dict[str, Any]] = [
+    # ── Streak-style Discover Strategies ─────────────────────────────────
+    {
+        "id": "vis_volatility_contraction",
+        "kind": "strategy",
+        "mode": "visual",
+        "builder_mode": "advance",
+        "category": "Equity Intraday",
+        "name": "Volatility Contraction",
+        "description": "Takes a Buy position when short-term price ranges contract and volume expands sharply above recent levels.",
+        "timeframe": "15minute",
+        "chart_type": "candlestick",
+        "segment": "equity_intraday",
+        "universe": "NIFTY_50",
+        "default_symbols": ["APOLLOHOSP", "ASIANPAINT", "BHARTIARTL", "CIPLA", "HDFCBANK", "HINDUNILVR", "INFY", "RELIANCE", "SBIN"],
+        "stop_loss_pct": 4.0,
+        "take_profit_pct": 6.0,
+        "trailing_sl_pct": 0.0,
+        "entry": {
+            "logic": "AND",
+            "conditions": [
+                {"left": {"type": "atr", "period": 5, "offset": 0}, "operator": "<", "right": {"type": "atr", "period": 14, "offset": 0}, "enabled": True},
+                {"left": {"type": "close", "offset": 0}, "operator": ">", "right": {"type": "ema", "period": 20, "offset": 0}, "enabled": True},
+                {"left": {"type": "volume", "offset": 0}, "operator": ">", "right": {"type": "vol_sma", "period": 20, "multiplier": 1.6, "offset": 0}, "enabled": True},
+            ],
+        },
+        "exit": {
+            "logic": "OR",
+            "conditions": [
+                {"left": {"type": "close", "offset": 0}, "operator": "crosses_below", "right": {"type": "ema", "period": 20, "offset": 0}, "enabled": True},
+            ],
+        },
+    },
+    {
+        "id": "vis_bb_mean_reversion",
+        "kind": "strategy",
+        "mode": "visual",
+        "builder_mode": "basic",
+        "category": "Equity Intraday",
+        "name": "Bollinger Band Mean Reversion",
+        "description": "Buys oversold dips where Close rebounds above Bollinger Lower Band with RSI(14) recovering above 32.",
+        "timeframe": "15minute",
+        "chart_type": "candlestick",
+        "segment": "equity_intraday",
+        "universe": "NIFTY_50",
+        "default_symbols": ["RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK", "SBIN"],
+        "stop_loss_pct": 2.0,
+        "take_profit_pct": 4.0,
+        "trailing_sl_pct": 0.0,
+        "entry": {
+            "logic": "AND",
+            "conditions": [
+                {"left": {"type": "close", "offset": 0}, "operator": "crosses_above", "right": {"type": "bb_lower", "period": 20, "param2": 2.0}, "enabled": True},
+                {"left": {"type": "rsi", "period": 14}, "operator": ">", "right": {"type": "number", "value": 32}, "enabled": True},
+            ],
+        },
+        "exit": {
+            "logic": "OR",
+            "conditions": [
+                {"left": {"type": "close", "offset": 0}, "operator": ">=", "right": {"type": "bb_middle", "period": 20, "param2": 2.0}, "enabled": True},
+            ],
+        },
+    },
+    {
+        "id": "vis_strong_breakout_continuation",
+        "kind": "strategy",
+        "mode": "visual",
+        "builder_mode": "basic",
+        "category": "Equity Swing",
+        "name": "Strong Breakout Continuation",
+        "description": "Captures swing breakouts where Close clears 20-day Rolling High with ADX(14) > 22 and strong volume.",
+        "timeframe": "1day",
+        "chart_type": "candlestick",
+        "segment": "equity_delivery",
+        "universe": "NIFTY_50",
+        "default_symbols": ["RELIANCE", "BHARTIARTL", "LT", "M&M", "SBIN", "ICICIBANK"],
+        "stop_loss_pct": 4.0,
+        "take_profit_pct": 12.0,
+        "trailing_sl_pct": 2.0,
+        "entry": {
+            "logic": "AND",
+            "conditions": [
+                {"left": {"type": "close", "offset": 0}, "operator": ">", "right": {"type": "rolling_high", "period": 20, "offset": -1}, "enabled": True},
+                {"left": {"type": "adx", "period": 14}, "operator": ">", "right": {"type": "number", "value": 22}, "enabled": True},
+                {"left": {"type": "volume"}, "operator": ">", "right": {"type": "vol_sma", "period": 20, "multiplier": 1.4}, "enabled": True},
+            ],
+        },
+        "exit": {
+            "logic": "OR",
+            "conditions": [
+                {"left": {"type": "close", "offset": 0}, "operator": "crosses_below", "right": {"type": "ema", "period": 20}, "enabled": True},
+            ],
+        },
+    },
     {
         "id": "vis_ema_rsi_momentum",
         "kind": "strategy",
         "mode": "visual",
+        "builder_mode": "basic",
+        "category": "Equity Swing",
         "name": "EMA 20/50 Crossover + RSI Filter",
         "description": "Enters when EMA(20) crosses above EMA(50) with RSI(14) > 55; exits on bearish crossover or SL/TP.",
         "timeframe": "1day",
+        "chart_type": "candlestick",
         "segment": "equity_delivery",
+        "universe": "NIFTY_50",
+        "default_symbols": ["RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK"],
         "stop_loss_pct": 4.0,
         "take_profit_pct": 12.0,
         "trailing_sl_pct": 0.0,
         "entry": {
             "logic": "AND",
             "conditions": [
-                {"left": {"type": "ema", "period": 20, "offset": 0}, "operator": "crosses_above", "right": {"type": "ema", "period": 50, "offset": 0}},
-                {"left": {"type": "rsi", "period": 14, "offset": 0}, "operator": ">", "right": {"type": "number", "value": 55}},
+                {"left": {"type": "ema", "period": 20, "offset": 0}, "operator": "crosses_above", "right": {"type": "ema", "period": 50, "offset": 0}, "enabled": True},
+                {"left": {"type": "rsi", "period": 14, "offset": 0}, "operator": ">", "right": {"type": "number", "value": 55}, "enabled": True},
             ],
         },
         "exit": {
             "logic": "OR",
             "conditions": [
-                {"left": {"type": "ema", "period": 20, "offset": 0}, "operator": "crosses_below", "right": {"type": "ema", "period": 50, "offset": 0}},
+                {"left": {"type": "ema", "period": 20, "offset": 0}, "operator": "crosses_below", "right": {"type": "ema", "period": 50, "offset": 0}, "enabled": True},
             ],
         },
     },
@@ -511,24 +742,222 @@ _SEED_VISUAL_RULES: List[Dict[str, Any]] = [
         "id": "vis_supertrend_adx",
         "kind": "strategy",
         "mode": "visual",
+        "builder_mode": "basic",
+        "category": "Equity Intraday",
         "name": "Supertrend Bullish + ADX Trend",
         "description": "Captures strong directional trends when Supertrend flips bullish and ADX(14) > 22.",
         "timeframe": "15minute",
+        "chart_type": "candlestick",
         "segment": "equity_intraday",
+        "universe": "NIFTY_50",
+        "default_symbols": ["RELIANCE", "SBIN", "ICICIBANK", "AXISBANK", "BAJFINANCE"],
         "stop_loss_pct": 1.5,
         "take_profit_pct": 3.5,
         "trailing_sl_pct": 1.0,
         "entry": {
             "logic": "AND",
             "conditions": [
-                {"left": {"type": "supertrend_dir", "period": 10, "param2": 3.0}, "operator": "==", "right": {"type": "number", "value": 1}},
-                {"left": {"type": "adx", "period": 14}, "operator": ">", "right": {"type": "number", "value": 22}},
+                {"left": {"type": "supertrend_dir", "period": 10, "param2": 3.0}, "operator": "==", "right": {"type": "number", "value": 1}, "enabled": True},
+                {"left": {"type": "adx", "period": 14}, "operator": ">", "right": {"type": "number", "value": 22}, "enabled": True},
             ],
         },
         "exit": {
             "logic": "OR",
             "conditions": [
-                {"left": {"type": "supertrend_dir", "period": 10, "param2": 3.0}, "operator": "==", "right": {"type": "number", "value": -1}},
+                {"left": {"type": "supertrend_dir", "period": 10, "param2": 3.0}, "operator": "==", "right": {"type": "number", "value": -1}, "enabled": True},
+            ],
+        },
+    },
+    {
+        "id": "vis_stochastic_reversal",
+        "kind": "strategy",
+        "mode": "visual",
+        "builder_mode": "basic",
+        "category": "Equity Swing",
+        "name": "Stochastic Reversal",
+        "description": "Identifies bullish swings when Stochastic %K crosses above %D while price holds above EMA(50).",
+        "timeframe": "60minute",
+        "chart_type": "candlestick",
+        "segment": "equity_delivery",
+        "universe": "NIFTY_50",
+        "default_symbols": ["INFY", "TCS", "HCLTECH", "WIPRO", "TECHM"],
+        "stop_loss_pct": 2.5,
+        "take_profit_pct": 6.0,
+        "trailing_sl_pct": 0.0,
+        "entry": {
+            "logic": "AND",
+            "conditions": [
+                {"left": {"type": "stoch_k", "period": 14}, "operator": "crosses_above", "right": {"type": "stoch_d", "period": 3}, "enabled": True},
+                {"left": {"type": "close"}, "operator": ">", "right": {"type": "ema", "period": 50}, "enabled": True},
+            ],
+        },
+        "exit": {
+            "logic": "OR",
+            "conditions": [
+                {"left": {"type": "stoch_k", "period": 14}, "operator": "crosses_below", "right": {"type": "stoch_d", "period": 3}, "enabled": True},
+            ],
+        },
+    },
+    # ── Streak-style Discover Live Scanners ──────────────────────────────
+    {
+        "id": "vis_scan_top_gainers",
+        "kind": "screen",
+        "mode": "visual",
+        "builder_mode": "basic",
+        "name": "Top Gainers",
+        "description": "Identifies stocks where the current closing price is at least 1% higher than the previous close, indicating positive price momentum.",
+        "universe": "NIFTY_50",
+        "timeframe": "1day",
+        "chart_type": "candlestick",
+        "entry": {
+            "logic": "AND",
+            "conditions": [
+                {"left": {"type": "close", "offset": 0}, "operator": "up_by_pct", "pct": 1.0, "right": {"type": "close", "offset": -1}, "enabled": True},
+            ],
+        },
+    },
+    {
+        "id": "vis_scan_top_losers",
+        "kind": "screen",
+        "mode": "visual",
+        "builder_mode": "basic",
+        "name": "Top Losers",
+        "description": "Identifies stocks trading at least 1% below the previous session close, signaling short-term bearish weakness.",
+        "universe": "NIFTY_50",
+        "timeframe": "1day",
+        "chart_type": "candlestick",
+        "entry": {
+            "logic": "AND",
+            "conditions": [
+                {"left": {"type": "close", "offset": 0}, "operator": "down_by_pct", "pct": 1.0, "right": {"type": "close", "offset": -1}, "enabled": True},
+            ],
+        },
+    },
+    {
+        "id": "vis_scan_orb_breakout",
+        "kind": "screen",
+        "mode": "visual",
+        "builder_mode": "advance",
+        "name": "Opening Range Breakout",
+        "description": "Detects intraday breakouts above the prior 15-bar high supported by expanding volume.",
+        "universe": "NIFTY_50",
+        "timeframe": "5minute",
+        "chart_type": "candlestick",
+        "entry": {
+            "logic": "AND",
+            "conditions": [
+                {"left": {"type": "close", "offset": 0}, "operator": ">", "right": {"type": "rolling_high", "period": 15, "offset": -1}, "enabled": True},
+                {"left": {"type": "volume", "offset": 0}, "operator": ">", "right": {"type": "vol_sma", "period": 20, "multiplier": 1.4}, "enabled": True},
+            ],
+        },
+    },
+    {
+        "id": "vis_scan_orb_breakdown",
+        "kind": "screen",
+        "mode": "visual",
+        "builder_mode": "advance",
+        "name": "Opening Range Breakdown",
+        "description": "Detects intraday breakdowns below the prior 15-bar low accompanied by elevated selling volume.",
+        "universe": "NIFTY_50",
+        "timeframe": "5minute",
+        "chart_type": "candlestick",
+        "entry": {
+            "logic": "AND",
+            "conditions": [
+                {"left": {"type": "close", "offset": 0}, "operator": "<", "right": {"type": "rolling_low", "period": 15, "offset": -1}, "enabled": True},
+                {"left": {"type": "volume", "offset": 0}, "operator": ">", "right": {"type": "vol_sma", "period": 20, "multiplier": 1.4}, "enabled": True},
+            ],
+        },
+    },
+    {
+        "id": "vis_scan_higher_high_2d",
+        "kind": "screen",
+        "mode": "visual",
+        "builder_mode": "basic",
+        "name": "Higher High for 2 Days",
+        "description": "Finds stocks forming consecutive higher daily highs across the last two sessions.",
+        "universe": "NIFTY_50",
+        "timeframe": "1day",
+        "chart_type": "candlestick",
+        "entry": {
+            "logic": "AND",
+            "conditions": [
+                {"left": {"type": "high", "offset": 0}, "operator": ">", "right": {"type": "high", "offset": -1}, "enabled": True},
+                {"left": {"type": "high", "offset": -1}, "operator": ">", "right": {"type": "high", "offset": -2}, "enabled": True},
+            ],
+        },
+    },
+    {
+        "id": "vis_scan_lower_low_2d",
+        "kind": "screen",
+        "mode": "visual",
+        "builder_mode": "basic",
+        "name": "Lower Low for 2 Days",
+        "description": "Finds stocks making consecutive lower lows across the last two daily sessions.",
+        "universe": "NIFTY_50",
+        "timeframe": "1day",
+        "chart_type": "candlestick",
+        "entry": {
+            "logic": "AND",
+            "conditions": [
+                {"left": {"type": "low", "offset": 0}, "operator": "<", "right": {"type": "low", "offset": -1}, "enabled": True},
+                {"left": {"type": "low", "offset": -1}, "operator": "<", "right": {"type": "low", "offset": -2}, "enabled": True},
+            ],
+        },
+    },
+    {
+        "id": "vis_scan_short_term_bullish",
+        "kind": "screen",
+        "mode": "visual",
+        "builder_mode": "basic",
+        "name": "Short Term Bullish",
+        "description": "Bullish trend alignment where Close > EMA(20) > EMA(50) and RSI(14) > 55.",
+        "universe": "NIFTY_50",
+        "timeframe": "1day",
+        "chart_type": "candlestick",
+        "entry": {
+            "logic": "AND",
+            "conditions": [
+                {"left": {"type": "close"}, "operator": ">", "right": {"type": "ema", "period": 20}, "enabled": True},
+                {"left": {"type": "ema", "period": 20}, "operator": ">", "right": {"type": "ema", "period": 50}, "enabled": True},
+                {"left": {"type": "rsi", "period": 14}, "operator": ">", "right": {"type": "number", "value": 55}, "enabled": True},
+            ],
+        },
+    },
+    {
+        "id": "vis_scan_short_term_bear",
+        "kind": "screen",
+        "mode": "visual",
+        "builder_mode": "basic",
+        "name": "Short Term Bear",
+        "description": "Bearish alignment where Close < EMA(20) < EMA(50) and RSI(14) < 45.",
+        "universe": "NIFTY_50",
+        "timeframe": "1day",
+        "chart_type": "candlestick",
+        "entry": {
+            "logic": "AND",
+            "conditions": [
+                {"left": {"type": "close"}, "operator": "<", "right": {"type": "ema", "period": 20}, "enabled": True},
+                {"left": {"type": "ema", "period": 20}, "operator": "<", "right": {"type": "ema", "period": 50}, "enabled": True},
+                {"left": {"type": "rsi", "period": 14}, "operator": "<", "right": {"type": "number", "value": 45}, "enabled": True},
+            ],
+        },
+    },
+    {
+        "id": "vis_scan_supertrend_vwap",
+        "kind": "screen",
+        "mode": "visual",
+        "builder_mode": "basic",
+        "name": "Supertrend Bullish + Above VWAP",
+        "description": "Intraday bullish momentum where Supertrend(10,3) is positive and Close holds above VWAP.",
+        "universe": "NIFTY_50",
+        "timeframe": "15minute",
+        "chart_type": "candlestick",
+        "entry": {
+            "logic": "AND",
+            "conditions": [
+                {"left": {"type": "supertrend_dir", "period": 10, "param2": 3.0}, "operator": "==", "right": {"type": "number", "value": 1}, "enabled": True},
+                {"left": {"type": "close"}, "operator": ">", "right": {"type": "vwap", "period": 20}, "enabled": True},
             ],
         },
     },
@@ -536,15 +965,18 @@ _SEED_VISUAL_RULES: List[Dict[str, Any]] = [
         "id": "vis_scan_rsi_breakout",
         "kind": "screen",
         "mode": "visual",
-        "name": "RSI Momentum + Volume Surge Scanner",
+        "builder_mode": "basic",
+        "name": "RSI Momentum + Volume Surge",
         "description": "Finds stocks trading above EMA(20) with RSI(14) > 60 and volume > 1.5x 20-bar average.",
+        "universe": "NIFTY_50",
         "timeframe": "1day",
+        "chart_type": "candlestick",
         "entry": {
             "logic": "AND",
             "conditions": [
-                {"left": {"type": "close"}, "operator": ">", "right": {"type": "ema", "period": 20}},
-                {"left": {"type": "rsi", "period": 14}, "operator": ">", "right": {"type": "number", "value": 60}},
-                {"left": {"type": "volume"}, "operator": ">", "right": {"type": "vol_sma", "period": 20, "multiplier": 1.5}},
+                {"left": {"type": "close"}, "operator": ">", "right": {"type": "ema", "period": 20}, "enabled": True},
+                {"left": {"type": "rsi", "period": 14}, "operator": ">", "right": {"type": "number", "value": 60}, "enabled": True},
+                {"left": {"type": "volume"}, "operator": ">", "right": {"type": "vol_sma", "period": 20, "multiplier": 1.5}, "enabled": True},
             ],
         },
     },
@@ -561,12 +993,27 @@ class VisualRuleStore:
 
     def _ensure_seeded(self) -> None:
         with self._lock:
-            if self._file.exists():
-                return
-            self._file.parent.mkdir(parents=True, exist_ok=True)
             now_ist = datetime.now(tz=IST_TZ).isoformat(timespec="seconds")
-            seeded = [{**r, "updated_at_ist": now_ist} for r in _SEED_VISUAL_RULES]
-            self._file.write_text(json.dumps(seeded, indent=2), encoding="utf-8")
+            if not self._file.exists():
+                self._file.parent.mkdir(parents=True, exist_ok=True)
+                seeded = [{**r, "seeded": True, "updated_at_ist": now_ist} for r in _SEED_VISUAL_RULES]
+                self._file.write_text(json.dumps(seeded, indent=2), encoding="utf-8")
+                return
+            # Gently backfill new curated Streak presets if upgrading from an earlier 3-item seed file
+            try:
+                raw = json.loads(self._file.read_text(encoding="utf-8"))
+                if isinstance(raw, list):
+                    existing_ids = {str(r.get("id") or "").lower() for r in raw if isinstance(r, dict)}
+                    if "vis_scan_top_gainers" not in existing_ids:
+                        added = False
+                        for seed in _SEED_VISUAL_RULES:
+                            if seed["id"].lower() not in existing_ids:
+                                raw.append({**seed, "seeded": True, "updated_at_ist": now_ist})
+                                added = True
+                        if added:
+                            self._file.write_text(json.dumps(raw, indent=2), encoding="utf-8")
+            except Exception:
+                pass
 
     def _read_all_locked(self) -> List[Dict[str, Any]]:
         self._ensure_seeded()
@@ -647,5 +1094,6 @@ __all__ = [
     "compile_visual_strategy",
     "evaluate_condition_group",
     "export_rule_to_python",
+    "to_heikin_ashi_candles",
     "visual_rule_store",
 ]

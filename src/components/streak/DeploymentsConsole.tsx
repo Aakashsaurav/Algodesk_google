@@ -1,17 +1,31 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Pause, Play, Square, LogOut, Trash2, CheckCircle2, XCircle, ShieldAlert, RefreshCw } from 'lucide-react';
+import {
+  Bell,
+  CheckCircle2,
+  Compass,
+  LogOut,
+  Pause,
+  Play,
+  RefreshCw,
+  ShieldAlert,
+  Square,
+  Trash2,
+  XCircle,
+} from 'lucide-react';
 import type { ActionableAlert, DeploymentRecord, DeploymentsPayload } from './types';
 
 interface Props {
   onGoToStrategies: () => void;
+  onGoToRisk?: () => void;
 }
 
 const fmtInr = (v: number) => `₹${v.toLocaleString('en-IN', { maximumFractionDigits: 2 })}`;
 
-export function DeploymentsConsole({ onGoToStrategies }: Props) {
+export function DeploymentsConsole({ onGoToStrategies, onGoToRisk }: Props) {
   const [data, setData] = useState<DeploymentsPayload | null>(null);
-  const [tab, setTab] = useState<'all' | 'paper' | 'live' | 'alerts'>('all');
+  const [tab, setTab] = useState<'live_alert' | 'paper' | 'live_auto' | 'all' | 'alerts'>('all');
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [expandedLogId, setExpandedLogId] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<{ ok: boolean; text: string } | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
 
@@ -56,15 +70,15 @@ export function DeploymentsConsole({ onGoToStrategies }: Props) {
     try {
       const res =
         action === 'delete'
-          ? await fetch(`/api/streak/deployments/${id}`, { method: 'DELETE' })
-          : await fetch(`/api/streak/deployments/${id}/action`, {
+          ? await fetch(`/api/streak/deployments/${encodeURIComponent(id)}`, { method: 'DELETE' })
+          : await fetch(`/api/streak/deployments/${encodeURIComponent(id)}/action`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ action }),
             });
-      const body = await res.json();
+      const body = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(body.detail || `Action '${action}' failed.`);
-      setFeedback({ ok: true, text: `Deployment ${id}: ${action.replace('_', ' ')} completed.` });
+      setFeedback({ ok: true, text: `Deployment ${action.replace('_', ' ')} completed.` });
       await fetchDeployments();
     } catch (err) {
       setFeedback({ ok: false, text: err instanceof Error ? err.message : 'Action failed.' });
@@ -77,12 +91,12 @@ export function DeploymentsConsole({ onGoToStrategies }: Props) {
     setBusyId(alertId);
     setFeedback(null);
     try {
-      const res = await fetch(`/api/streak/deployments/alerts/${alertId}/action`, {
+      const res = await fetch(`/api/streak/deployments/alerts/${encodeURIComponent(alertId)}/action`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action }),
       });
-      const body = await res.json();
+      const body = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(body.detail || 'Alert action failed.');
       setFeedback({
         ok: Boolean(body.ok !== false),
@@ -90,8 +104,8 @@ export function DeploymentsConsole({ onGoToStrategies }: Props) {
           body.status === 'EXECUTED'
             ? `Order executed (${body.broker_order_id || alertId}).`
             : body.status === 'BLOCKED'
-            ? `Order blocked by safety gate: ${(body.reasons || []).join('; ')}`
-            : `Alert ${alertId}: ${body.status}.`,
+              ? `Order blocked by safety gate: ${(body.reasons || []).join('; ')}`
+              : `Alert ${alertId}: ${body.status}.`,
       });
       await fetchDeployments();
     } catch (err) {
@@ -104,50 +118,68 @@ export function DeploymentsConsole({ onGoToStrategies }: Props) {
   const deployments = data?.deployments || [];
   const filtered = deployments.filter((d) => {
     if (tab === 'paper') return d.exec_mode === 'paper';
-    if (tab === 'live') return d.exec_mode !== 'paper';
+    if (tab === 'live_alert') return d.exec_mode === 'live_alert';
+    if (tab === 'live_auto') return d.exec_mode === 'live_auto';
     return true;
   });
   const pendingAlerts = data?.pending_alerts || [];
   const allAlerts = data?.alerts || [];
 
+  const nbtCount = deployments.filter((d) => d.exec_mode === 'live_alert').length;
+  const paperCount = deployments.filter((d) => d.exec_mode === 'paper').length;
+  const autoCount = deployments.filter((d) => d.exec_mode === 'live_auto').length;
+
   return (
-    <div className="space-y-6">
-      <div className="flex flex-wrap items-end justify-between gap-4">
+    <div className="space-y-5">
+      {/* Header matching Streak Live Strategy.png */}
+      <div className="flex flex-wrap items-center justify-between gap-4">
         <div>
-          <h1 className="text-xl font-bold tracking-tight text-slate-100">Deployed Strategies (Paper &amp; Live)</h1>
-          <p className="text-sm text-slate-400">
-            Real-time MTM tracking over shared Broker WebSocket, 1-click actionable order alerts, and Kill-Switch / Risk-Limit gated live execution.
+          <h1 className="text-xl font-bold tracking-tight text-slate-100">Live Strategies</h1>
+          <p className="mt-0.5 text-xs text-slate-400">
+            Real-time MTM tracking across Notification Based Trading (1-click), Paper Trading, and Gated Auto-Execute deployments.
           </p>
         </div>
         <div className="flex items-center gap-2">
           <button
             type="button"
             onClick={() => void fetchDeployments()}
-            className="inline-flex h-9 items-center gap-1.5 rounded-lg border border-slate-700 px-3 text-xs font-semibold text-slate-200 hover:bg-slate-800"
+            className="inline-flex min-h-[36px] items-center gap-1.5 rounded-lg border border-slate-700 bg-[#111827] px-3 text-xs font-semibold text-slate-200 hover:border-sky-400"
           >
             <RefreshCw className="h-3.5 w-3.5" />
-            Refresh
+            <span>Refresh</span>
           </button>
           <button
             type="button"
             onClick={onGoToStrategies}
-            className="inline-flex h-9 items-center gap-1.5 rounded-lg bg-sky-400 px-4 text-xs font-semibold text-sky-950 hover:bg-sky-300"
+            className="inline-flex min-h-[36px] items-center gap-1.5 rounded-lg bg-sky-500 px-4 text-xs font-semibold text-slate-950 hover:bg-sky-400"
           >
-            Deploy New Strategy
+            <Compass className="h-3.5 w-3.5" />
+            <span>Go to Discover Strategies</span>
           </button>
         </div>
       </div>
 
       {data?.kill_switch?.engaged && (
-        <div className="flex items-center gap-3 rounded-xl border border-red-800/80 bg-red-950/40 px-4 py-3 text-xs text-red-200">
-          <ShieldAlert className="h-4 w-4 shrink-0 text-red-400" />
-          <span>
-            <strong>Emergency Kill Switch ENGAGED</strong> — All Live Auto-Execute and 1-Click Live Order dispatches are blocked until reset in Connections &amp; Risk.
-          </span>
+        <div className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-red-800/80 bg-red-950/40 px-4 py-3 text-xs text-red-200">
+          <div className="flex items-center gap-2.5">
+            <ShieldAlert className="h-4 w-4 shrink-0 text-red-400" />
+            <span>
+              <strong>Emergency Kill Switch ENGAGED</strong> — All Live Auto-Execute and 1-Click Live Order dispatches are halted.
+            </span>
+          </div>
+          {onGoToRisk && (
+            <button
+              type="button"
+              onClick={onGoToRisk}
+              className="rounded-md border border-red-700 px-3 py-1 font-semibold text-red-200 hover:bg-red-900/50"
+            >
+              Open Risk Limits
+            </button>
+          )}
         </div>
       )}
 
-      {/* KPI Summary */}
+      {/* KPI Strip */}
       <div className="grid grid-cols-2 gap-3 md:grid-cols-5">
         <div className="rounded-xl border border-slate-800 bg-[#111827] p-4">
           <p className="text-[11px] uppercase tracking-wider text-slate-500">Running / Total</p>
@@ -157,64 +189,88 @@ export function DeploymentsConsole({ onGoToStrategies }: Props) {
         </div>
         <div className="rounded-xl border border-slate-800 bg-[#111827] p-4">
           <p className="text-[11px] uppercase tracking-wider text-slate-500">Paper Net P&amp;L</p>
-          <p className={`mt-1 font-mono text-lg font-bold tabular-nums ${(data?.summary.paper_net_pnl ?? 0) >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+          <p
+            className={`mt-1 font-mono text-lg font-bold tabular-nums ${
+              (data?.summary.paper_net_pnl ?? 0) >= 0 ? 'text-emerald-400' : 'text-red-400'
+            }`}
+          >
             {fmtInr(data?.summary.paper_net_pnl ?? 0)}
           </p>
         </div>
         <div className="rounded-xl border border-slate-800 bg-[#111827] p-4">
           <p className="text-[11px] uppercase tracking-wider text-slate-500">Live Net P&amp;L</p>
-          <p className={`mt-1 font-mono text-lg font-bold tabular-nums ${(data?.summary.live_net_pnl ?? 0) >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
+          <p
+            className={`mt-1 font-mono text-lg font-bold tabular-nums ${
+              (data?.summary.live_net_pnl ?? 0) >= 0 ? 'text-emerald-400' : 'text-red-400'
+            }`}
+          >
             {fmtInr(data?.summary.live_net_pnl ?? 0)}
           </p>
         </div>
         <div className="rounded-xl border border-slate-800 bg-[#111827] p-4">
           <p className="text-[11px] uppercase tracking-wider text-slate-500">Charges Accrued</p>
-          <p className="mt-1 font-mono text-lg font-semibold text-amber-300 tabular-nums">{fmtInr(data?.summary.total_charges ?? 0)}</p>
+          <p className="mt-1 font-mono text-lg font-semibold text-amber-300 tabular-nums">
+            {fmtInr(data?.summary.total_charges ?? 0)}
+          </p>
         </div>
         <div className="rounded-xl border border-slate-800 bg-[#111827] p-4">
           <p className="text-[11px] uppercase tracking-wider text-slate-500">Pending 1-Click Alerts</p>
-          <p className={`mt-1 font-mono text-lg font-bold tabular-nums ${pendingAlerts.length > 0 ? 'text-sky-400' : 'text-slate-400'}`}>
+          <p
+            className={`mt-1 font-mono text-lg font-bold tabular-nums ${
+              pendingAlerts.length > 0 ? 'text-sky-400' : 'text-slate-400'
+            }`}
+          >
             {pendingAlerts.length}
           </p>
         </div>
       </div>
 
-      {/* Pending 1-Click Actionable Alerts Banner */}
+      {/* Pending 1-Click Actionable Alerts Queue */}
       {pendingAlerts.length > 0 && (
-        <div className="rounded-xl border border-sky-500/40 bg-[#111827] p-4 space-y-3">
-          <h3 className="text-xs font-semibold uppercase tracking-wider text-sky-300">
-            Action Required — Pending 1-Click Live Order Alerts ({pendingAlerts.length})
-          </h3>
+        <div className="space-y-3 rounded-xl border border-sky-500/40 bg-[#111827] p-4">
+          <div className="flex items-center gap-2 text-xs font-semibold uppercase tracking-wider text-sky-300">
+            <Bell className="h-3.5 w-3.5" />
+            <span>Action Required — Pending 1-Click Order Alerts ({pendingAlerts.length})</span>
+          </div>
           <div className="space-y-2">
             {pendingAlerts.map((a: ActionableAlert) => (
-              <div key={a.id} className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-slate-800 bg-[#0b1120] px-4 py-3">
+              <div
+                key={a.id}
+                className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-slate-800 bg-[#0b1120] px-4 py-3"
+              >
                 <div className="space-y-0.5">
-                  <div className="flex items-center gap-2 text-xs font-semibold">
+                  <div className="flex flex-wrap items-center gap-2 text-xs font-semibold">
                     <span className={a.side === 'BUY' ? 'text-emerald-400' : 'text-red-400'}>{a.side}</span>
-                    <span className="font-mono text-slate-100">{a.qty} × {a.symbol}</span>
+                    <span className="font-mono text-slate-100">
+                      {a.qty} × {a.symbol}
+                    </span>
                     <span className="font-mono text-slate-300">@ ₹{a.signal_price}</span>
-                    <span className="text-slate-500">· {a.product} · {a.deployment_name}</span>
+                    <span className="text-slate-500">
+                      · {a.product} · {a.deployment_name}
+                    </span>
                   </div>
-                  <p className="text-[11px] text-slate-500">{a.reason} · {a.created_at_ist}</p>
+                  <p className="text-[11px] text-slate-500">
+                    {a.reason} · {a.created_at_ist}
+                  </p>
                 </div>
                 <div className="flex items-center gap-2">
                   <button
                     type="button"
                     disabled={busyId === a.id}
                     onClick={() => void handleAlertAction(a.id, 'execute')}
-                    className="inline-flex h-8 items-center gap-1.5 rounded-md bg-emerald-500/20 px-3 text-xs font-semibold text-emerald-300 hover:bg-emerald-500/30 disabled:opacity-50"
+                    className="inline-flex h-8 items-center gap-1.5 rounded-md bg-emerald-500 px-3 text-xs font-semibold text-slate-950 hover:bg-emerald-400 disabled:opacity-50"
                   >
                     <CheckCircle2 className="h-3.5 w-3.5" />
-                    Execute Order
+                    <span>Execute Order</span>
                   </button>
                   <button
                     type="button"
                     disabled={busyId === a.id}
                     onClick={() => void handleAlertAction(a.id, 'dismiss')}
-                    className="inline-flex h-8 items-center gap-1.5 rounded-md border border-slate-700 px-3 text-xs font-semibold text-slate-400 hover:bg-slate-800 hover:text-slate-200 disabled:opacity-50"
+                    className="inline-flex h-8 items-center gap-1.5 rounded-md border border-slate-700 px-3 text-xs font-semibold text-slate-300 hover:bg-slate-800 disabled:opacity-50"
                   >
                     <XCircle className="h-3.5 w-3.5" />
-                    Dismiss
+                    <span>Dismiss</span>
                   </button>
                 </div>
               </div>
@@ -224,22 +280,33 @@ export function DeploymentsConsole({ onGoToStrategies }: Props) {
       )}
 
       {feedback && (
-        <p className={`text-xs ${feedback.ok ? 'text-emerald-400' : 'text-red-400'}`}>{feedback.text}</p>
+        <div
+          className={`rounded-lg border px-4 py-2 text-xs ${
+            feedback.ok
+              ? 'border-emerald-800/70 bg-emerald-950/30 text-emerald-300'
+              : 'border-red-900/70 bg-red-950/30 text-red-300'
+          }`}
+        >
+          {feedback.text}
+        </div>
       )}
 
-      {/* Filter Tabs */}
-      <div className="flex items-center gap-2 border-b border-slate-800 pb-2 text-xs">
-        {([
-          ['all', `All Deployments (${deployments.length})`],
-          ['paper', `Paper Trade (${data?.summary.paper_count ?? 0})`],
-          ['live', `Live Trade (${data?.summary.live_count ?? 0})`],
-          ['alerts', `Alert Log (${allAlerts.length})`],
-        ] as const).map(([id, label]) => (
+      {/* Streak Live Strategy Tabs */}
+      <div className="flex flex-wrap items-center gap-1.5 border-b border-slate-800 pb-2 text-xs">
+        {(
+          [
+            ['all', `All (${deployments.length})`],
+            ['live_alert', `Notification Based Trading (${nbtCount})`],
+            ['paper', `Paper Trading (${paperCount})`],
+            ['live_auto', `Gated Auto-Execute (${autoCount})`],
+            ['alerts', `Alert Log (${allAlerts.length})`],
+          ] as const
+        ).map(([id, label]) => (
           <button
             key={id}
             type="button"
             onClick={() => setTab(id)}
-            className={`rounded-md px-3 py-1.5 font-semibold ${
+            className={`min-h-[32px] rounded-md px-3 font-semibold transition-colors ${
               tab === id ? 'bg-sky-500/20 text-sky-300' : 'text-slate-400 hover:text-slate-200'
             }`}
           >
@@ -249,9 +316,9 @@ export function DeploymentsConsole({ onGoToStrategies }: Props) {
       </div>
 
       {tab === 'alerts' ? (
-        <div className="rounded-xl border border-slate-800 bg-[#111827] p-4 overflow-x-auto">
+        <div className="overflow-x-auto rounded-xl border border-slate-800 bg-[#111827] p-4">
           {allAlerts.length === 0 ? (
-            <p className="py-6 text-center text-xs text-slate-500">No actionable alerts recorded yet.</p>
+            <p className="py-8 text-center text-xs text-slate-500">No actionable alerts recorded yet.</p>
           ) : (
             <table className="w-full text-xs">
               <thead className="border-b border-slate-800 text-[11px] uppercase text-slate-500">
@@ -260,7 +327,7 @@ export function DeploymentsConsole({ onGoToStrategies }: Props) {
                   <th className="py-2 text-left">Deployment</th>
                   <th className="py-2 text-left">Order</th>
                   <th className="py-2 text-right">Signal ₹</th>
-                  <th className="py-2 text-left pl-3">Status</th>
+                  <th className="py-2 pl-3 text-left">Status</th>
                   <th className="py-2 text-left">Note</th>
                 </tr>
               </thead>
@@ -270,7 +337,8 @@ export function DeploymentsConsole({ onGoToStrategies }: Props) {
                     <td className="py-2 text-slate-400">{a.created_at_ist.slice(11, 19)}</td>
                     <td className="py-2 font-sans text-slate-200">{a.deployment_name}</td>
                     <td className="py-2">
-                      <span className={a.side === 'BUY' ? 'text-emerald-400' : 'text-red-400'}>{a.side}</span> {a.qty} {a.symbol}
+                      <span className={a.side === 'BUY' ? 'text-emerald-400' : 'text-red-400'}>{a.side}</span> {a.qty}{' '}
+                      {a.symbol}
                     </td>
                     <td className="py-2 text-right text-slate-200">{a.signal_price}</td>
                     <td className="py-2 pl-3 font-sans font-semibold text-slate-300">{a.status}</td>
@@ -281,85 +349,200 @@ export function DeploymentsConsole({ onGoToStrategies }: Props) {
             </table>
           )}
         </div>
-      ) : filtered.length === 0 ? (
-        <div className="rounded-xl border border-slate-800 bg-[#111827] p-10 text-center space-y-3">
-          <p className="text-sm text-slate-300">No strategies deployed in this view yet.</p>
-          <p className="text-xs text-slate-500">
-            Run a backtest in <strong>Strategies &amp; Backtest</strong> and click <strong>Deploy Strategy</strong> to promote it into Paper Trade or Live Trade.
-          </p>
-        </div>
       ) : (
-        <div className="space-y-4">
-          {filtered.map((d: DeploymentRecord) => (
-            <div key={d.id} className="rounded-xl border border-slate-800 bg-[#111827] p-5 space-y-4">
-              <div className="flex flex-wrap items-start justify-between gap-3">
-                <div className="space-y-1">
-                  <div className="flex flex-wrap items-center gap-2">
-                    <h3 className="text-sm font-bold text-slate-100">{d.name}</h3>
-                    <span className="font-mono text-[11px] text-slate-400">
-                      · {d.exec_mode.replace('_', ' ').toUpperCase()} · {d.status} · {d.strategy_mode} · {d.timeframe} · {d.charges_profile.toUpperCase()}
-                    </span>
-                  </div>
-                  <p className="font-mono text-xs text-slate-500">
-                    {d.symbols.join(', ')} · SL {d.stop_loss_pct}% · TP {d.take_profit_pct}%{d.trailing_sl_pct > 0 ? ` · TSL ${d.trailing_sl_pct}%` : ''}
-                  </p>
-                  {d.last_note && <p className="text-xs text-slate-400">{d.last_note}</p>}
-                </div>
-
-                <div className="flex flex-wrap items-center gap-1.5">
-                  {d.status === 'RUNNING' ? (
-                    <button type="button" disabled={busyId === d.id} onClick={() => void handleControl(d.id, 'pause')} className="inline-flex h-8 items-center gap-1 rounded border border-slate-700 px-2.5 text-xs text-slate-200 hover:bg-slate-800">
-                      <Pause className="h-3 w-3" /> Pause
-                    </button>
-                  ) : d.status === 'PAUSED' ? (
-                    <button type="button" disabled={busyId === d.id} onClick={() => void handleControl(d.id, 'resume')} className="inline-flex h-8 items-center gap-1 rounded border border-sky-500/40 bg-sky-500/10 px-2.5 text-xs text-sky-300 hover:bg-sky-500/20">
-                      <Play className="h-3 w-3" /> Resume
-                    </button>
-                  ) : null}
-                  {d.open_positions_count > 0 && (
-                    <button type="button" disabled={busyId === d.id} onClick={() => void handleControl(d.id, 'square_off')} className="inline-flex h-8 items-center gap-1 rounded border border-amber-500/40 bg-amber-500/10 px-2.5 text-xs text-amber-300 hover:bg-amber-500/20">
-                      <LogOut className="h-3 w-3" /> Square-Off
-                    </button>
-                  )}
-                  {d.status !== 'STOPPED' && (
-                    <button type="button" disabled={busyId === d.id} onClick={() => void handleControl(d.id, 'stop')} className="inline-flex h-8 items-center gap-1 rounded border border-red-500/40 bg-red-500/10 px-2.5 text-xs text-red-300 hover:bg-red-500/20">
-                      <Square className="h-3 w-3" /> Stop
-                    </button>
-                  )}
-                  <button type="button" disabled={busyId === d.id} onClick={() => void handleControl(d.id, 'delete')} className="inline-flex h-8 items-center rounded border border-slate-800 px-2 text-slate-500 hover:text-red-400" title="Remove deployment">
-                    <Trash2 className="h-3.5 w-3.5" />
-                  </button>
-                </div>
-              </div>
-
-              <div className="grid grid-cols-2 gap-3 border-t border-slate-800 pt-3 sm:grid-cols-6 font-mono text-xs tabular-nums">
-                <div><span className="block font-sans text-[11px] text-slate-500">Capital</span><span className="text-slate-200">{fmtInr(d.initial_capital)}</span></div>
-                <div><span className="block font-sans text-[11px] text-slate-500">Equity</span><span className="text-slate-100 font-semibold">{fmtInr(d.equity)}</span></div>
-                <div><span className="block font-sans text-[11px] text-slate-500">Realized</span><span className={d.realized_pnl >= 0 ? 'text-emerald-400' : 'text-red-400'}>{fmtInr(d.realized_pnl)}</span></div>
-                <div><span className="block font-sans text-[11px] text-slate-500">Unrealized MTM</span><span className={d.unrealized_pnl >= 0 ? 'text-emerald-400' : 'text-red-400'}>{fmtInr(d.unrealized_pnl)}</span></div>
-                <div><span className="block font-sans text-[11px] text-slate-500">Charges</span><span className="text-amber-300">{fmtInr(d.total_charges)}</span></div>
-                <div><span className="block font-sans text-[11px] text-slate-500">Net P&amp;L</span><span className={`font-bold ${d.net_pnl >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>{fmtInr(d.net_pnl)} ({d.return_pct}%)</span></div>
-              </div>
-
-              {d.positions.length > 0 && (
-                <div className="rounded-lg border border-slate-800 bg-[#0b1120] p-3">
-                  <p className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-slate-500">Open Positions ({d.positions.length})</p>
-                  <div className="grid grid-cols-1 gap-1.5 font-mono text-xs tabular-nums sm:grid-cols-2">
-                    {d.positions.map((p) => {
-                      const mtm = (p.last_price - p.entry_price) * p.qty;
-                      return (
-                        <div key={p.symbol} className="flex items-center justify-between rounded bg-[#111827] px-3 py-1.5">
-                          <span className="font-sans font-semibold text-slate-200">{p.symbol} × {p.qty}</span>
-                          <span className="text-slate-400">Avg ₹{p.entry_price} · LTP ₹{p.last_price}</span>
-                          <span className={mtm >= 0 ? 'text-emerald-400' : 'text-red-400'}>{fmtInr(mtm)}</span>
+        <div className="overflow-hidden rounded-xl border border-slate-800 bg-[#111827]">
+          <div className="overflow-x-auto">
+            <table className="w-full border-collapse text-left text-xs">
+              <thead className="border-b border-slate-800 bg-[#0b1120] text-[11px] font-semibold uppercase tracking-wide text-slate-400">
+                <tr>
+                  <th className="px-4 py-3">Strategy / Instrument</th>
+                  <th className="px-3 py-3 text-right">Avg. Price</th>
+                  <th className="px-3 py-3 text-right">LTP</th>
+                  <th className="px-3 py-3 text-right">TP</th>
+                  <th className="px-3 py-3 text-right">SL</th>
+                  <th className="px-3 py-3 text-right">P&amp;L</th>
+                  <th className="px-3 py-3 text-right">Net Change</th>
+                  <th className="px-3 py-3">Status / Mode</th>
+                  <th className="px-4 py-3 text-right">Controls / Log</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-800/70">
+                {filtered.length === 0 ? (
+                  <tr>
+                    <td colSpan={9} className="px-6 py-16 text-center">
+                      <div className="mx-auto max-w-sm space-y-2.5">
+                        <p className="text-sm font-semibold text-slate-200">No Strategies Deployed</p>
+                        <p className="text-xs text-slate-400">
+                          Backtest a strategy in Discover Strategies or Create Strategy, then click Notification Based Trading to take it live.
+                        </p>
+                        <div className="pt-2">
+                          <button
+                            type="button"
+                            onClick={onGoToStrategies}
+                            className="inline-flex min-h-[36px] items-center gap-1.5 rounded-lg bg-sky-500 px-4 text-xs font-semibold text-slate-950 hover:bg-sky-400"
+                          >
+                            Go to Discover Strategies
+                          </button>
                         </div>
-                      );
-                    })}
-                  </div>
-                </div>
-              )}
-            </div>
-          ))}
+                      </div>
+                    </td>
+                  </tr>
+                ) : (
+                  filtered.map((d: DeploymentRecord) => {
+                    const primaryPos = d.positions?.[0];
+                    const isLogOpen = expandedLogId === d.id;
+                    return (
+                      <tr key={d.id} className="align-top hover:bg-slate-800/35">
+                        <td className="px-4 py-3">
+                          <div className="font-semibold text-slate-100">{d.name}</div>
+                          <div className="mt-0.5 font-mono text-[11px] text-slate-400">
+                            {d.symbols.slice(0, 4).join(', ')}
+                            {d.symbols.length > 4 ? ` +${d.symbols.length - 4}` : ''} · {d.timeframe} ·{' '}
+                            {d.strategy_mode}
+                          </div>
+                          {isLogOpen && (
+                            <div className="mt-2.5 space-y-1 rounded-lg border border-slate-800 bg-[#0b1120] p-2.5 font-mono text-[11px] text-slate-300">
+                              <div>
+                                Capital: {fmtInr(d.initial_capital)} · Equity: {fmtInr(d.equity)} · Charges:{' '}
+                                {fmtInr(d.total_charges)}
+                              </div>
+                              {d.last_note && <div className="text-slate-400">Note: {d.last_note}</div>}
+                              {d.positions.length > 0 && (
+                                <div className="pt-1">
+                                  {d.positions.map((p) => (
+                                    <div key={p.symbol} className="text-sky-300">
+                                      OPEN {p.symbol} × {p.qty} @ ₹{p.entry_price} (LTP ₹{p.last_price})
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
+                              {d.trades.slice(-3).map((t) => (
+                                <div key={t.id} className="text-slate-400">
+                                  {t.executed_at_ist.slice(11, 19)} {t.side} {t.symbol} × {t.qty} · {t.reason} ·{' '}
+                                  {fmtInr(t.net_pnl)}
+                                </div>
+                              ))}
+                            </div>
+                          )}
+                        </td>
+                        <td className="px-3 py-3 text-right font-mono text-slate-300 tabular-nums">
+                          {primaryPos ? `₹${primaryPos.entry_price.toFixed(2)}` : '—'}
+                        </td>
+                        <td className="px-3 py-3 text-right font-mono text-slate-100 tabular-nums">
+                          {primaryPos ? `₹${primaryPos.last_price.toFixed(2)}` : '—'}
+                        </td>
+                        <td className="px-3 py-3 text-right font-mono text-emerald-400 tabular-nums">
+                          {d.take_profit_pct}%
+                        </td>
+                        <td className="px-3 py-3 text-right font-mono text-red-400 tabular-nums">
+                          {d.stop_loss_pct}%
+                        </td>
+                        <td
+                          className={`px-3 py-3 text-right font-mono font-semibold tabular-nums ${
+                            d.net_pnl >= 0 ? 'text-emerald-400' : 'text-red-400'
+                          }`}
+                        >
+                          {d.net_pnl >= 0 ? '+' : ''}
+                          {fmtInr(d.net_pnl)}
+                        </td>
+                        <td
+                          className={`px-3 py-3 text-right font-mono font-semibold tabular-nums ${
+                            d.return_pct >= 0 ? 'text-emerald-400' : 'text-red-400'
+                          }`}
+                        >
+                          {d.return_pct >= 0 ? '+' : ''}
+                          {d.return_pct.toFixed(2)}%
+                        </td>
+                        <td className="px-3 py-3 font-mono text-[11px]">
+                          <div
+                            className={
+                              d.status === 'RUNNING'
+                                ? 'font-semibold text-emerald-400'
+                                : d.status === 'PAUSED'
+                                  ? 'font-semibold text-amber-400'
+                                  : 'text-slate-400'
+                            }
+                          >
+                            {d.status}
+                          </div>
+                          <div className="text-[10px] text-slate-500">
+                            {d.exec_mode === 'live_alert'
+                              ? '1-Click Alerts'
+                              : d.exec_mode === 'live_auto'
+                                ? 'Gated Auto'
+                                : 'Paper'}
+                          </div>
+                        </td>
+                        <td className="px-4 py-3 text-right">
+                          <div className="inline-flex items-center gap-1">
+                            {d.status === 'RUNNING' ? (
+                              <button
+                                type="button"
+                                disabled={busyId === d.id}
+                                onClick={() => void handleControl(d.id, 'pause')}
+                                title="Pause"
+                                className="rounded border border-slate-700 p-1.5 text-slate-300 hover:border-amber-400"
+                              >
+                                <Pause className="h-3.5 w-3.5" />
+                              </button>
+                            ) : d.status === 'PAUSED' ? (
+                              <button
+                                type="button"
+                                disabled={busyId === d.id}
+                                onClick={() => void handleControl(d.id, 'resume')}
+                                title="Resume"
+                                className="rounded border border-sky-700/70 p-1.5 text-sky-300 hover:border-sky-400"
+                              >
+                                <Play className="h-3.5 w-3.5" />
+                              </button>
+                            ) : null}
+                            {d.open_positions_count > 0 && (
+                              <button
+                                type="button"
+                                disabled={busyId === d.id}
+                                onClick={() => void handleControl(d.id, 'square_off')}
+                                title="Square-off positions"
+                                className="rounded border border-amber-700/70 p-1.5 text-amber-300 hover:border-amber-400"
+                              >
+                                <LogOut className="h-3.5 w-3.5" />
+                              </button>
+                            )}
+                            {d.status !== 'STOPPED' && (
+                              <button
+                                type="button"
+                                disabled={busyId === d.id}
+                                onClick={() => void handleControl(d.id, 'stop')}
+                                title="Stop deployment"
+                                className="rounded border border-red-800/70 p-1.5 text-red-400 hover:border-red-500"
+                              >
+                                <Square className="h-3.5 w-3.5" />
+                              </button>
+                            )}
+                            <button
+                              type="button"
+                              onClick={() => setExpandedLogId(isLogOpen ? null : d.id)}
+                              className="rounded border border-slate-700 px-2 py-1 text-[11px] font-medium text-sky-300 hover:border-sky-400"
+                            >
+                              {isLogOpen ? 'Hide' : 'Log'}
+                            </button>
+                            <button
+                              type="button"
+                              disabled={busyId === d.id}
+                              onClick={() => void handleControl(d.id, 'delete')}
+                              title="Remove deployment"
+                              className="rounded border border-slate-800 p-1.5 text-slate-500 hover:text-red-400"
+                            >
+                              <Trash2 className="h-3.5 w-3.5" />
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })
+                )}
+              </tbody>
+            </table>
+          </div>
         </div>
       )}
     </div>
