@@ -80,7 +80,7 @@ export function RiskLimitsView() {
     try {
       const [riskRes, ksRes] = await Promise.all([
         fetch('/api/analytics/risk'),
-        fetch('/api/live/kill-switch'),
+        fetch('/api/live/status'),
       ]);
       const riskBody = (await riskRes.json().catch(() => ({}))) as RiskApiPayload;
       const ksBody = await ksRes.json().catch(() => ({}));
@@ -96,8 +96,8 @@ export function RiskLimitsView() {
       }));
       setMetrics(riskBody.metrics || {});
       setBreaches(Array.isArray(riskBody.breaches) ? riskBody.breaches : []);
-      if (ksBody.kill_switch || typeof ksBody.engaged === 'boolean') {
-        const ks = ksBody.kill_switch || ksBody;
+      const ks = ksBody.kill_switch || (typeof ksBody.engaged === 'boolean' ? ksBody : null);
+      if (ks) {
         setKillSwitch({ engaged: Boolean(ks.engaged), reason: ks.reason });
       }
     } catch {

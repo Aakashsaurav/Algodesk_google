@@ -149,7 +149,7 @@ export interface StreakMetaPayload {
   strategy_specs: StrategySpecMeta[];
   universes: UniverseMeta[];
   timeframes: Array<{ id: string; label: string; base: string; resampled: boolean }>;
-  indicator_backends: string[];
+  indicator_backends: Record<string, { available?: boolean; version?: string; label?: string }> | string[];
   charge_presets: {
     segments: Array<{ id: string; label: string }>;
     profiles: Record<string, Record<string, ChargesConfigPreset>>;

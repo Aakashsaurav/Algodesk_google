@@ -68,7 +68,7 @@ export function CreateScannerView({
   const [name, setName] = useState('Untitled Scanner');
   const [description, setDescription] = useState('');
   const [mode, setMode] = useState<BuilderEngineMode>('basic');
-  const [scanOnKey, setScanOnKey] = useState('universe:nifty50');
+  const [scanOnKey, setScanOnKey] = useState('universe:DEFAULT_WATCHLIST');
   const [customSymbolsText, setCustomSymbolsText] = useState('');
   const [chartType, setChartType] = useState<'candlestick' | 'heikin_ashi'>('candlestick');
   const [timeframe, setTimeframe] = useState('1day');
@@ -156,13 +156,12 @@ export function CreateScannerView({
       wsRef.current = null;
     }
     if (liveSessionId) {
-      const sid = liveSessionId;
       setLiveSessionId(null);
       setLiveStatusText('');
-      await fetch('/api/screener/live/stop', {
+      await fetch('/api/analytics/live-screener/stop', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ session_id: sid }),
+        body: JSON.stringify({}),
       }).catch(() => {});
     }
   }, [liveSessionId]);
@@ -188,9 +187,9 @@ export function CreateScannerView({
       return { universe: 'custom', symbols: syms, basket_id: undefined };
     }
     if (scanOnKey.startsWith('basket:')) {
-      return { universe: 'nifty50', symbols: undefined, basket_id: scanOnKey.slice(7) };
+      return { universe: 'DEFAULT_WATCHLIST', symbols: undefined, basket_id: scanOnKey.slice(7) };
     }
-    return { universe: scanOnKey.replace(/^universe:/, '') || 'nifty50', symbols: undefined, basket_id: undefined };
+    return { universe: scanOnKey.replace(/^universe:/, '') || 'DEFAULT_WATCHLIST', symbols: undefined, basket_id: undefined };
   };
 
   const buildVisualRuleDef = (): VisualRuleDef => ({
@@ -200,7 +199,7 @@ export function CreateScannerView({
     builder_mode: mode === 'advance' ? 'advance' : 'basic',
     name: name.trim() || 'Untitled Scanner',
     description: description.trim() || 'Custom visual scanner',
-    universe: scanOnKey.startsWith('universe:') ? scanOnKey.slice(9) : 'nifty50',
+    universe: scanOnKey.startsWith('universe:') ? scanOnKey.slice(9) : 'DEFAULT_WATCHLIST',
     basket_id: scanOnKey.startsWith('basket:') ? scanOnKey.slice(7) : undefined,
     timeframe,
     chart_type: chartType,
@@ -224,10 +223,8 @@ export function CreateScannerView({
         symbols: target.symbols,
         exchange: 'NSE',
         timeframe,
-        chart_type: chartType,
-        indicator_backend: indicatorBackend,
-        only_matched: true,
-        as_of_date: scanDateMode === 'as_of' ? asOfDate : '',
+        backend: indicatorBackend,
+        as_of_date: scanDateMode === 'as_of' ? asOfDate : undefined,
       };
       if (mode === 'python') {
         payload.params = pythonParams;
@@ -238,7 +235,7 @@ export function CreateScannerView({
       } else {
         payload.rule_def = buildVisualRuleDef();
       }
-      const res = await fetch('/api/screener/run', {
+      const res = await fetch('/api/analytics/screener', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
@@ -272,7 +269,7 @@ export function CreateScannerView({
     setLiveStatusText('Starting live WebSocket scanner...');
     try {
       const target = buildScanTarget();
-      const res = await fetch('/api/screener/live/start', {
+      const res = await fetch('/api/analytics/live-screener/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -284,31 +281,33 @@ export function CreateScannerView({
           symbols: target.symbols,
           exchange: 'NSE',
           timeframe,
-          indicator_backend: indicatorBackend,
-          only_matched: true,
+          backend: indicatorBackend,
         }),
       });
       const body = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(body.detail || 'Live WebSocket failed to start.');
-      const sid = body.session_id as string;
+      const sid = String(body.session_id || 'active');
       setLiveSessionId(sid);
       const initRows = Array.isArray(body.results) ? body.results : Array.isArray(body.rows) ? body.rows : null;
       if (initRows) setRows(initRows);
       if (Array.isArray(body.columns)) setColumns(body.columns);
 
       const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const ws = new WebSocket(`${proto}//${window.location.host}/ws/live-screener?session_id=${encodeURIComponent(sid)}`);
+      const ws = new WebSocket(`${proto}//${window.location.host}/ws/live-screener`);
       wsRef.current = ws;
       ws.onmessage = (evt) => {
         try {
           const msg = JSON.parse(evt.data);
           const snapRows = Array.isArray(msg.results) ? msg.results : Array.isArray(msg.rows) ? msg.rows : null;
-          if ((msg.type === 'snapshot' || msg.type === 'update') && snapRows) {
-            if (msg.type === 'update') setLiveTickCount((c) => c + 1);
+          if (
+            (msg.type === 'snapshot' || msg.type === 'update' || msg.type === 'live_screen:state' || msg.type === 'live_screen:snapshot') &&
+            snapRows
+          ) {
+            if (msg.type === 'update' || msg.type === 'live_screen:state') setLiveTickCount((c) => c + 1);
             setRows(snapRows);
-            setScannedAt(msg.ts_ist || msg.updated_at_ist || new Date().toISOString());
+            setScannedAt(msg.ts_ist || msg.updated_at_ist || msg.last_tick_at || new Date().toISOString());
             setLiveStatusText(`Live WS active · ${msg.feed_mode || msg.source || 'streaming'}`);
-          } else if (msg.type === 'tick' && msg.row) {
+          } else if ((msg.type === 'tick' || msg.type === 'live_screen:tick') && msg.row) {
             setLiveTickCount((c) => c + 1);
             const updated = msg.row as ScannerResultRow;
             setRows((prev) => {
@@ -373,11 +372,11 @@ export function CreateScannerView({
       const res = await fetch('/api/streak/rules/export-python', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ rule_id: saved.id }),
+        body: JSON.stringify({ rule_def: saved, save_to_disk: true }),
       });
       const body = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(body.detail || 'Export to .py failed.');
-      setNotice(`Exported Python screen: ${body.file || body.module_id}`);
+      setNotice(`Exported Python screen: ${body.saved_path || body.filename || body.file || body.module_id || 'saved'}`);
       onRefreshMeta();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Export failed.');
@@ -422,13 +421,19 @@ export function CreateScannerView({
   const handleSyncNse = async () => {
     setSyncingNse(true);
     try {
-      await fetch('/api/screener/sync-universes', { method: 'POST' });
+      await fetch('/api/analytics/universes/sync', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
       onRefreshMeta();
       setNotice('Synced NSE Index constituents.');
     } finally {
       setSyncingNse(false);
     }
   };
+
+  const backendOptions = useMemo(() => {
+    const raw = meta.indicator_backends;
+    const keys = Array.isArray(raw) ? raw : raw && typeof raw === 'object' ? Object.keys(raw) : ['builtin'];
+    return ['auto', ...keys].filter((v, i, arr) => arr.indexOf(v) === i);
+  }, [meta.indicator_backends]);
 
   const mySavedScanners = useMemo(
     () => (meta.visual_rules || []).filter((r) => r.kind === 'screen'),
@@ -606,7 +611,7 @@ export function CreateScannerView({
                   onChange={(e) => setIndicatorBackend(e.target.value)}
                   className="min-h-[32px] w-full rounded-md border border-slate-700 bg-[#111827] px-2.5 text-xs text-slate-200 focus:border-sky-400 focus:outline-none"
                 >
-                  {(meta.indicator_backends || ['auto', 'builtin']).map((b) => (
+                  {backendOptions.map((b) => (
                     <option key={b} value={b}>
                       {b === 'auto' ? 'Auto (TA-Lib -> pandas-ta -> O(N))' : b}
                     </option>

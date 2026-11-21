@@ -162,7 +162,7 @@ export function DiscoverStrategiesView({
         charges_profile: 'zerodha',
         segment: item.segment,
       };
-      const res = await fetch('/api/streak/backtest/run', {
+      const res = await fetch('/api/streak/backtest', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),

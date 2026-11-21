@@ -274,11 +274,11 @@ export function CreateStrategyView({
       const res = await fetch('/api/streak/rules/export-python', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ rule_id: saved.id }),
+        body: JSON.stringify({ rule_def: saved, save_to_disk: true }),
       });
       const body = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(body.detail || 'Export failed.');
-      setNotice(`Exported Python strategy: ${body.file || body.module_id}`);
+      setNotice(`Exported Python strategy: ${body.saved_path || body.filename || body.file || body.module_id || 'saved'}`);
       onRefreshMeta();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Export failed.');
@@ -321,7 +321,7 @@ export function CreateStrategyView({
         charges_profile: chargesProfile,
         segment,
       };
-      const res = await fetch('/api/streak/backtest/run', {
+      const res = await fetch('/api/streak/backtest', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),

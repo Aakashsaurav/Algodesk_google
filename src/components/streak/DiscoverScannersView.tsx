@@ -108,7 +108,7 @@ export function DiscoverScannersView({
 }: DiscoverScannersViewProps) {
   const [search, setSearch] = useState('');
   const [activeTab, setActiveTab] = useState('all');
-  const [scanOnKey, setScanOnKey] = useState<string>('universe:nifty50');
+  const [scanOnKey, setScanOnKey] = useState<string>('universe:DEFAULT_WATCHLIST');
   const [selectedKey, setSelectedKey] = useState<string>('');
 
   // Scan execution state
@@ -198,13 +198,12 @@ export function DiscoverScannersView({
       wsRef.current = null;
     }
     if (liveSessionId) {
-      const sid = liveSessionId;
       setLiveSessionId(null);
       setLiveStatusText('');
-      await fetch('/api/screener/live/stop', {
+      await fetch('/api/analytics/live-screener/stop', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ session_id: sid }),
+        body: JSON.stringify({}),
       }).catch(() => {});
     }
   }, [liveSessionId]);
@@ -223,9 +222,9 @@ export function DiscoverScannersView({
 
   const parseScanTarget = useCallback(() => {
     if (scanOnKey.startsWith('basket:')) {
-      return { universe: 'nifty50', basket_id: scanOnKey.slice(7) };
+      return { universe: 'DEFAULT_WATCHLIST', basket_id: scanOnKey.slice(7) };
     }
-    return { universe: scanOnKey.replace(/^universe:/, '') || 'nifty50', basket_id: undefined };
+    return { universe: scanOnKey.replace(/^universe:/, '') || 'DEFAULT_WATCHLIST', basket_id: undefined };
   }, [scanOnKey]);
 
   const runSelectedScan = useCallback(
@@ -242,14 +241,12 @@ export function DiscoverScannersView({
           basket_id: target.basket_id,
           exchange: 'NSE',
           timeframe: item.timeframe || '1day',
-          chart_type: item.rule?.chart_type || 'candlestick',
-          indicator_backend: 'auto',
-          only_matched: true,
+          backend: 'auto',
         };
         if (item.engine !== 'python' && item.rule) {
           payload.rule_def = item.rule;
         }
-        const res = await fetch('/api/screener/run', {
+        const res = await fetch('/api/analytics/screener', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload),
@@ -297,7 +294,7 @@ export function DiscoverScannersView({
     setLiveStatusText('Connecting to WebSocket market feed...');
     try {
       const target = parseScanTarget();
-      const res = await fetch('/api/screener/live/start', {
+      const res = await fetch('/api/analytics/live-screener/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -307,31 +304,33 @@ export function DiscoverScannersView({
           basket_id: target.basket_id,
           exchange: 'NSE',
           timeframe: selected.timeframe || '1day',
-          indicator_backend: 'auto',
-          only_matched: true,
+          backend: 'auto',
         }),
       });
       const body = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(body.detail || 'Could not start live WebSocket stream.');
-      const sid = body.session_id as string;
+      const sid = String(body.session_id || 'active');
       setLiveSessionId(sid);
       const initRows = Array.isArray(body.results) ? body.results : Array.isArray(body.rows) ? body.rows : null;
       if (initRows) setRows(initRows);
       if (Array.isArray(body.columns)) setColumns(body.columns);
 
       const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const ws = new WebSocket(`${proto}//${window.location.host}/ws/live-screener?session_id=${encodeURIComponent(sid)}`);
+      const ws = new WebSocket(`${proto}//${window.location.host}/ws/live-screener`);
       wsRef.current = ws;
       ws.onmessage = (evt) => {
         try {
           const msg = JSON.parse(evt.data);
           const snapRows = Array.isArray(msg.results) ? msg.results : Array.isArray(msg.rows) ? msg.rows : null;
-          if ((msg.type === 'snapshot' || msg.type === 'update') && snapRows) {
-            if (msg.type === 'update') setLiveTickCount((c) => c + 1);
+          if (
+            (msg.type === 'snapshot' || msg.type === 'update' || msg.type === 'live_screen:state' || msg.type === 'live_screen:snapshot') &&
+            snapRows
+          ) {
+            if (msg.type === 'update' || msg.type === 'live_screen:state') setLiveTickCount((c) => c + 1);
             setRows(snapRows);
-            setScannedAt(msg.ts_ist || msg.updated_at_ist || new Date().toISOString());
+            setScannedAt(msg.ts_ist || msg.updated_at_ist || msg.last_tick_at || new Date().toISOString());
             setLiveStatusText(`Live WS connected · ${msg.feed_mode || msg.source || 'streaming'}`);
-          } else if (msg.type === 'tick' && msg.row) {
+          } else if ((msg.type === 'tick' || msg.type === 'live_screen:tick') && msg.row) {
             setLiveTickCount((c) => c + 1);
             const updated = msg.row as ScannerResultRow;
             setRows((prev) => {

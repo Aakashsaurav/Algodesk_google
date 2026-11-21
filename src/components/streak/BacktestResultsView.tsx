@@ -226,13 +226,13 @@ export function BacktestResultsView({
     setDeployBusy(true);
     setDeployMsg(null);
     try {
-      const res = await fetch('/api/streak/deployments', {
+      const res = await fetch('/api/streak/deployments/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
+          ...(result.deploy_spec || {}),
           name: deployName.trim() || `${result.strategy_label} Live`,
           exec_mode: deployExecMode,
-          spec: result.deploy_spec,
         }),
       });
       const body = await res.json().catch(() => ({}));
