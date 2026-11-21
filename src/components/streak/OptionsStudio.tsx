@@ -32,13 +32,21 @@ interface OptionsAnalysis {
 }
 
 interface Props {
-  templates: Array<{ id: string; name: string; outlook: string; description: string }>;
+  templates:
+    | Array<{ id: string; name: string; outlook?: string; description?: string }>
+    | Record<string, { id: string; name: string; outlook?: string; description?: string }>;
   initialTemplate?: { id: string; spot?: number; step?: number; lotSize?: number } | null;
 }
 
-const fmtInr = (v: number) => `₹${v.toLocaleString('en-IN', { maximumFractionDigits: 2 })}`;
+const fmtInr = (v: number | null | undefined) =>
+  `₹${Number(v ?? 0).toLocaleString('en-IN', { maximumFractionDigits: 2 })}`;
 
 export function OptionsStudio({ templates, initialTemplate }: Props) {
+  const templateList = Array.isArray(templates)
+    ? templates
+    : templates && typeof templates === 'object'
+      ? Object.values(templates)
+      : [];
   const [spot, setSpot] = useState(initialTemplate?.spot ?? 24200);
   const [step, setStep] = useState(initialTemplate?.step ?? 100);
   const [lotSize, setLotSize] = useState(initialTemplate?.lotSize ?? 75);
@@ -231,7 +239,7 @@ export function OptionsStudio({ templates, initialTemplate }: Props) {
       {/* Templates Strip */}
       <div className="rounded-xl border border-slate-800 bg-[#111827] p-4 space-y-4">
         <div className="flex flex-wrap items-center gap-2">
-          {templates.map((t) => (
+          {templateList.map((t) => (
             <button
               key={t.id}
               type="button"

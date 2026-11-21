@@ -21,6 +21,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -43,7 +44,12 @@ from core.preflight import PreflightChecker, kill_switch_controller
 from deploy.manager import deployment_manager
 from discover.catalog import list_discover_catalog
 from indicators.toolkit import available_backends, backend_diagnostics, refresh_backend_cache
-from options.payoff import OPTIONS_TEMPLATES, analyze_options_strategy, build_template_legs
+from options.payoff import (
+    OPTIONS_TEMPLATES,
+    analyze_options_strategy,
+    build_template_legs,
+    list_options_templates,
+)
 from risk.limits import risk_limit_manager
 from rules.engine import (
     SUPPORTED_OPERANDS,
@@ -999,7 +1005,7 @@ class BrokerHubService:
             "visual_rules": visual_rule_store.list_rules(),
             "baskets": basket_store.list_baskets(),
             "discover": list_discover_catalog(),
-            "options_templates": OPTIONS_TEMPLATES,
+            "options_templates": list_options_templates(),
             "recent_backtests": portfolio_backtest_engine.list_runs(limit=15),
             "deployments_summary": deployment_manager.list_deployments()["summary"],
         }
@@ -1019,28 +1025,36 @@ class BrokerHubService:
         return {**res, "rules": visual_rule_store.list_rules()}
 
     def export_visual_rule_to_python(self, rule_def: Dict[str, Any], save_to_disk: bool = False) -> Dict[str, Any]:
-        code = export_rule_to_python(rule_def)
-        saved_path = ""
+        import tempfile
+
+        kind = str(rule_def.get("kind") or "strategy").strip().lower()
         if save_to_disk:
-            kind = str(rule_def.get("kind") or "strategy").strip().lower()
-            raw_id = str(rule_def.get("id") or rule_def.get("name") or "custom_rule").strip().lower()
-            slug = "".join(ch if (ch.isalnum() or ch == "_") else "_" for ch in raw_id).strip("_") or "custom_rule"
             target_dir = screen_registry.screens_dir if kind == "screen" else strategy_registry.strategies_dir
-            target_dir.mkdir(parents=True, exist_ok=True)
-            out_file = target_dir / f"{slug}.py"
-            out_file.write_text(code, encoding="utf-8")
-            saved_path = str(out_file)
+            exported = export_rule_to_python(rule_def, kind=kind, target_dir=target_dir)
             if kind == "screen":
                 screen_registry.refresh_if_changed(force=True)
             else:
                 strategy_registry.refresh_if_changed(force=True)
-        return {"ok": True, "code": code, "saved_path": saved_path}
+            return {"ok": True, "code": exported["code"], "saved_path": exported["path"], "filename": exported["filename"]}
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            exported = export_rule_to_python(rule_def, kind=kind, target_dir=Path(tmp_dir))
+            return {"ok": True, "code": exported["code"], "saved_path": "", "filename": exported["filename"]}
 
     def list_baskets(self) -> Dict[str, Any]:
         return {"ok": True, "baskets": basket_store.list_baskets()}
 
     def save_basket(self, basket_def: Dict[str, Any]) -> Dict[str, Any]:
-        saved = basket_store.save(basket_def)
+        raw_syms = basket_def.get("symbols") or []
+        if isinstance(raw_syms, str):
+            raw_syms = [s.strip() for s in raw_syms.replace("\n", ",").split(",") if s.strip()]
+        saved = basket_store.save(
+            name=str(basket_def.get("name") or ""),
+            symbols=list(raw_syms),
+            exchange=str(basket_def.get("exchange") or "NSE"),
+            description=str(basket_def.get("description") or ""),
+            basket_id=basket_def.get("id") or basket_def.get("basket_id"),
+        )
         return {"ok": True, "basket": saved, "baskets": basket_store.list_baskets()}
 
     def delete_basket(self, basket_id: str) -> Dict[str, Any]:
