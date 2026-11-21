@@ -110,12 +110,20 @@ def ensure_spa_bundle(auto_build: bool = True) -> Optional[Path]:
     try:
         if not (REPO_ROOT / "node_modules").is_dir():
             logger.info("Frontend bundle incomplete and node_modules missing — running 'npm install'...")
-            subprocess.run(
-                [npm_bin, "install"],
+            install_res = subprocess.run(
+                [npm_bin, "install", "--no-audit", "--no-fund"],
                 cwd=str(REPO_ROOT),
-                check=True,
+                check=False,
                 timeout=240,
             )
+            if install_res.returncode != 0:
+                logger.warning("Standard 'npm install' exited %s — retrying with '--legacy-peer-deps'...", install_res.returncode)
+                subprocess.run(
+                    [npm_bin, "install", "--legacy-peer-deps", "--no-audit", "--no-fund"],
+                    cwd=str(REPO_ROOT),
+                    check=True,
+                    timeout=240,
+                )
         logger.info("Frontend bundle missing or incomplete — rebuilding via 'npm run build'...")
         subprocess.run(
             [npm_bin, "run", "build"],
