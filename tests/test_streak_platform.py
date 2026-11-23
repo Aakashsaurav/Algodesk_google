@@ -18,8 +18,10 @@ modules:
 from __future__ import annotations
 
 import math
+import os
 import tempfile
 import unittest
+from unittest.mock import patch
 from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Dict, List
@@ -543,26 +545,27 @@ class TestDeploymentManagerLifecycle(unittest.TestCase):
         self.assertEqual(res_blocked["status"], "BLOCKED")
 
         # Live Auto-Execute with Kill Switch active must also block without firing orders
-        res_auto = self.mgr.deploy(
-            name="Live Auto RELIANCE",
-            exec_mode="live_auto",
-            strategy_id="ema_crossover",
-            symbols=["RELIANCE"],
-            exchange="NSE",
-            timeframe="1day",
-            initial_capital=100000.0,
-            charges_profile="zerodha",
-            segment="equity_intraday",
-            provider="synthetic",
-            start_worker=False,
-            hist_fetcher=self._hist_fetcher,
-        )
-        auto_id = res_auto["deployment"]["id"]
-        self.mgr.trigger_manual_signal(auto_id, symbol="RELIANCE", side="BUY", price=1000.0, reason="Auto signal")
-        snap_auto = self.mgr.list_deployments()
-        auto_rec = next(d for d in snap_auto["deployments"] if d["id"] == auto_id)
-        self.assertEqual(auto_rec["open_positions_count"], 0)
-        self.assertIn("BLOCKED", auto_rec["last_note"].upper())
+        with patch.dict(os.environ, {"ALGODESK_ENABLE_LIVE_TRADING": "true"}, clear=False):
+            res_auto = self.mgr.deploy(
+                name="Live Auto RELIANCE",
+                exec_mode="live_auto",
+                strategy_id="ema_crossover",
+                symbols=["RELIANCE"],
+                exchange="NSE",
+                timeframe="1day",
+                initial_capital=100000.0,
+                charges_profile="zerodha",
+                segment="equity_intraday",
+                provider="synthetic",
+                start_worker=False,
+                hist_fetcher=self._hist_fetcher,
+            )
+            auto_id = res_auto["deployment"]["id"]
+            self.mgr.trigger_manual_signal(auto_id, symbol="RELIANCE", side="BUY", price=1000.0, reason="Auto signal")
+            snap_auto = self.mgr.list_deployments()
+            auto_rec = next(d for d in snap_auto["deployments"] if d["id"] == auto_id)
+            self.assertEqual(auto_rec["open_positions_count"], 0)
+            self.assertIn("BLOCKED", auto_rec["last_note"].upper())
 
 
 class TestBasketsAndDiscover(unittest.TestCase):

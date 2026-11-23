@@ -283,6 +283,8 @@ export interface DeploySpec {
   trailing_sl_pct: number;
   charges_profile: string;
   segment: string;
+  product?: string;
+  evaluation_mode?: 'completed_bar' | 'intrabar';
   charges_overrides?: Record<string, unknown>;
 }
 
@@ -340,6 +342,18 @@ export interface BacktestFullResult extends BacktestRunSummary {
   has_ohlcv_export?: boolean;
   cagr_pct: number;
   sharpe_ratio: number;
+  daily_sharpe_ratio?: number;
+  bar_sharpe_ratio?: number;
+  sharpe_daily?: number;
+  sharpe_bar?: number;
+  execution_assumptions?: {
+    entry_fill?: string;
+    stop_fill?: string;
+    same_bar_exit?: boolean;
+    sharpe_method?: string;
+    spread_bps?: number;
+    max_volume_participation_pct?: number;
+  };
   profit_factor: number;
   charges_breakdown: ChargeBreakdown;
   equity_curve: Array<{ date: string; equity: number; drawdown_pct: number; open_positions?: number }>;
@@ -371,10 +385,37 @@ export interface DeploymentSummary {
   pending_alerts_count: number;
 }
 
+export interface OmsOrderRecord {
+  client_order_id: string;
+  broker_order_id: string;
+  deployment_id: string;
+  broker_id: string;
+  exec_mode?: string;
+  mode?: string;
+  symbol: string;
+  exchange: string;
+  side: string;
+  product: string;
+  order_type: string;
+  quantity?: number;
+  qty?: number;
+  filled_quantity?: number;
+  filled_qty?: number;
+  average_fill_price?: number;
+  avg_price?: number;
+  limit_price?: number | null;
+  status: string;
+  rejection_reason?: string;
+  created_at_ist: string;
+  updated_at_ist: string;
+}
+
 export interface DeploymentRecord {
   id: string;
   name: string;
   exec_mode: 'paper' | 'live_alert' | 'live_auto';
+  evaluation_mode?: 'completed_bar' | 'intrabar';
+  product?: string;
   status: string;
   strategy_id: string;
   strategy_name: string;
@@ -400,6 +441,7 @@ export interface DeploymentRecord {
   positions: Array<{
     symbol: string;
     qty: number;
+    side?: string;
     entry_price: number;
     last_price: number;
     highest_price: number;

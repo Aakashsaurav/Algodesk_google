@@ -35,6 +35,7 @@ from core.ws_protocol import (
     send_ws_pong,
     send_ws_text,
 )
+from web.security import security_manager
 from web.service import hub_service
 from web.spa import ensure_spa_bundle, has_spa_bundle, render_spa_html, resolve_spa_asset
 
@@ -545,6 +546,27 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
             self._send_json(200, hub_service.list_scanner_alerts(subscription_id=sub_id))
             return
 
+        if path == "/api/streak/oms/orders":
+            dep_id = query.get("deployment_id", [None])[0]
+            limit = int(query.get("limit", ["100"])[0] or 100)
+            self._send_json(200, hub_service.list_oms_orders(deployment_id=dep_id, limit=limit))
+            return
+
+        if path == "/api/data/history":
+            sym = query.get("symbol", [None])[0]
+            exch = query.get("exchange", [None])[0]
+            tf = query.get("timeframe", [None])[0]
+            self._send_json(200, hub_service.get_asset_data_history(symbol=sym, exchange=exch, timeframe=tf))
+            return
+
+        if path == "/api/security/status":
+            self._send_json(200, hub_service.get_security_status())
+            return
+
+        if path == "/api/notifications/telegram":
+            self._send_json(200, hub_service.get_telegram_settings())
+            return
+
         if len(parts) == 4 and parts[0] == "api" and parts[1] == "brokers" and parts[3] == "reconnect-status":
             self._send_json(200, hub_service.get_reconnect_status(parts[2]))
             return
@@ -629,6 +651,17 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         path = parsed.path
+
+        if security_manager.is_protected_request("POST", path):
+            if not security_manager.verify_bearer(self.headers.get("Authorization")):
+                self._send_json(
+                    401,
+                    {
+                        "detail": "Operator authentication required. Sign in with your admin passcode or ALGODESK_API_TOKEN.",
+                        "auth_required": True,
+                    },
+                )
+                return
 
         try:
             body = self._read_json_body()
@@ -748,7 +781,8 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
 
             if path == "/api/live/preflight":
                 symbols = body.get("symbols") if isinstance(body.get("symbols"), list) else None
-                self._send_json(200, hub_service.run_preflight(symbols=symbols))
+                exch = str(body.get("exchange") or "NSE")
+                self._send_json(200, hub_service.run_preflight(symbols=symbols, exchange=exch))
                 return
 
             if path == "/api/live/kill-switch":
@@ -1023,6 +1057,33 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
                 self._send_json(200, hub_service.place_quick_order(body))
                 return
 
+            if path == "/api/streak/deployments/reconcile":
+                dep_id = body.get("deployment_id") if isinstance(body, dict) else None
+                self._send_json(200, hub_service.reconcile_deployments(deployment_id=dep_id))
+                return
+
+            if path == "/api/security/claim":
+                self._send_json(200, hub_service.claim_admin_passcode(str(body.get("passcode", ""))))
+                return
+
+            if path == "/api/security/login":
+                try:
+                    self._send_json(
+                        200,
+                        hub_service.login_admin(str(body.get("passcode") or body.get("token") or "")),
+                    )
+                except PermissionError as exc:
+                    self._send_json(401, {"detail": str(exc)})
+                return
+
+            if path == "/api/notifications/telegram":
+                self._send_json(200, hub_service.update_telegram_settings(body))
+                return
+
+            if path == "/api/notifications/telegram/test":
+                self._send_json(200, hub_service.send_telegram_test())
+                return
+
             self._send_json(404, {"detail": "Not Found"})
         except ValueError as exc:
             self._send_json(400, {"detail": str(exc)})
@@ -1031,6 +1092,16 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
 
     def do_DELETE(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
+        if security_manager.is_protected_request("DELETE", parsed.path):
+            if not security_manager.verify_bearer(self.headers.get("Authorization")):
+                self._send_json(
+                    401,
+                    {
+                        "detail": "Operator authentication required. Sign in with your admin passcode or ALGODESK_API_TOKEN.",
+                        "auth_required": True,
+                    },
+                )
+                return
         parts = parsed.path.strip("/").split("/")
         try:
             if len(parts) == 4 and parts[0] == "api" and parts[1] == "streak" and parts[2] == "rules":
@@ -1091,6 +1162,7 @@ def run_server(host: str = "127.0.0.1", port: int = 8000, open_browser: bool = T
     except ImportError:
         logger.info("FastAPI/Uvicorn not installed; running lightweight Python stdlib server.")
 
+    hub_service.start_background_services()
     server = _AlgoDeskHTTPServer((host, port), _StdlibBrokerHandler)
     if open_browser:
         webbrowser.open(url)
@@ -1099,6 +1171,7 @@ def run_server(host: str = "127.0.0.1", port: int = 8000, open_browser: bool = T
     except KeyboardInterrupt:
         pass
     finally:
+        hub_service.stop_background_services()
         server.server_close()
 
 

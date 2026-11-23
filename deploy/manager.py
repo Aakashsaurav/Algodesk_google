@@ -40,15 +40,16 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Set
 
 from backtest.registry import StrategyRegistry, strategy_registry
-from broker.base import OrderRequest
+from broker.base import BrokerBase, OrderRequest, OrderStatus
 from broker.registry import BrokerRegistry, SelectionStore
 from charges.calculator import ChargeBreakdown, ChargesConfig, charges_engine
-from config import IST_TZ, config
+from config import IST_TZ, config, is_live_trading_enabled
 from core.audit import AuditTrail, audit_trail
 from core.feed_manager import HotStandbyFeedManager, feed_manager
 from core.historical import HistoricalDataManager, historical_data_manager, normalize_timeframe
 from core.instruments import InstrumentIndex, instrument_index
 from core.preflight import KillSwitchController, kill_switch_controller
+from execution.oms import OrderManagementSystem, PaperExecutionAdapter, oms_manager
 from indicators.toolkit import IndicatorToolkit
 from risk.limits import RiskLimitManager, risk_limit_manager
 from rules.engine import compile_visual_strategy, visual_rule_store
@@ -77,6 +78,9 @@ class DeploymentManager:
         kill_switch: Optional[KillSwitchController] = None,
         audit: Optional[AuditTrail] = None,
         selection_store: Optional[SelectionStore] = None,
+        oms: Optional[OrderManagementSystem] = None,
+        broker_resolver: Optional[Callable[[str], BrokerBase]] = None,
+        require_live_env_lock: bool = True,
     ) -> None:
         self._db_path = db_path or (config.DATA_DIR / "deployments.db")
         self._hist = hist_manager or historical_data_manager
@@ -87,6 +91,14 @@ class DeploymentManager:
         self._kill_switch = kill_switch or kill_switch_controller
         self._audit = audit or audit_trail
         self._selections = selection_store or SelectionStore()
+        self._oms = oms or (
+            OrderManagementSystem(db_path=self._db_path.parent / "oms.db", audit=self._audit)
+            if db_path is not None
+            else oms_manager
+        )
+        self._broker_resolver = broker_resolver or BrokerRegistry.get
+        self._require_live_env_lock = require_live_env_lock
+        self._paper_adapter = PaperExecutionAdapter()
 
         self._lock = threading.RLock()
         self._listeners: Set[queue.Queue] = set()
@@ -486,6 +498,8 @@ class DeploymentManager:
         segment: str = "equity_intraday",
         charges_overrides: Optional[Dict[str, Any]] = None,
         product: str = "MIS",
+        evaluation_mode: str = "completed_bar",
+        side: str = "BUY",
         provider: Optional[str] = None,
         poll_interval_sec: float = 2.0,
         backtest_run_id: Optional[str] = None,
@@ -496,6 +510,15 @@ class DeploymentManager:
         mode = (exec_mode or "paper").strip().lower()
         if mode not in {"paper", "live_alert", "live_auto"}:
             raise ValueError("exec_mode must be 'paper', 'live_alert', or 'live_auto'.")
+        if mode == "live_auto" and self._require_live_env_lock and not is_live_trading_enabled():
+            raise PermissionError(
+                "Live trading is locked by default (ALGODESK_ENABLE_LIVE_TRADING=false). "
+                "Use 'paper' or 'live_alert' mode, or set ALGODESK_ENABLE_LIVE_TRADING=true in server .env."
+            )
+
+        eval_mode = (evaluation_mode or "completed_bar").strip().lower()
+        if eval_mode not in {"completed_bar", "intrabar"}:
+            eval_mode = "completed_bar"
 
         clean_syms: List[str] = []
         seen: set[str] = set()
@@ -529,6 +552,8 @@ class DeploymentManager:
             "segment": segment or "equity_intraday",
             "charges_overrides": dict(charges_overrides or {}),
             "product": (product or ("CNC" if segment == "equity_delivery" else "MIS")).strip().upper(),
+            "evaluation_mode": eval_mode,
+            "side": (side or "BUY").strip().upper(),
             "provider": (provider or self._selections.load().get("data_connection") or config.ACTIVE_DATA_CONNECTION or "yfinance").strip().lower(),
             "poll_interval_sec": max(1.0, min(30.0, float(poll_interval_sec or 2.0))),
         }
@@ -719,7 +744,7 @@ class DeploymentManager:
         open_count = len(rt["positions"])
         free_slots = max(1, max_slots - open_count)
         cash = float(rt["cash"])
-        equity = cash + sum(p["qty"] * p["last_price"] for p in rt["positions"].values())
+        equity = cash + sum(abs(int(p["qty"])) * float(p["last_price"]) for p in rt["positions"].values())
 
         if alloc == "equal_split":
             budget = min(cash, float(rt["initial_capital"]) / float(max_slots))
@@ -736,7 +761,7 @@ class DeploymentManager:
         return int(budget // (price * 1.005))
 
     def process_ticks(self, deployment_id: str, quotes: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
-        """Evaluate live quotes for a deployment (also callable directly in deterministic tests)."""
+        """Evaluate live quotes for a deployment (default: completed_bar close parity with backtest)."""
         actions_taken: List[Dict[str, Any]] = []
         with self._lock:
             rt = self._runtime.get(deployment_id)
@@ -744,6 +769,8 @@ class DeploymentManager:
                 return {"ok": False, "actions": []}
             spec = rt["spec"]
             tf = rt["timeframe"]
+            eval_mode = str(spec.get("evaluation_mode") or "completed_bar").strip().lower()
+            is_short_strat = str(spec.get("side") or "BUY").strip().upper() in {"SELL", "SHORT"}
             sl_pct = float(spec.get("stop_loss_pct") or 0.0)
             tp_pct = float(spec.get("take_profit_pct") or 0.0)
             tsl_pct = float(spec.get("trailing_sl_pct") or 0.0)
@@ -761,58 +788,107 @@ class DeploymentManager:
             with self._lock:
                 st = rt["sym_state"].get(sym_u)
                 if st is None:
-                    # Allow ad-hoc tick evaluation if symbol wasn't pre-warmed (e.g. unit test)
-                    st = {"base_bars": [], "forming_bar": None, "last_ltp": ltp, "last_sig_key": ""}
+                    st = {
+                        "base_bars": [],
+                        "forming_bar": None,
+                        "last_ltp": ltp,
+                        "last_sig_key": "",
+                        "last_eval_bar_ts": "",
+                        "indicator_eval_count": 0,
+                    }
                     rt["sym_state"][sym_u] = st
                 base_bars = st["base_bars"]
                 forming_bar = st["forming_bar"]
+                last_eval_bar_ts = str(st.get("last_eval_bar_ts") or "")
 
             new_base, new_forming, combined = merge_live_tick_into_candles(base_bars, forming_bar, q, tf)
             enter_sig = False
             exit_sig = False
-            if len(combined) >= 5:
-                try:
-                    tk = IndicatorToolkit(combined, backend="auto")
-                    strat_inst.prepare(combined, spec["params"], tk)
-                    enter_sig, exit_sig = strat_inst.signal_at(len(combined) - 1, combined[-1])
-                except Exception:
-                    enter_sig, exit_sig = False, False
+            eval_bar_ts = ""
+
+            if eval_mode == "completed_bar":
+                # Evaluate strategy ONLY when a new completed candle closes (matches backtest semantics
+                # and caches indicators between candle closes on MacBook Air M2).
+                if len(new_base) >= 5:
+                    latest_closed_ts = str(new_base[-1].get("ts_ist") or "")
+                    if latest_closed_ts and latest_closed_ts != last_eval_bar_ts:
+                        try:
+                            tk = IndicatorToolkit(new_base, backend="auto")
+                            strat_inst.prepare(new_base, spec["params"], tk)
+                            enter_sig, exit_sig = strat_inst.signal_at(len(new_base) - 1, new_base[-1])
+                            eval_bar_ts = latest_closed_ts
+                            st["indicator_eval_count"] = int(st.get("indicator_eval_count") or 0) + 1
+                        except Exception:
+                            enter_sig, exit_sig = False, False
+            else:
+                if len(combined) >= 5:
+                    try:
+                        tk = IndicatorToolkit(combined, backend="auto")
+                        strat_inst.prepare(combined, spec["params"], tk)
+                        enter_sig, exit_sig = strat_inst.signal_at(len(combined) - 1, combined[-1])
+                        eval_bar_ts = str(combined[-1].get("ts_ist") or "")
+                        st["indicator_eval_count"] = int(st.get("indicator_eval_count") or 0) + 1
+                    except Exception:
+                        enter_sig, exit_sig = False, False
 
             with self._lock:
                 st["base_bars"] = new_base
                 st["forming_bar"] = new_forming
                 st["last_ltp"] = ltp
-                bar_key = str(combined[-1].get("ts_ist") or _now_ist()) if combined else _now_ist()
+                if eval_bar_ts:
+                    st["last_eval_bar_ts"] = eval_bar_ts
+                bar_key = eval_bar_ts or (str(combined[-1].get("ts_ist") or _now_ist()) if combined else _now_ist())
 
                 pos = rt["positions"].get(sym_u)
                 if pos is not None:
+                    signed_qty = int(pos["qty"])
+                    abs_qty = abs(signed_qty)
+                    is_short_pos = signed_qty < 0
                     pos["last_price"] = ltp
-                    if ltp > pos["highest_price"]:
-                        pos["highest_price"] = ltp
+                    if not is_short_pos:
+                        if ltp > pos["highest_price"]:
+                            pos["highest_price"] = ltp
+                    else:
+                        if ltp < pos["highest_price"]:
+                            pos["highest_price"] = ltp
+
                     exit_reason = ""
-                    if sl_pct > 0 and ltp <= pos["entry_price"] * (1.0 - sl_pct / 100.0):
-                        exit_reason = f"STOP_LOSS (-{sl_pct:.1f}%)"
-                    elif tsl_pct > 0 and pos["highest_price"] > pos["entry_price"] and ltp <= pos["highest_price"] * (1.0 - tsl_pct / 100.0):
-                        exit_reason = f"TRAILING_SL (-{tsl_pct:.1f}%)"
-                    elif tp_pct > 0 and ltp >= pos["entry_price"] * (1.0 + tp_pct / 100.0):
-                        exit_reason = f"TAKE_PROFIT (+{tp_pct:.1f}%)"
-                    elif exit_sig:
-                        exit_reason = "STRATEGY_EXIT"
-                    if exit_reason:
-                        ev = self._handle_signal_locked(rt, sym_u, "SELL", int(pos["qty"]), ltp, exit_reason)
+                    if not is_short_pos:
+                        if sl_pct > 0 and ltp <= pos["entry_price"] * (1.0 - sl_pct / 100.0):
+                            exit_reason = f"STOP_LOSS (-{sl_pct:.1f}%)"
+                        elif tsl_pct > 0 and pos["highest_price"] > pos["entry_price"] and ltp <= pos["highest_price"] * (1.0 - tsl_pct / 100.0):
+                            exit_reason = f"TRAILING_SL (-{tsl_pct:.1f}%)"
+                        elif tp_pct > 0 and ltp >= pos["entry_price"] * (1.0 + tp_pct / 100.0):
+                            exit_reason = f"TAKE_PROFIT (+{tp_pct:.1f}%)"
+                        elif exit_sig:
+                            exit_reason = "STRATEGY_EXIT"
+                    else:
+                        if sl_pct > 0 and ltp >= pos["entry_price"] * (1.0 + sl_pct / 100.0):
+                            exit_reason = f"STOP_LOSS (-{sl_pct:.1f}%)"
+                        elif tsl_pct > 0 and pos["highest_price"] < pos["entry_price"] and ltp >= pos["highest_price"] * (1.0 + tsl_pct / 100.0):
+                            exit_reason = f"TRAILING_SL (-{tsl_pct:.1f}%)"
+                        elif tp_pct > 0 and ltp <= pos["entry_price"] * (1.0 - tp_pct / 100.0):
+                            exit_reason = f"TAKE_PROFIT (+{tp_pct:.1f}%)"
+                        elif exit_sig:
+                            exit_reason = "STRATEGY_EXIT"
+
+                    if exit_reason and abs_qty > 0:
+                        exit_side = "COVER" if is_short_pos else "SELL"
+                        ev = self._handle_signal_locked(rt, sym_u, exit_side, abs_qty, ltp, exit_reason)
                         if ev:
                             actions_taken.append(ev)
                 elif enter_sig and len(rt["positions"]) < max_slots:
-                    sig_marker = f"BUY:{bar_key}"
+                    entry_side = "SHORT" if is_short_strat else "BUY"
+                    sig_marker = f"{entry_side}:{bar_key}"
                     if st.get("last_sig_key") != sig_marker:
                         qty = self._compute_order_qty(rt, ltp)
                         if qty >= 1:
                             st["last_sig_key"] = sig_marker
-                            ev = self._handle_signal_locked(rt, sym_u, "BUY", qty, ltp, "STRATEGY_ENTRY")
+                            ev = self._handle_signal_locked(rt, sym_u, entry_side, qty, ltp, "STRATEGY_ENTRY")
                             if ev:
                                 actions_taken.append(ev)
 
-                # Recompute live MTM unrealized P&L
+                # Recompute live MTM unrealized P&L (supports both signed long >0 and short <0)
                 unreal = 0.0
                 for p in rt["positions"].values():
                     unreal += (float(p["last_price"]) - float(p["entry_price"])) * int(p["qty"])
@@ -831,6 +907,7 @@ class DeploymentManager:
         price: float,
         qty: Optional[int] = None,
         reason: str = "SIGNAL_TRIGGER",
+        client_order_id: str = "",
     ) -> Dict[str, Any]:
         """Deterministic signal trigger (useful for testing & manual simulation)."""
         sym_u = symbol.strip().upper()
@@ -842,11 +919,13 @@ class DeploymentManager:
             if rt["status"] != "RUNNING":
                 raise ValueError(f"Deployment '{deployment_id}' is {rt['status']}, not RUNNING.")
             eff_qty = int(qty) if (qty and int(qty) > 0) else (
-                int(rt["positions"][sym_u]["qty"])
-                if (side_u == "SELL" and sym_u in rt["positions"])
+                abs(int(rt["positions"][sym_u]["qty"]))
+                if (side_u in {"SELL", "COVER"} and sym_u in rt["positions"])
                 else max(1, self._compute_order_qty(rt, price))
             )
-            ev = self._handle_signal_locked(rt, sym_u, side_u, eff_qty, float(price), reason)
+            ev = self._handle_signal_locked(
+                rt, sym_u, side_u, eff_qty, float(price), reason, client_order_id=client_order_id
+            )
             unreal = sum((float(p["last_price"]) - float(p["entry_price"])) * int(p["qty"]) for p in rt["positions"].values())
             rt["unrealized_pnl"] = round(unreal, 2)
             self._persist_deployment_locked(rt)
@@ -861,12 +940,48 @@ class DeploymentManager:
         qty: int,
         price: float,
         reason: str,
+        *,
+        client_order_id: str = "",
     ) -> Optional[Dict[str, Any]]:
         mode = rt["exec_mode"]
         cfg = self._charges_cfg_for(rt["spec"])
 
         if mode == "paper":
-            return self._execute_paper_fill_locked(rt, symbol, side, qty, price, reason, cfg)
+            # Route Paper orders through the exact same canonical OrderRequest + OMS pipeline
+            req = OrderRequest(
+                symbol=symbol,
+                side=side,
+                quantity=qty,
+                exchange=rt["exchange"],
+                instrument_key=rt["instrument_keys"].get(symbol, ""),
+                order_type="MARKET",
+                product=str(rt["spec"].get("product") or "MIS"),
+                client_order_id=client_order_id,
+                tag=f"paper:{rt['id']}",
+                metadata={"reference_price": price, "exchange": rt["exchange"]},
+            )
+            order_rec, delta_qty, fill_px = self._oms.submit_order(
+                req,
+                self._paper_adapter,
+                deployment_id=rt["id"],
+                exec_mode="paper",
+                reason=reason,
+                reference_price=price,
+            )
+            if delta_qty > 0:
+                res = self._apply_verified_fill_locked(
+                    rt,
+                    symbol,
+                    side,
+                    delta_qty,
+                    fill_px or price,
+                    reason,
+                    cfg,
+                    broker_order_id=order_rec["broker_order_id"],
+                )
+                res["order"] = order_rec
+                return res
+            return {"kind": "rejected", "order": order_rec, "error": order_rec.get("rejection_reason", "")}
 
         if mode == "live_alert":
             alert = self._create_alert_db(
@@ -889,9 +1004,9 @@ class DeploymentManager:
             )
             return {"kind": "alert", "alert": alert}
 
-        # mode == "live_auto": Strictly gated by Kill Switch + RiskLimitManager
+        # mode == "live_auto": Strictly gated by Kill Switch + RiskLimitManager + Live Master Lock
         open_count = len(rt["positions"])
-        gross_exp = sum(p["qty"] * p["last_price"] for p in rt["positions"].values())
+        gross_exp = sum(abs(int(p["qty"])) * float(p["last_price"]) for p in rt["positions"].values())
         check = self._risk.validate_order(
             symbol=symbol,
             quantity=qty,
@@ -905,7 +1020,148 @@ class DeploymentManager:
             rt["last_note"] = f"Auto-order BLOCKED by safety gate ({block_reason})."
             return {"kind": "blocked", "symbol": symbol, "side": side, "reasons": check["reasons"]}
 
-        return self._dispatch_live_broker_order_locked(rt, symbol, side, qty, price, reason, cfg)
+        return self._dispatch_live_broker_order_locked(
+            rt, symbol, side, qty, price, reason, cfg, client_order_id=client_order_id
+        )
+
+    def _apply_verified_fill_locked(
+        self,
+        rt: Dict[str, Any],
+        symbol: str,
+        side: str,
+        qty: int,
+        price: float,
+        reason: str,
+        cfg: ChargesConfig,
+        broker_order_id: str = "",
+    ) -> Dict[str, Any]:
+        """
+        Update deployment cash, signed position (+qty long, -qty short), charges,
+        and realized P&L STRICTLY from a verified fill delta (`qty > 0`).
+        Supports both full and partial fills cleanly.
+        """
+        clean_side = side.strip().upper()
+        txn = "BUY" if clean_side in {"BUY", "COVER"} else "SELL"
+        leg = charges_engine.calculate_leg(side=txn, price=price, quantity=qty, cfg=cfg, include_slippage=True)
+        rt["total_charges"] = round(rt["total_charges"] + leg.total_charges, 2)
+
+        pos = rt["positions"].get(symbol)
+        if clean_side == "BUY":
+            outlay = (qty * price) + leg.total_charges
+            rt["cash"] = round(rt["cash"] - outlay, 2)
+            if pos is not None and int(pos["qty"]) > 0:
+                old_qty = int(pos["qty"])
+                new_qty = old_qty + qty
+                avg_px = ((old_qty * float(pos["entry_price"])) + (qty * price)) / float(new_qty)
+                pos["qty"] = new_qty
+                pos["entry_price"] = round(avg_px, 4)
+                pos["last_price"] = price
+                pos["highest_price"] = max(float(pos["highest_price"]), price)
+                pos["entry_charges"] = float(pos.get("entry_charges", 0.0)) + leg.total_charges
+            else:
+                rt["positions"][symbol] = {
+                    "symbol": symbol,
+                    "qty": qty,
+                    "entry_price": price,
+                    "last_price": price,
+                    "highest_price": price,
+                    "entry_charges": leg.total_charges,
+                    "entry_at_ist": _now_ist(),
+                }
+            rt["last_note"] = f"BUY {qty} {symbol} @ ₹{price:.2f} (Charges ₹{leg.total_charges:.2f})."
+            return {"kind": "fill", "side": "BUY", "symbol": symbol, "qty": qty, "price": price, "charges": round(leg.total_charges, 2), "broker_order_id": broker_order_id}
+
+        if clean_side == "SHORT":
+            outlay = (qty * price) + leg.total_charges
+            rt["cash"] = round(rt["cash"] - outlay, 2)
+            if pos is not None and int(pos["qty"]) < 0:
+                old_abs = abs(int(pos["qty"]))
+                new_abs = old_abs + qty
+                avg_px = ((old_abs * float(pos["entry_price"])) + (qty * price)) / float(new_abs)
+                pos["qty"] = -new_abs
+                pos["entry_price"] = round(avg_px, 4)
+                pos["last_price"] = price
+                pos["highest_price"] = min(float(pos["highest_price"]), price)
+                pos["entry_charges"] = float(pos.get("entry_charges", 0.0)) + leg.total_charges
+            else:
+                rt["positions"][symbol] = {
+                    "symbol": symbol,
+                    "qty": -qty,
+                    "entry_price": price,
+                    "last_price": price,
+                    "highest_price": price,
+                    "entry_charges": leg.total_charges,
+                    "entry_at_ist": _now_ist(),
+                }
+            rt["last_note"] = f"SHORT {qty} {symbol} @ ₹{price:.2f} (Charges ₹{leg.total_charges:.2f})."
+            return {"kind": "fill", "side": "SHORT", "symbol": symbol, "qty": qty, "price": price, "charges": round(leg.total_charges, 2), "broker_order_id": broker_order_id}
+
+        # Closing legs: SELL closes long (+qty), COVER closes short (-qty)
+        if clean_side == "COVER" or (pos is not None and int(pos["qty"]) < 0):
+            old_abs = abs(int(pos["qty"])) if pos else qty
+            close_qty = min(qty, old_abs) if pos else qty
+            entry_px = float(pos["entry_price"]) if pos else price
+            prop_entry_chg = (float(pos.get("entry_charges", 0.0)) * (close_qty / float(old_abs))) if (pos and old_abs > 0) else 0.0
+            gross_pnl = (entry_px - price) * close_qty
+            total_rt_chg = prop_entry_chg + leg.total_charges
+            net_pnl = gross_pnl - total_rt_chg
+            rt["cash"] = round(rt["cash"] + (close_qty * entry_px) + gross_pnl - leg.total_charges, 2)
+            rt["realized_pnl"] = round(rt["realized_pnl"] + net_pnl, 2)
+            if pos is not None:
+                rem_abs = old_abs - close_qty
+                if rem_abs <= 0:
+                    rt["positions"].pop(symbol, None)
+                else:
+                    pos["qty"] = -rem_abs
+                    pos["entry_charges"] = max(0.0, float(pos.get("entry_charges", 0.0)) - prop_entry_chg)
+            rt["last_note"] = f"COVER {close_qty} {symbol} @ ₹{price:.2f} | Net ₹{net_pnl:+,.2f} ({reason})."
+            trade = self._record_trade_db(
+                deployment_id=rt["id"],
+                symbol=symbol,
+                side="COVER",
+                qty=close_qty,
+                entry_price=entry_px,
+                exit_price=price,
+                gross_pnl=gross_pnl,
+                charges=total_rt_chg,
+                net_pnl=net_pnl,
+                reason=reason,
+                broker_order_id=broker_order_id,
+            )
+            return {"kind": "trade", "trade": trade, "broker_order_id": broker_order_id}
+
+        # SELL closing LONG position (supports partial exit)
+        old_qty = int(pos["qty"]) if pos else qty
+        close_qty = min(qty, old_qty) if pos else qty
+        entry_px = float(pos["entry_price"]) if pos else price
+        prop_entry_chg = (float(pos.get("entry_charges", 0.0)) * (close_qty / float(old_qty))) if (pos and old_qty > 0) else 0.0
+        gross_pnl = (price - entry_px) * close_qty
+        total_rt_chg = prop_entry_chg + leg.total_charges
+        net_pnl = gross_pnl - total_rt_chg
+        rt["cash"] = round(rt["cash"] + (close_qty * price) - leg.total_charges, 2)
+        rt["realized_pnl"] = round(rt["realized_pnl"] + net_pnl, 2)
+        if pos is not None:
+            rem_qty = old_qty - close_qty
+            if rem_qty <= 0:
+                rt["positions"].pop(symbol, None)
+            else:
+                pos["qty"] = rem_qty
+                pos["entry_charges"] = max(0.0, float(pos.get("entry_charges", 0.0)) - prop_entry_chg)
+        rt["last_note"] = f"SELL {close_qty} {symbol} @ ₹{price:.2f} | Net ₹{net_pnl:+,.2f} ({reason})."
+        trade = self._record_trade_db(
+            deployment_id=rt["id"],
+            symbol=symbol,
+            side="SELL",
+            qty=close_qty,
+            entry_price=entry_px,
+            exit_price=price,
+            gross_pnl=gross_pnl,
+            charges=total_rt_chg,
+            net_pnl=net_pnl,
+            reason=reason,
+            broker_order_id=broker_order_id,
+        )
+        return {"kind": "trade", "trade": trade, "broker_order_id": broker_order_id}
 
     def _execute_paper_fill_locked(
         self,
@@ -918,48 +1174,10 @@ class DeploymentManager:
         cfg: ChargesConfig,
         broker_order_id: str = "",
     ) -> Dict[str, Any]:
-        leg = charges_engine.calculate_leg(side=side, price=price, quantity=qty, cfg=cfg, include_slippage=True)
-        if side == "BUY":
-            outlay = (qty * price) + leg.total_charges
-            rt["cash"] = round(rt["cash"] - outlay, 2)
-            rt["total_charges"] = round(rt["total_charges"] + leg.total_charges, 2)
-            rt["positions"][symbol] = {
-                "symbol": symbol,
-                "qty": qty,
-                "entry_price": price,
-                "last_price": price,
-                "highest_price": price,
-                "entry_charges": leg.total_charges,
-                "entry_at_ist": _now_ist(),
-            }
-            rt["last_note"] = f"BUY {qty} {symbol} @ ₹{price:.2f} (Charges ₹{leg.total_charges:.2f})."
-            return {"kind": "fill", "side": "BUY", "symbol": symbol, "qty": qty, "price": price, "charges": round(leg.total_charges, 2)}
-
-        pos = rt["positions"].pop(symbol, None)
-        entry_px = float(pos["entry_price"]) if pos else price
-        entry_chg = float(pos.get("entry_charges", 0.0)) if pos else 0.0
-        eff_qty = int(pos["qty"]) if pos else qty
-        gross_pnl = (price - entry_px) * eff_qty
-        total_rt_chg = entry_chg + leg.total_charges
-        net_pnl = gross_pnl - total_rt_chg
-        rt["cash"] = round(rt["cash"] + (eff_qty * price) - leg.total_charges, 2)
-        rt["realized_pnl"] = round(rt["realized_pnl"] + net_pnl, 2)
-        rt["total_charges"] = round(rt["total_charges"] + leg.total_charges, 2)
-        rt["last_note"] = f"SELL {eff_qty} {symbol} @ ₹{price:.2f} | Net ₹{net_pnl:+,.2f} ({reason})."
-        trade = self._record_trade_db(
-            deployment_id=rt["id"],
-            symbol=symbol,
-            side="SELL",
-            qty=eff_qty,
-            entry_price=entry_px,
-            exit_price=price,
-            gross_pnl=gross_pnl,
-            charges=total_rt_chg,
-            net_pnl=net_pnl,
-            reason=reason,
-            broker_order_id=broker_order_id,
+        """Backwards-compatible alias delegating to `_apply_verified_fill_locked`."""
+        return self._apply_verified_fill_locked(
+            rt, symbol, side, qty, price, reason, cfg, broker_order_id=broker_order_id
         )
-        return {"kind": "trade", "trade": trade}
 
     def _dispatch_live_broker_order_locked(
         self,
@@ -970,49 +1188,144 @@ class DeploymentManager:
         price: float,
         reason: str,
         cfg: ChargesConfig,
+        *,
+        client_order_id: str = "",
     ) -> Dict[str, Any]:
+        if self._require_live_env_lock and not is_live_trading_enabled():
+            msg = "Live trading master lock is ON (set ALGODESK_ENABLE_LIVE_TRADING=true to enable real broker orders)."
+            rt["last_note"] = f"Live order blocked: {msg}"
+            self._audit.log(
+                event_type="LIVE_ORDER_BLOCKED_MASTER_LOCK",
+                actor="deploy_engine",
+                payload={"deployment_id": rt["id"], "symbol": symbol, "side": side, "qty": qty},
+            )
+            return {"kind": "blocked", "symbol": symbol, "side": side, "reasons": [msg]}
+
         trading_broker = str(self._selections.load().get("trading_broker") or "upstox").strip().lower()
-        adapter = BrokerRegistry.get(trading_broker)
+        adapter = self._broker_resolver(trading_broker)
         req = OrderRequest(
             symbol=symbol,
             side=side,
             quantity=qty,
+            exchange=rt["exchange"],
             instrument_key=rt["instrument_keys"].get(symbol, ""),
             order_type="MARKET",
             product=str(rt["spec"].get("product") or "MIS"),
-            tag=f"algodesk:{rt['id']}",
+            client_order_id=client_order_id,
+            tag=f"adk:{rt['id'][:8]}",
             algo_tag=f"ALGODESK-{rt['strategy_id'][:12].upper()}",
+            metadata={"exchange": rt["exchange"], "deployment_id": rt["id"], "reason": reason},
         )
-        try:
-            order = adapter.place_order(req)
-            order_id = str(getattr(order, "order_id", "") or f"LIVE-{uuid.uuid4().hex[:8]}")
-            fill_px = float(getattr(order, "average_fill_price", None) or price)
-            self._audit.log(
-                event_type="LIVE_ORDER_PLACED",
-                actor="deploy_engine",
-                payload={
-                    "deployment_id": rt["id"],
-                    "broker": trading_broker,
-                    "order_id": order_id,
-                    "symbol": symbol,
-                    "side": side,
-                    "qty": qty,
-                    "price": fill_px,
-                    "reason": reason,
-                },
+        order_rec, delta_qty, fill_px = self._oms.submit_order(
+            req,
+            adapter,
+            deployment_id=rt["id"],
+            exec_mode=rt["exec_mode"],
+            reason=reason,
+            reference_price=price,
+        )
+        oid = str(order_rec.get("broker_order_id") or order_rec.get("client_order_id") or "")
+        status = str(order_rec.get("status") or "")
+
+        if status == OrderStatus.REJECTED.value:
+            err_msg = str(order_rec.get("rejection_reason") or "Order rejected by broker")
+            rt["last_note"] = f"Live order REJECTED on {trading_broker.upper()}: {err_msg}"
+            return {
+                "kind": "rejected",
+                "symbol": symbol,
+                "side": side,
+                "broker_order_id": oid,
+                "order": order_rec,
+                "error": err_msg,
+            }
+
+        self._audit.log(
+            event_type="LIVE_ORDER_SUBMITTED",
+            actor="deploy_engine",
+            payload={
+                "deployment_id": rt["id"],
+                "broker": trading_broker,
+                "client_order_id": order_rec["client_order_id"],
+                "broker_order_id": oid,
+                "symbol": symbol,
+                "exchange": rt["exchange"],
+                "product": req.product,
+                "side": side,
+                "qty": qty,
+                "status": status,
+                "filled_qty": int(order_rec.get("filled_quantity") or 0),
+                "reason": reason,
+            },
+        )
+
+        # CRITICAL P0 INVARIANT: ONLY update positions/cash when broker explicitly reports a verified fill delta!
+        if delta_qty > 0:
+            res = self._apply_verified_fill_locked(
+                rt,
+                symbol,
+                side,
+                delta_qty,
+                fill_px or price,
+                reason,
+                cfg,
+                broker_order_id=oid,
             )
-            res = self._execute_paper_fill_locked(rt, symbol, side, qty, fill_px, reason, cfg, broker_order_id=order_id)
-            res["broker_order_id"] = order_id
+            res["order"] = order_rec
             return res
-        except Exception as exc:
-            err_msg = str(exc)
-            rt["last_note"] = f"Live order failed on {trading_broker.upper()}: {err_msg}"
-            self._audit.log(
-                event_type="LIVE_ORDER_FAILED",
-                actor="deploy_engine",
-                payload={"deployment_id": rt["id"], "broker": trading_broker, "symbol": symbol, "side": side, "error": err_msg},
-            )
-            return {"kind": "error", "symbol": symbol, "error": err_msg}
+
+        rt["last_note"] = (
+            f"Live order {status} on {trading_broker.upper()}: {side} {qty} {rt['exchange']}:{symbol} "
+            f"(Order {oid}, awaiting broker fill confirmation)."
+        )
+        return {
+            "kind": "submitted",
+            "symbol": symbol,
+            "side": side,
+            "status": status,
+            "broker_order_id": oid,
+            "order": order_rec,
+        }
+
+    def reconcile_orders(
+        self,
+        *,
+        deployment_id: Optional[str] = None,
+        broker_adapter: Optional[BrokerBase] = None,
+    ) -> Dict[str, Any]:
+        """Reconcile active OMS orders against the authoritative broker order book and apply verified fill deltas."""
+        trading_broker = str(self._selections.load().get("trading_broker") or "upstox").strip().lower()
+        adapter = broker_adapter or self._broker_resolver(trading_broker)
+
+        def _on_fill(order_rec: Dict[str, Any], delta_qty: int, fill_px: float) -> None:
+            did = str(order_rec.get("deployment_id") or "")
+            if not did:
+                return
+            with self._lock:
+                rt = self._runtime.get(did)
+                if not rt:
+                    return
+                cfg = self._charges_cfg_for(rt["spec"])
+                self._apply_verified_fill_locked(
+                    rt,
+                    str(order_rec["symbol"]),
+                    str(order_rec["side"]),
+                    int(delta_qty),
+                    float(fill_px or order_rec.get("limit_price") or 0.0),
+                    str(order_rec.get("reason") or "BROKER_RECONCILED_FILL"),
+                    cfg,
+                    broker_order_id=str(order_rec.get("broker_order_id") or ""),
+                )
+                unreal = sum(
+                    (float(p["last_price"]) - float(p["entry_price"])) * int(p["qty"])
+                    for p in rt["positions"].values()
+                )
+                rt["unrealized_pnl"] = round(unreal, 2)
+                self._persist_deployment_locked(rt)
+
+        result = self._oms.reconcile_orders(adapter, deployment_id=deployment_id, on_fill=_on_fill)
+        if result.get("fills_applied"):
+            self._broadcast("deployments:update")
+        return result
 
     # ── Operator Controls (Pause / Resume / Square-Off / Stop / Alerts) ──
 
@@ -1144,31 +1457,47 @@ class DeploymentManager:
             )
             self._persist_deployment_locked(rt)
 
-        if exec_res.get("kind") == "error":
+        if exec_res.get("kind") in {"error", "rejected", "blocked"}:
+            err_txt = str(
+                exec_res.get("error")
+                or ("; ".join(exec_res.get("reasons") or []))
+                or "Broker order failed"
+            )
+            st_val = "BLOCKED" if exec_res.get("kind") == "blocked" else "FAILED"
             with self._connect() as conn:
                 conn.execute(
-                    "UPDATE actionable_alerts SET status='FAILED', note=?, resolved_at_ist=? WHERE id=?",
-                    (str(exec_res.get("error") or "Broker order failed"), now, alert_id),
+                    "UPDATE actionable_alerts SET status=?, note=?, resolved_at_ist=? WHERE id=?",
+                    (st_val, err_txt, now, alert_id),
                 )
             self._broadcast("deployments:update")
-            return {"ok": False, "alert_id": alert_id, "status": "FAILED", "error": exec_res.get("error")}
+            return {"ok": False, "alert_id": alert_id, "status": st_val, "error": err_txt}
 
         oid = str(exec_res.get("broker_order_id") or "")
         with self._connect() as conn:
             conn.execute(
-                "UPDATE actionable_alerts SET status='EXECUTED', broker_order_id=?, note='Executed via 1-Click Live Order', resolved_at_ist=? WHERE id=?",
+                "UPDATE actionable_alerts SET status='EXECUTED', broker_order_id=?, note='Submitted via 1-Click Live Order', resolved_at_ist=? WHERE id=?",
                 (oid, now, alert_id),
             )
         self._broadcast("deployments:update")
-        return {"ok": True, "alert_id": alert_id, "status": "EXECUTED", "broker_order_id": oid}
+        return {"ok": True, "alert_id": alert_id, "status": "EXECUTED", "broker_order_id": oid, "order": exec_res.get("order")}
 
     # ── Read Views ───────────────────────────────────────────────────────
 
-    def _serialize_deployment_locked(self, rt: Dict[str, Any], trades: List[Dict[str, Any]]) -> Dict[str, Any]:
+    def _serialize_deployment_locked(
+        self,
+        rt: Dict[str, Any],
+        trades: List[Dict[str, Any]],
+        orders: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
         positions = list(rt["positions"].values())
-        equity = float(rt["cash"]) + sum(float(p["qty"]) * float(p["last_price"]) for p in positions)
+        equity = float(rt["cash"]) + sum(
+            (abs(int(p["qty"])) * float(p["entry_price"]))
+            + ((float(p["last_price"]) - float(p["entry_price"])) * int(p["qty"]))
+            for p in positions
+        )
         net_pnl = float(rt["realized_pnl"]) + float(rt["unrealized_pnl"])
         ret_pct = (net_pnl / max(1.0, float(rt["initial_capital"]))) * 100.0
+        dep_orders = orders if orders is not None else self._oms.list_orders(deployment_id=rt["id"], limit=40)
         return {
             "id": rt["id"],
             "name": rt["name"],
@@ -1179,6 +1508,8 @@ class DeploymentManager:
             "strategy_mode": rt["strategy_mode"],
             "symbols": list(rt["spec"].get("symbols") or []),
             "exchange": rt["exchange"],
+            "product": rt["spec"].get("product", "MIS"),
+            "evaluation_mode": rt["spec"].get("evaluation_mode", "completed_bar"),
             "timeframe": rt["timeframe"],
             "allocation_mode": rt["spec"].get("allocation_mode", "shared_pool"),
             "charges_profile": rt["spec"].get("charges_profile", "zerodha"),
@@ -1196,6 +1527,8 @@ class DeploymentManager:
             "total_charges": round(float(rt["total_charges"]), 2),
             "open_positions_count": len(positions),
             "positions": positions,
+            "orders_count": len(dep_orders),
+            "orders": dep_orders[:40],
             "trades_count": len(trades),
             "trades": trades[:40],
             "last_note": rt.get("last_note", ""),
@@ -1210,11 +1543,12 @@ class DeploymentManager:
                 (deployment_id,),
             ).fetchall()
             trades = [dict(r) for r in trade_rows]
+        dep_orders = self._oms.list_orders(deployment_id=deployment_id, limit=40)
         with self._lock:
             rt = self._runtime.get(deployment_id)
             if not rt:
                 raise ValueError(f"Deployment '{deployment_id}' not found.")
-            return {"ok": True, "deployment": self._serialize_deployment_locked(rt, trades)}
+            return {"ok": True, "deployment": self._serialize_deployment_locked(rt, trades, dep_orders)}
 
     def list_deployments(self) -> Dict[str, Any]:
         with self._connect() as conn:
@@ -1224,6 +1558,11 @@ class DeploymentManager:
             alert_rows = conn.execute(
                 "SELECT * FROM actionable_alerts ORDER BY created_at_ist DESC LIMIT 60"
             ).fetchall()
+
+        all_orders = self._oms.list_orders(limit=200)
+        orders_by_dep: Dict[str, List[Dict[str, Any]]] = {}
+        for o in all_orders:
+            orders_by_dep.setdefault(str(o.get("deployment_id") or ""), []).append(o)
 
         trades_by_dep: Dict[str, List[Dict[str, Any]]] = {}
         for tr in all_trades:
@@ -1236,7 +1575,13 @@ class DeploymentManager:
         deployments: List[Dict[str, Any]] = []
         with self._lock:
             for rt in sorted(self._runtime.values(), key=lambda x: str(x["created_at_ist"]), reverse=True):
-                deployments.append(self._serialize_deployment_locked(rt, trades_by_dep.get(rt["id"], [])))
+                deployments.append(
+                    self._serialize_deployment_locked(
+                        rt,
+                        trades_by_dep.get(rt["id"], []),
+                        orders_by_dep.get(rt["id"], []),
+                    )
+                )
 
         paper_deps = [d for d in deployments if d["exec_mode"] == "paper"]
         live_deps = [d for d in deployments if d["exec_mode"] != "paper"]
@@ -1252,11 +1597,16 @@ class DeploymentManager:
                 "live_net_pnl": round(sum(d["net_pnl"] for d in live_deps), 2),
                 "total_charges": round(sum(d["total_charges"] for d in deployments), 2),
                 "pending_alerts_count": len(pending_alerts),
+                "active_oms_orders_count": sum(
+                    1 for o in all_orders if str(o.get("status") or "") not in {"FILLED", "CANCELLED", "REJECTED", "EXPIRED"}
+                ),
             },
             "deployments": deployments,
+            "orders": all_orders[:60],
             "alerts": alerts,
             "pending_alerts": pending_alerts,
             "kill_switch": self._kill_switch.status(),
+            "live_trading_enabled": is_live_trading_enabled(),
             "generated_at_ist": _now_ist(),
         }
 

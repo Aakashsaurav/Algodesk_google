@@ -125,8 +125,12 @@ class OrderSide(str, Enum):
 
 
 class OrderStatus(str, Enum):
-    """Broker order lifecycle states."""
+    """Canonical Order Management & broker order lifecycle states."""
 
+    CREATED = "CREATED"
+    VALIDATED = "VALIDATED"
+    SUBMITTED = "SUBMITTED"
+    OPEN = "OPEN"
     PENDING = "PENDING"
     PARTIALLY_FILLED = "PARTIALLY_FILLED"
     FILLED = "FILLED"
@@ -134,14 +138,55 @@ class OrderStatus(str, Enum):
     REJECTED = "REJECTED"
     EXPIRED = "EXPIRED"
 
+    @property
+    def is_terminal(self) -> bool:
+        return self in {
+            OrderStatus.FILLED,
+            OrderStatus.CANCELLED,
+            OrderStatus.REJECTED,
+            OrderStatus.EXPIRED,
+        }
+
+    @property
+    def is_active(self) -> bool:
+        return self in {
+            OrderStatus.CREATED,
+            OrderStatus.VALIDATED,
+            OrderStatus.SUBMITTED,
+            OrderStatus.OPEN,
+            OrderStatus.PENDING,
+            OrderStatus.PARTIALLY_FILLED,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class InstrumentContract:
+    """Canonical instrument & contract specification across NSE/BSE/NFO/BFO/MCX."""
+
+    symbol: str
+    exchange: str = "NSE"
+    segment: str = "EQUITY"  # EQUITY | FUT | OPT | COMMODITY
+    lot_size: int = 1
+    tick_size: float = 0.05
+    multiplier: float = 1.0
+    expiry: Optional[str] = None
+    strike: Optional[float] = None
+    option_type: Optional[str] = None  # CE | PE | None
+    upstox_key: str = ""
+    zerodha_token: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
 
 @dataclass(slots=True)
 class OrderRequest:
-    """Generic broker order request with SEBI algo-tag & client order ID."""
+    """Single canonical broker order request with mandatory exchange/product validation & idempotency key."""
 
     symbol: str
     side: str | OrderSide
     quantity: int
+    exchange: str = ""
     instrument_key: str = ""
     order_type: str = "MARKET"
     product: str = "MIS"
@@ -158,29 +203,107 @@ class OrderRequest:
 
         self.symbol = self.symbol.strip().upper()
         self.side = OrderSide.normalize(self.side).value
+        meta_exch = str((self.metadata or {}).get("exchange") or "").strip().upper()
+        self.exchange = (self.exchange or meta_exch or "").strip().upper()
+        if self.exchange:
+            self.metadata["exchange"] = self.exchange
         self.order_type = self.order_type.strip().upper()
         self.product = self.product.strip().upper()
         self.validity = self.validity.strip().upper()
         self.tag = self.tag.strip()
-        self.client_order_id = self.client_order_id.strip() or str(uuid.uuid4())[:16]
+        self.client_order_id = self.client_order_id.strip() or f"adk-{uuid.uuid4().hex[:14]}"
         self.algo_tag = self.algo_tag.strip()
 
         if self.quantity <= 0:
             raise ValueError(f"quantity must be > 0, got {self.quantity}")
         if not self.symbol:
             raise ValueError("symbol must not be empty")
-        if self.order_type not in {"MARKET", "LIMIT", "STOP", "STOP_LIMIT"}:
+        if self.order_type not in {"MARKET", "LIMIT", "STOP", "STOP_LIMIT", "SL", "SL-M"}:
             raise ValueError(f"Unsupported order_type: {self.order_type!r}")
-        if self.price is not None and self.price <= 0:
-            raise ValueError(f"price must be > 0 when provided, got {self.price}")
-        if self.trigger_price is not None and self.trigger_price <= 0:
+        if self.price is not None and self.price < 0:
+            raise ValueError(f"price must be >= 0 when provided, got {self.price}")
+        if self.price == 0 and self.order_type == "MARKET":
+            self.price = None
+        if self.trigger_price is not None and self.trigger_price < 0:
             raise ValueError(
-                f"trigger_price must be > 0 when provided, got {self.trigger_price}"
+                f"trigger_price must be >= 0 when provided, got {self.trigger_price}"
             )
+        if self.trigger_price == 0 and self.order_type == "MARKET":
+            self.trigger_price = None
+
+    def require_exchange(self) -> str:
+        """Return validated exchange or raise ValueError for live broker dispatch."""
+        ex = (self.exchange or str((self.metadata or {}).get("exchange") or "")).strip().upper()
+        if not ex and self.instrument_key and "|" in self.instrument_key:
+            prefix = self.instrument_key.split("|", 1)[0].strip().upper()
+            prefix_map = {
+                "NSE_EQ": "NSE",
+                "NSE_INDEX": "NSE",
+                "NSE_FO": "NFO",
+                "BSE_EQ": "BSE",
+                "BSE_INDEX": "BSE",
+                "BSE_FO": "BFO",
+                "MCX_FO": "MCX",
+                "MCX_EQ": "MCX",
+                "NFO": "NFO",
+                "BFO": "BFO",
+                "MCX": "MCX",
+                "NSE": "NSE",
+                "BSE": "BSE",
+            }
+            ex = prefix_map.get(prefix, "")
+            if ex:
+                self.exchange = ex
+                self.metadata["exchange"] = ex
+        if not ex:
+            raise ValueError(
+                f"Exchange is mandatory for live order on {self.symbol}; refusing silent default."
+            )
+        return ex
+
+    @property
+    def trading_symbol(self) -> str:
+        return self.symbol
+
+    @property
+    def transaction_type(self) -> str:
+        """Canonical broker transaction side: BUY/COVER -> BUY, SELL/SHORT -> SELL."""
+        return "BUY" if self.side in {OrderSide.BUY.value, OrderSide.COVER.value} else "SELL"
 
     @property
     def is_exit(self) -> bool:
         return self.side in {OrderSide.SELL.value, OrderSide.COVER.value}
+
+
+@dataclass(slots=True)
+class ExecutionFill:
+    """Verified broker or paper fill event used to update position ledgers."""
+
+    fill_id: str
+    order_id: str
+    symbol: str
+    exchange: str
+    side: str
+    quantity: int
+    price: float
+    product: str = "MIS"
+    client_order_id: str = ""
+    timestamp: datetime = field(default_factory=_utc_now)
+    raw: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "fill_id": self.fill_id,
+            "order_id": self.order_id,
+            "client_order_id": self.client_order_id,
+            "symbol": self.symbol,
+            "exchange": self.exchange,
+            "side": self.side,
+            "quantity": int(self.quantity),
+            "price": float(self.price),
+            "product": self.product,
+            "timestamp": self.timestamp.isoformat(),
+        }
 
 
 @dataclass(slots=True)
@@ -198,6 +321,10 @@ class BrokerOrder:
     raw: Dict[str, Any] = field(default_factory=dict)
 
     @property
+    def symbol(self) -> str:
+        return self.request.symbol
+
+    @property
     def remaining_quantity(self) -> int:
         return max(0, self.request.quantity - self.filled_quantity)
 
@@ -210,6 +337,7 @@ class BrokerPosition:
     quantity: int
     average_price: float
     direction: int = 1
+    exchange: str = "NSE"
     instrument_key: str = ""
     product: str = "MIS"
     realized_pnl: float = 0.0
@@ -221,6 +349,10 @@ class BrokerPosition:
 
     def __post_init__(self) -> None:
         self.symbol = self.symbol.strip().upper()
+        self.exchange = (self.exchange or "NSE").strip().upper()
+        if self.quantity < 0:
+            self.direction = -1
+            self.quantity = abs(self.quantity)
         if self.quantity <= 0:
             raise ValueError(f"quantity must be > 0, got {self.quantity}")
         if self.average_price <= 0:
@@ -234,9 +366,12 @@ class BrokerPosition:
         return self.quantity * self.direction
 
     @property
+    def last_price(self) -> float:
+        return float(self.market_price if self.market_price is not None else self.average_price)
+
+    @property
     def market_value(self) -> float:
-        price = self.market_price if self.market_price is not None else self.average_price
-        return price * self.quantity
+        return self.last_price * self.quantity
 
 
 @dataclass(slots=True)
@@ -291,8 +426,9 @@ class BrokerBase(ABC):
     """
     Abstract broker & connectivity contract.
 
-    Every broker adapter implements trading methods plus lightweight health/auth
-    hooks so the UI and runtime never depend on broker-specific SDK internals.
+    Every broker adapter implements trading methods plus authoritative account/
+    order/trade/position reads so the OMS, risk watchdog, and kill switch never
+    rely on stale in-memory state.
     """
 
     name: str = "generic-broker"
@@ -347,8 +483,35 @@ class BrokerBase(ABC):
     def get_orders(self) -> Sequence[BrokerOrder]:
         """Return the current order book snapshot."""
 
+    def get_trades(self) -> Sequence[ExecutionFill]:
+        """Return verified fills/trades for the current trading day."""
+        return []
+
+    def get_funds(self, segment: str = "equity") -> Dict[str, float]:
+        """Return authoritative broker funds (`available`, `used`, `total`)."""
+        bal = self.get_balance()
+        avail = float(bal.available_cash or 0.0)
+        used = float(bal.margin_used or 0.0)
+        return {
+            "available": round(avail, 2),
+            "used": round(used, 2),
+            "total": round(avail + used, 2),
+            "segment": segment,
+        }
+
+    def get_order(self, order_id: str) -> Optional[BrokerOrder]:
+        """Fetch latest status of a specific broker order."""
+        oid = str(order_id or "").strip()
+        if not oid:
+            return None
+        for o in self.get_orders():
+            if str(o.order_id) == oid:
+                return o
+        return None
+
     def safe_balance(self) -> float:
         try:
             return float(self.get_balance().balance)
         except Exception:
             return 0.0
+

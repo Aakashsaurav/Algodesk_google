@@ -25,6 +25,8 @@ import {
   Bell,
   PlusSquare,
   FilePlus2,
+  Lock,
+  Unlock,
 } from 'lucide-react';
 import { LiveTerminal } from './components/LiveTerminal';
 import { PlatformDashboard } from './components/streak/PlatformDashboard';
@@ -36,9 +38,17 @@ import { DiscoverStrategiesView } from './components/streak/DiscoverStrategiesVi
 import { CreateStrategyView } from './components/streak/CreateStrategyView';
 import { RiskLimitsView } from './components/streak/RiskLimitsView';
 import { QuickOrderModal, type QuickOrderTarget } from './components/streak/QuickOrderModal';
+import { AdminAuthModal } from './components/streak/AdminAuthModal';
 import { OptionsStudio } from './components/streak/OptionsStudio';
 import { TechnicalsView } from './components/streak/TechnicalsView';
 import { DeploymentsConsole } from './components/streak/DeploymentsConsole';
+import {
+  fetchSecurityStatus,
+  hasSessionToken,
+  subscribeAuthRequired,
+  subscribeTokenChange,
+  type SecurityStatus,
+} from './utils/authClient';
 import type {
   BasketItem,
   DiscoverItem,
@@ -617,6 +627,33 @@ export default function App() {
   const [killReason, setKillReason] = useState('');
   const [killBusy, setKillBusy] = useState(false);
   const [verifyingAudit, setVerifyingAudit] = useState(false);
+
+  // Production security status & inline in-memory Bearer auth modal
+  const [securityStatus, setSecurityStatus] = useState<SecurityStatus | null>(null);
+  const [authModalOpen, setAuthModalOpen] = useState(false);
+  const [authPromptReason, setAuthPromptReason] = useState('');
+  const [hasAuthSession, setHasAuthSession] = useState(() => hasSessionToken());
+
+  const refreshSecurityStatus = useCallback(async () => {
+    const st = await fetchSecurityStatus();
+    if (st) setSecurityStatus(st);
+  }, []);
+
+  useEffect(() => {
+    void refreshSecurityStatus();
+    const unsubReq = subscribeAuthRequired((detail) => {
+      setAuthPromptReason(detail || 'Unlock your operator session to continue.');
+      void refreshSecurityStatus();
+      setAuthModalOpen(true);
+    });
+    const unsubTok = subscribeTokenChange((active) => {
+      setHasAuthSession(active);
+    });
+    return () => {
+      unsubReq();
+      unsubTok();
+    };
+  }, [refreshSecurityStatus]);
 
   const fetchOverview = useCallback(async (refresh = true): Promise<OverviewPayload | null> => {
     setRefreshing(true);
@@ -1560,7 +1597,49 @@ export default function App() {
             <span className="hidden truncate text-xs text-slate-400 sm:inline">{activeNavMeta.subtitle}</span>
           </div>
 
-          <div className="flex shrink-0 items-center gap-3">
+          <div className="flex shrink-0 items-center gap-2.5">
+            {securityStatus && !securityStatus.live_trading_enabled && (
+              <button
+                type="button"
+                onClick={() => {
+                  setAuthPromptReason('');
+                  setAuthModalOpen(true);
+                }}
+                title="Live broker orders are locked by default (ALGODESK_ENABLE_LIVE_TRADING=false)"
+                className="hidden h-8 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg border border-amber-800/70 bg-amber-950/40 px-2.5 text-xs font-semibold text-amber-300 hover:border-amber-500 sm:inline-flex"
+              >
+                <Lock className="h-3 w-3" />
+                <span>Live Locked</span>
+              </button>
+            )}
+            {securityStatus && (
+              <button
+                type="button"
+                onClick={() => {
+                  setAuthPromptReason('');
+                  setAuthModalOpen(true);
+                }}
+                title={
+                  securityStatus.needs_claim
+                    ? 'Set local operator admin passcode'
+                    : hasAuthSession
+                      ? 'Operator session unlocked (in-memory)'
+                      : 'Unlock operator session'
+                }
+                className={`inline-flex h-8 shrink-0 items-center gap-1.5 whitespace-nowrap rounded-lg border px-2.5 text-xs font-semibold transition-colors ${
+                  hasAuthSession
+                    ? 'border-emerald-700/70 bg-emerald-950/40 text-emerald-300 hover:border-emerald-400'
+                    : securityStatus.auth_enforced
+                      ? 'border-sky-700/70 bg-sky-950/40 text-sky-300 hover:border-sky-400'
+                      : 'border-slate-700 bg-[#111827] text-slate-300 hover:border-sky-400'
+                }`}
+              >
+                {hasAuthSession ? <Unlock className="h-3.5 w-3.5" /> : <Lock className="h-3.5 w-3.5" />}
+                <span className="hidden md:inline">
+                  {securityStatus.needs_claim ? 'Set Passcode' : hasAuthSession ? 'Unlocked' : 'Unlock'}
+                </span>
+              </button>
+            )}
             {liveStatus?.kill_switch?.engaged && (
               <button
                 type="button"
@@ -1576,6 +1655,7 @@ export default function App() {
               onClick={() => {
                 void fetchOverview(true);
                 void fetchStreakMeta();
+                void refreshSecurityStatus();
               }}
               disabled={refreshing}
               className="inline-flex h-9 shrink-0 items-center gap-2 whitespace-nowrap rounded-lg bg-sky-400 px-3.5 text-xs font-semibold text-sky-950 transition-colors hover:bg-sky-300 disabled:opacity-50"
@@ -3277,6 +3357,21 @@ export default function App() {
         target={quickOrderTarget}
         tradingBroker={tradingSelection}
         onClose={() => setQuickOrderTarget(null)}
+      />
+
+      <AdminAuthModal
+        open={authModalOpen}
+        securityStatus={securityStatus}
+        promptReason={authPromptReason}
+        onClose={() => setAuthModalOpen(false)}
+        onAuthenticated={(next) => {
+          if (next) {
+            setSecurityStatus(next);
+          } else {
+            void refreshSecurityStatus();
+          }
+          setHasAuthSession(hasSessionToken());
+        }}
       />
     </div>
   );

@@ -3,6 +3,7 @@ import {
   Bell,
   CheckCircle2,
   Compass,
+  ListChecks,
   LogOut,
   Pause,
   Play,
@@ -12,7 +13,7 @@ import {
   Trash2,
   XCircle,
 } from 'lucide-react';
-import type { ActionableAlert, DeploymentRecord, DeploymentsPayload } from './types';
+import type { ActionableAlert, DeploymentRecord, DeploymentsPayload, OmsOrderRecord } from './types';
 
 interface Props {
   onGoToStrategies: () => void;
@@ -23,11 +24,25 @@ const fmtInr = (v: number) => `₹${v.toLocaleString('en-IN', { maximumFractionD
 
 export function DeploymentsConsole({ onGoToStrategies, onGoToRisk }: Props) {
   const [data, setData] = useState<DeploymentsPayload | null>(null);
-  const [tab, setTab] = useState<'live_alert' | 'paper' | 'live_auto' | 'all' | 'alerts'>('all');
+  const [omsOrders, setOmsOrders] = useState<OmsOrderRecord[]>([]);
+  const [tab, setTab] = useState<'live_alert' | 'paper' | 'live_auto' | 'all' | 'alerts' | 'oms'>('all');
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [reconciling, setReconciling] = useState(false);
   const [expandedLogId, setExpandedLogId] = useState<string | null>(null);
   const [feedback, setFeedback] = useState<{ ok: boolean; text: string } | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+
+  const fetchOmsOrders = useCallback(async () => {
+    try {
+      const res = await fetch('/api/streak/oms/orders?limit=100');
+      if (res.ok) {
+        const body = await res.json();
+        setOmsOrders(Array.isArray(body.orders) ? (body.orders as OmsOrderRecord[]) : []);
+      }
+    } catch {
+      // ignore
+    }
+  }, []);
 
   const fetchDeployments = useCallback(async () => {
     try {
@@ -38,7 +53,32 @@ export function DeploymentsConsole({ onGoToStrategies, onGoToRisk }: Props) {
     } catch {
       // ignore transient network glitches
     }
-  }, []);
+    void fetchOmsOrders();
+  }, [fetchOmsOrders]);
+
+  const handleReconcileBroker = async () => {
+    setReconciling(true);
+    setFeedback(null);
+    try {
+      const res = await fetch('/api/streak/deployments/reconcile', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: '{}',
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.detail || 'Broker reconciliation failed.');
+      const synced = Number(body.reconciled_count ?? body.reconciled_orders ?? body.updated_orders ?? 0);
+      setFeedback({
+        ok: true,
+        text: `Broker orderbook synchronized (${synced} order update${synced === 1 ? '' : 's'} applied).`,
+      });
+      await fetchDeployments();
+    } catch (err) {
+      setFeedback({ ok: false, text: err instanceof Error ? err.message : 'Reconciliation failed.' });
+    } finally {
+      setReconciling(false);
+    }
+  };
 
   useEffect(() => {
     void fetchDeployments();
@@ -139,7 +179,16 @@ export function DeploymentsConsole({ onGoToStrategies, onGoToRisk }: Props) {
             Real-time MTM tracking across Notification Based Trading (1-click), Paper Trading, and Gated Auto-Execute deployments.
           </p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            type="button"
+            disabled={reconciling}
+            onClick={() => void handleReconcileBroker()}
+            className="inline-flex min-h-[36px] items-center gap-1.5 rounded-lg border border-emerald-700/70 bg-emerald-950/30 px-3 text-xs font-semibold text-emerald-300 hover:border-emerald-400 disabled:opacity-50"
+          >
+            <ListChecks className={`h-3.5 w-3.5 ${reconciling ? 'animate-pulse' : ''}`} />
+            <span>{reconciling ? 'Syncing Broker...' : 'Sync Broker Now'}</span>
+          </button>
           <button
             type="button"
             onClick={() => void fetchDeployments()}
@@ -300,6 +349,7 @@ export function DeploymentsConsole({ onGoToStrategies, onGoToRisk }: Props) {
             ['paper', `Paper Trading (${paperCount})`],
             ['live_auto', `Gated Auto-Execute (${autoCount})`],
             ['alerts', `Alert Log (${allAlerts.length})`],
+            ['oms', `OMS Order Lifecycle (${omsOrders.length})`],
           ] as const
         ).map(([id, label]) => (
           <button
@@ -315,7 +365,73 @@ export function DeploymentsConsole({ onGoToStrategies, onGoToRisk }: Props) {
         ))}
       </div>
 
-      {tab === 'alerts' ? (
+      {tab === 'oms' ? (
+        <div className="overflow-x-auto rounded-xl border border-slate-800 bg-[#111827] p-4">
+          {omsOrders.length === 0 ? (
+            <p className="py-8 text-center text-xs text-slate-500">
+              No OMS orders recorded yet. Paper, quick, and live orders appear here with full broker fill reconciliation.
+            </p>
+          ) : (
+            <table className="w-full text-xs">
+              <thead className="border-b border-slate-800 text-[11px] uppercase text-slate-500">
+                <tr>
+                  <th className="py-2 text-left">Client / Broker ID</th>
+                  <th className="py-2 text-left">Instrument</th>
+                  <th className="py-2 text-left">Side / Product</th>
+                  <th className="py-2 text-right">Filled / Qty</th>
+                  <th className="py-2 text-right">Avg ₹</th>
+                  <th className="py-2 pl-3 text-left">Status</th>
+                  <th className="py-2 text-left">Note / Rejection</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-800/60 font-mono tabular-nums">
+                {omsOrders.map((o) => {
+                  const st = (o.status || '').toUpperCase();
+                  const stColor =
+                    st === 'FILLED'
+                      ? 'text-emerald-400'
+                      : st === 'REJECTED' || st === 'CANCELLED' || st === 'EXPIRED'
+                        ? 'text-red-400'
+                        : st === 'PARTIALLY_FILLED'
+                          ? 'text-amber-300'
+                          : 'text-sky-300';
+                  const totalQty = Number(o.quantity ?? o.qty ?? 0);
+                  const filledQty = Number(o.filled_quantity ?? o.filled_qty ?? 0);
+                  const avgPx = Number(o.average_fill_price ?? o.avg_price ?? 0);
+                  const modeLabel = o.exec_mode || o.mode || '';
+                  return (
+                    <tr key={o.client_order_id} className="hover:bg-slate-800/30">
+                      <td className="py-2 text-[11px] text-slate-300">
+                        <div>{o.client_order_id}</div>
+                        <div className="text-[10px] text-slate-500">
+                          {o.broker_order_id || '—'} · {modeLabel}
+                        </div>
+                      </td>
+                      <td className="py-2 text-slate-100">
+                        {o.symbol} <span className="text-slate-500">({o.exchange})</span>
+                      </td>
+                      <td className="py-2">
+                        <span className={o.side === 'BUY' || o.side === 'COVER' ? 'text-emerald-400' : 'text-red-400'}>
+                          {o.side}
+                        </span>{' '}
+                        <span className="text-slate-400">{o.product}</span>
+                      </td>
+                      <td className="py-2 text-right text-slate-200">
+                        {filledQty} / {totalQty}
+                      </td>
+                      <td className="py-2 text-right text-slate-200">
+                        {avgPx > 0 ? `₹${avgPx.toFixed(2)}` : '—'}
+                      </td>
+                      <td className={`py-2 pl-3 font-sans font-semibold ${stColor}`}>{st}</td>
+                      <td className="py-2 font-sans text-slate-400">{o.rejection_reason || o.updated_at_ist.slice(11, 19)}</td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          )}
+        </div>
+      ) : tab === 'alerts' ? (
         <div className="overflow-x-auto rounded-xl border border-slate-800 bg-[#111827] p-4">
           {allAlerts.length === 0 ? (
             <p className="py-8 text-center text-xs text-slate-500">No actionable alerts recorded yet.</p>
@@ -470,7 +586,11 @@ export function DeploymentsConsole({ onGoToStrategies, onGoToRisk }: Props) {
                               ? '1-Click Alerts'
                               : d.exec_mode === 'live_auto'
                                 ? 'Gated Auto'
-                                : 'Paper'}
+                                : 'Paper'}{' '}
+                            · {d.evaluation_mode === 'intrabar' ? 'Intrabar' : 'Candle Close'}
+                          </div>
+                          <div className="text-[10px] text-slate-600">
+                            {d.exchange || 'NSE'} · {d.product || 'MIS'}
                           </div>
                         </td>
                         <td className="px-4 py-3 text-right">

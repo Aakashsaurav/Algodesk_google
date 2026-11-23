@@ -361,7 +361,7 @@ class TestBrokerHubArchitecture(unittest.TestCase):
             self.assertTrue(res2["cache_hit_only"])
             self.assertEqual(recorded_calls, [])
 
-            # 3) Expand range to 2026-10-01..2026-10-14 -> only absent leading & trailing ranges fetched
+            # 3) Expand range to 2026-10-01..2026-10-14 -> only absent trading days fetched (2026-10-02 is NSE Gandhi Jayanti holiday)
             recorded_calls.clear()
             res3 = mgr.download(
                 symbol="RELIANCE",
@@ -374,24 +374,24 @@ class TestBrokerHubArchitecture(unittest.TestCase):
             )
             self.assertEqual(
                 recorded_calls,
-                [(date(2026, 10, 1), date(2026, 10, 2)), (date(2026, 10, 12), date(2026, 10, 14))],
+                [(date(2026, 10, 1), date(2026, 10, 1)), (date(2026, 10, 12), date(2026, 10, 14))],
             )
             self.assertEqual(res3["api_calls_made"], 2)
             self.assertEqual(res3["existing_days_skipped"], 5)
-            self.assertEqual(res3["missing_days_count"], 5)
+            self.assertEqual(res3["missing_days_count"], 4)
 
-            # 4) Verify Snapshot (<=15 bars) vs Full (all 20 bars) + CSV export (0 API calls)
+            # 4) Verify Snapshot (<=15 bars) vs Full (all 18 bars) + CSV export (0 API calls)
             snap = mgr.get_records(symbol="RELIANCE", exchange="NSE", timeframe="30minute", view="snapshot")
             full = mgr.get_records(symbol="RELIANCE", exchange="NSE", timeframe="30minute", view="full")
-            self.assertEqual(snap["total_rows"], 20)
+            self.assertEqual(snap["total_rows"], 18)
             self.assertEqual(snap["returned_rows"], 15)
             self.assertTrue(snap["is_truncated"])
-            self.assertEqual(full["total_rows"], 20)
-            self.assertEqual(full["returned_rows"], 20)
+            self.assertEqual(full["total_rows"], 18)
+            self.assertEqual(full["returned_rows"], 18)
             self.assertFalse(full["is_truncated"])
 
             csv_text = mgr.export_csv(symbol="RELIANCE", exchange="NSE", timeframe="30minute")
-            self.assertEqual(len(csv_text.strip().splitlines()), 21)
+            self.assertEqual(len(csv_text.strip().splitlines()), 19)
 
             # Pure unit check for middle-gap detection
             gaps = compute_missing_date_ranges(

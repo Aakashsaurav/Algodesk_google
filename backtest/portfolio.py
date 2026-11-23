@@ -33,6 +33,7 @@ from backtest.engine import (
     BacktestEngine,
     backtest_engine,
     collect_strategy_indicators,
+    compute_sharpe_metrics,
     format_bar_timestamp,
     within_time_window,
 )
@@ -63,6 +64,7 @@ def _compute_metrics_from_curve_and_trades(
     raw_curve: List[Dict[str, Any]],
     trades: List[Dict[str, Any]],
     timeframe: str,
+    exchange: str = "NSE",
 ) -> Dict[str, Any]:
     cap = max(1.0, float(initial_capital))
     net_pnl = final_equity - cap
@@ -82,8 +84,6 @@ def _compute_metrics_from_curve_and_trades(
 
     peak = cap
     max_dd = 0.0
-    rets: List[float] = []
-    prev_eq = cap
     for pt in raw_curve:
         eq = float(pt["equity"])
         if eq > peak:
@@ -91,18 +91,8 @@ def _compute_metrics_from_curve_and_trades(
         dd = ((peak - eq) / peak) * 100.0 if peak > 0 else 0.0
         if dd > max_dd:
             max_dd = dd
-        if prev_eq > 0:
-            rets.append((eq - prev_eq) / prev_eq)
-        prev_eq = eq
 
-    sharpe = 0.0
-    if len(rets) >= 2:
-        mean_r = sum(rets) / float(len(rets))
-        var_r = sum((r - mean_r) ** 2 for r in rets) / float(len(rets) - 1)
-        std_r = math.sqrt(max(0.0, var_r))
-        if std_r > 0:
-            ann_factor = 252.0 if timeframe == "1day" else (252.0 * 12.0)
-            sharpe = (mean_r / std_r) * math.sqrt(ann_factor)
+    sharpe_meta = compute_sharpe_metrics(raw_curve, cap, timeframe, exchange=exchange)
 
     wins = [t for t in trades if float(t.get("pnl", 0.0)) > 0]
     losses = [t for t in trades if float(t.get("pnl", 0.0)) < 0]
@@ -117,7 +107,10 @@ def _compute_metrics_from_curve_and_trades(
         "total_return_pct": round(total_return_pct, 2),
         "cagr_pct": round(cagr_pct, 2),
         "max_drawdown_pct": round(max_dd, 2),
-        "sharpe_ratio": round(sharpe, 2),
+        "sharpe_ratio": sharpe_meta["sharpe_ratio"],
+        "daily_sharpe_ratio": sharpe_meta["daily_sharpe_ratio"],
+        "bar_sharpe_ratio": sharpe_meta["bar_sharpe_ratio"],
+        "sharpe_method": sharpe_meta["sharpe_method"],
         "total_trades": len(trades),
         "winning_trades": len(wins),
         "losing_trades": len(losses),
@@ -191,39 +184,100 @@ class PortfolioBacktestEngine:
         return self._single._resolve_strategy(strategy, rule_def=rule_def)
 
     def _store_export_bundle(self, run_id: str, bundle: Dict[str, Any]) -> None:
+        """
+        Stream full-period OHLCV + indicator rows directly to CSV files on disk
+        under `backtest_exports/{run_id}/` so 8 GB RAM hosts never retain large
+        per-run row arrays in memory.
+        """
+        safe_id = re.sub(r"[^a-zA-Z0-9_-]+", "", run_id)
+        if not safe_id:
+            return
+        by_sym: Dict[str, List[Dict[str, Any]]] = bundle.get("by_symbol") or {}
+        ind_cols: List[str] = list(bundle.get("indicator_columns") or [])
+        strategy_name = str(bundle.get("strategy") or "strategy")
+        headers = [
+            "trading_symbol",
+            "exchange",
+            "timestamp",
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+            *ind_cols,
+            "entry_signal",
+            "exit_signal",
+            "order_action",
+            "order_price",
+            "exit_reason",
+        ]
+
         with self._lock:
-            self._export_cache[run_id] = bundle
-            while len(self._export_cache) > _MAX_CACHED_EXPORTS:
-                oldest = next(iter(self._export_cache))
-                self._export_cache.pop(oldest, None)
             try:
-                self._exports_dir.mkdir(parents=True, exist_ok=True)
-                safe_id = re.sub(r"[^a-zA-Z0-9_-]+", "", run_id)
-                out_path = self._exports_dir / f"{safe_id}.json"
-                out_path.write_text(json.dumps(bundle), encoding="utf-8")
-                # Keep only latest _MAX_CACHED_EXPORTS files on disk
-                files = sorted(self._exports_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-                for old_f in files[_MAX_CACHED_EXPORTS:]:
+                run_dir = self._exports_dir / safe_id
+                run_dir.mkdir(parents=True, exist_ok=True)
+                symbol_files: Dict[str, str] = {}
+                for sym_k in sorted(by_sym.keys()):
+                    safe_sym = re.sub(r"[^A-Za-z0-9._-]+", "_", sym_k.upper()) or "SYM"
+                    csv_path = run_dir / f"{safe_sym}.csv"
+                    with csv_path.open("w", encoding="utf-8", newline="") as fh:
+                        writer = csv.writer(fh)
+                        writer.writerow(headers)
+                        for r in by_sym[sym_k]:
+                            writer.writerow([r.get("symbol", "") if h == "trading_symbol" else r.get(h, "") for h in headers])
+                    symbol_files[sym_k.upper()] = csv_path.name
+
+                meta = {
+                    "run_id": safe_id,
+                    "strategy": strategy_name,
+                    "indicator_columns": ind_cols,
+                    "headers": headers,
+                    "symbol_files": symbol_files,
+                }
+                (run_dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
+                self._export_cache[safe_id] = meta
+                while len(self._export_cache) > _MAX_CACHED_EXPORTS:
+                    oldest = next(iter(self._export_cache))
+                    self._export_cache.pop(oldest, None)
+
+                # Prune old export directories/files beyond _MAX_CACHED_EXPORTS
+                entries = sorted(self._exports_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
+                for old_entry in entries[_MAX_CACHED_EXPORTS:]:
                     try:
-                        old_f.unlink()
+                        if old_entry.is_dir():
+                            for child in old_entry.iterdir():
+                                child.unlink(missing_ok=True)
+                            old_entry.rmdir()
+                        else:
+                            old_entry.unlink(missing_ok=True)
                     except OSError:
                         pass
             except Exception:
                 pass
 
-    def _load_export_bundle(self, run_id: str) -> Optional[Dict[str, Any]]:
+    def _load_export_meta(self, run_id: str) -> Optional[Dict[str, Any]]:
         safe_id = re.sub(r"[^a-zA-Z0-9_-]+", "", run_id or "")
         if not safe_id:
             return None
         with self._lock:
-            if safe_id in self._export_cache:
-                return self._export_cache[safe_id]
-            candidate = self._exports_dir / f"{safe_id}.json"
-            if candidate.exists():
+            cached = self._export_cache.get(safe_id)
+            if cached is not None:
+                return cached
+            meta_file = self._exports_dir / safe_id / "meta.json"
+            if meta_file.exists():
                 try:
-                    data = json.loads(candidate.read_text(encoding="utf-8"))
+                    data = json.loads(meta_file.read_text(encoding="utf-8"))
                     if isinstance(data, dict):
                         self._export_cache[safe_id] = data
+                        return data
+                except Exception:
+                    return None
+            # Legacy single-file JSON fallback
+            legacy_file = self._exports_dir / f"{safe_id}.json"
+            if legacy_file.exists():
+                try:
+                    data = json.loads(legacy_file.read_text(encoding="utf-8"))
+                    if isinstance(data, dict):
                         return data
                 except Exception:
                     return None
@@ -232,19 +286,45 @@ class PortfolioBacktestEngine:
     def export_ohlcv_csv(self, run_id: str, symbol: Optional[str] = None) -> Tuple[str, str]:
         """
         Render complete-period OHLCV + trading symbol + all strategy indicator
-        values + signals/order actions as a downloadable CSV string.
+        values + signals/order actions from disk-streamed CSV storage.
         """
-        bundle = self._load_export_bundle(run_id)
-        if not bundle:
+        safe_id = re.sub(r"[^a-zA-Z0-9_-]+", "", run_id or "")
+        meta = self._load_export_meta(safe_id)
+        if not meta:
             raise KeyError(
                 f"OHLCV + Indicator export data for run '{run_id}' is not available. Re-run the backtest to generate it."
             )
 
-        by_sym: Dict[str, List[Dict[str, Any]]] = bundle.get("by_symbol") or {}
-        ind_cols: List[str] = list(bundle.get("indicator_columns") or [])
-        strat_slug = re.sub(r"[^a-z0-9]+", "_", str(bundle.get("strategy") or "strategy").lower()).strip("_") or "strategy"
-
+        strat_slug = re.sub(r"[^a-z0-9]+", "_", str(meta.get("strategy") or "strategy").lower()).strip("_") or "strategy"
         clean_sym = (symbol or "").strip().upper()
+
+        # Disk-streamed CSV layout (low RAM)
+        if "symbol_files" in meta:
+            run_dir = self._exports_dir / safe_id
+            sym_files: Dict[str, str] = meta.get("symbol_files") or {}
+            if clean_sym and clean_sym not in {"ALL", "COMBINED"}:
+                if clean_sym not in sym_files:
+                    raise KeyError(f"Symbol '{clean_sym}' not found in backtest run '{run_id}'.")
+                csv_path = run_dir / sym_files[clean_sym]
+                return f"{strat_slug}_{clean_sym}_ohlcv_indicators.csv", csv_path.read_text(encoding="utf-8")
+
+            out_lines: List[str] = []
+            for idx_s, sym_k in enumerate(sorted(sym_files.keys())):
+                csv_path = run_dir / sym_files[sym_k]
+                if not csv_path.exists():
+                    continue
+                content = csv_path.read_text(encoding="utf-8")
+                if idx_s == 0:
+                    out_lines.append(content.rstrip("\r\n"))
+                else:
+                    parts = content.splitlines()
+                    if len(parts) > 1:
+                        out_lines.append("\n".join(parts[1:]))
+            return f"{strat_slug}_all_symbols_ohlcv_indicators.csv", ("\n".join(out_lines) + "\n") if out_lines else ""
+
+        # Legacy JSON fallback
+        by_sym: Dict[str, List[Dict[str, Any]]] = meta.get("by_symbol") or {}
+        ind_cols: List[str] = list(meta.get("indicator_columns") or [])
         if clean_sym and clean_sym not in {"ALL", "COMBINED"}:
             if clean_sym not in by_sym:
                 raise KeyError(f"Symbol '{clean_sym}' not found in backtest run '{run_id}'.")
@@ -272,7 +352,6 @@ class PortfolioBacktestEngine:
             "order_price",
             "exit_reason",
         ]
-
         buf = io.StringIO()
         writer = csv.writer(buf)
         writer.writerow(headers)
@@ -668,6 +747,7 @@ class PortfolioBacktestEngine:
             raw_curve=raw_curve,
             trades=all_trades,
             timeframe=timeframe,
+            exchange=exchange,
         )
 
         if progress_cb:
@@ -705,6 +785,13 @@ class PortfolioBacktestEngine:
             "charges_profile": charges_profile,
             "segment": segment,
             "charges_breakdown": agg_charges.to_dict(),
+            "execution_assumptions": {
+                "fill_model": "next_bar_open",
+                "no_same_bar_exit": True,
+                "gap_through_stops": True,
+                "slippage_bps": float(slippage_bps or 0.0),
+                "sharpe_method": metrics.get("sharpe_method", "daily_resampled_sqrt252"),
+            },
             "indicator_columns": export_ind_cols,
             "has_ohlcv_export": True,
             **metrics,
@@ -1071,15 +1158,16 @@ class PortfolioBacktestEngine:
                     if not is_short:
                         if b_high > pos["extreme"]:
                             pos["extreme"] = b_high
-                        if sl_pct > 0 and b_low <= pos["entry_price"] * (1.0 - sl_pct / 100.0):
-                            stop_lvl = pos["entry_price"] * (1.0 - sl_pct / 100.0)
+                        stop_lvl = pos["entry_price"] * (1.0 - sl_pct / 100.0)
+                        tsl_lvl = pos["extreme"] * (1.0 - tsl_pct / 100.0)
+                        tp_lvl = pos["entry_price"] * (1.0 + tp_pct / 100.0)
+                        if sl_pct > 0 and b_low <= stop_lvl:
                             exit_px = min(b_open, stop_lvl) if b_open < stop_lvl else stop_lvl
                             reason = f"STOP_LOSS (-{sl_pct:.1f}%)"
-                        elif tsl_pct > 0 and pos["extreme"] > pos["entry_price"] and b_low <= pos["extreme"] * (1.0 - tsl_pct / 100.0):
-                            exit_px = pos["extreme"] * (1.0 - tsl_pct / 100.0)
+                        elif tsl_pct > 0 and pos["extreme"] > pos["entry_price"] and b_low <= tsl_lvl:
+                            exit_px = min(b_open, tsl_lvl) if b_open < tsl_lvl else tsl_lvl
                             reason = f"TRAILING_SL (-{tsl_pct:.1f}%)"
-                        elif tp_pct > 0 and b_high >= pos["entry_price"] * (1.0 + tp_pct / 100.0):
-                            tp_lvl = pos["entry_price"] * (1.0 + tp_pct / 100.0)
+                        elif tp_pct > 0 and b_high >= tp_lvl:
                             exit_px = max(b_open, tp_lvl) if b_open > tp_lvl else tp_lvl
                             reason = f"TAKE_PROFIT (+{tp_pct:.1f}%)"
                         elif is_session_last_bar:
@@ -1088,14 +1176,17 @@ class PortfolioBacktestEngine:
                     else:
                         if b_low < pos["extreme"]:
                             pos["extreme"] = b_low
-                        if sl_pct > 0 and b_high >= pos["entry_price"] * (1.0 + sl_pct / 100.0):
-                            exit_px = pos["entry_price"] * (1.0 + sl_pct / 100.0)
+                        stop_lvl = pos["entry_price"] * (1.0 + sl_pct / 100.0)
+                        tsl_lvl = pos["extreme"] * (1.0 + tsl_pct / 100.0)
+                        tp_lvl = pos["entry_price"] * (1.0 - tp_pct / 100.0)
+                        if sl_pct > 0 and b_high >= stop_lvl:
+                            exit_px = max(b_open, stop_lvl) if b_open > stop_lvl else stop_lvl
                             reason = f"STOP_LOSS (-{sl_pct:.1f}%)"
-                        elif tsl_pct > 0 and pos["extreme"] < pos["entry_price"] and b_high >= pos["extreme"] * (1.0 + tsl_pct / 100.0):
-                            exit_px = pos["extreme"] * (1.0 + tsl_pct / 100.0)
+                        elif tsl_pct > 0 and pos["extreme"] < pos["entry_price"] and b_high >= tsl_lvl:
+                            exit_px = max(b_open, tsl_lvl) if b_open > tsl_lvl else tsl_lvl
                             reason = f"TRAILING_SL (-{tsl_pct:.1f}%)"
-                        elif tp_pct > 0 and b_low <= pos["entry_price"] * (1.0 - tp_pct / 100.0):
-                            exit_px = pos["entry_price"] * (1.0 - tp_pct / 100.0)
+                        elif tp_pct > 0 and b_low <= tp_lvl:
+                            exit_px = min(b_open, tp_lvl) if b_open < tp_lvl else tp_lvl
                             reason = f"TAKE_PROFIT (+{tp_pct:.1f}%)"
                         elif is_session_last_bar:
                             exit_px = b_close
@@ -1134,7 +1225,7 @@ class PortfolioBacktestEngine:
             last_sym_i = sym_series[psym]["bars_count"] - 1
             _close_position(psym, sym_series[psym]["last_close"], last_ts_label, last_step_idx, last_sym_i, "END_OF_WINDOW")
 
-        # Persist complete-period OHLCV + Indicator rows for CSV export
+        # Persist complete-period OHLCV + Indicator rows directly to disk CSVs
         self._store_export_bundle(
             run_id,
             {
@@ -1152,6 +1243,7 @@ class PortfolioBacktestEngine:
             raw_curve=raw_curve,
             trades=trades,
             timeframe=timeframe,
+            exchange=exchange,
         )
 
         per_symbol_rows: List[Dict[str, Any]] = []
@@ -1213,6 +1305,13 @@ class PortfolioBacktestEngine:
             "charges_profile": charges_cfg.profile,
             "segment": charges_cfg.segment,
             "charges_breakdown": agg_charges.to_dict(),
+            "execution_assumptions": {
+                "fill_model": "next_bar_open",
+                "no_same_bar_exit": True,
+                "gap_through_stops": True,
+                "slippage_bps": float(charges_cfg.slippage_bps or 0.0),
+                "sharpe_method": metrics.get("sharpe_method", "daily_resampled_sqrt252"),
+            },
             "indicator_columns": export_ind_cols,
             "has_ohlcv_export": True,
             **metrics,

@@ -24,12 +24,20 @@ from datetime import datetime, time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from broker.base import OrderStatus
 from broker.registry import BrokerRegistry
 from broker.upstox.auth import auth_manager as upstox_auth
 from broker.zerodha.auth import zerodha_auth_manager as zerodha_auth
 from config import IST_TZ, config
 from core.audit import AuditTrail, audit_trail
+from core.calendar import (
+    get_exchange_schedule,
+    is_exchange_holiday,
+    is_market_open,
+    normalize_exchange,
+)
 from core.instruments import instrument_index
+from notifications.telegram import telegram_notifier
 
 logger = logging.getLogger(__name__)
 
@@ -105,19 +113,30 @@ class KillSwitchController:
         reason: str = "Manual emergency stop triggered by operator",
         actor: str = "operator",
         trading_broker: str = "upstox",
+        broker_adapter: Optional[Any] = None,
     ) -> Dict[str, Any]:
         clean_reason = (reason or "").strip() or "Manual emergency kill switch triggered"
         now_ist = datetime.now(tz=IST_TZ).isoformat(timespec="seconds")
 
         orders_cancelled = 0
+        cancel_errors: List[str] = []
         try:
-            adapter = BrokerRegistry.get(trading_broker)
+            adapter = broker_adapter or BrokerRegistry.get(trading_broker)
             if adapter.capabilities.supports_trading:
-                open_orders = adapter.get_orders()
+                open_orders = adapter.get_orders() or []
                 for ord_obj in open_orders:
+                    st = getattr(ord_obj, "status", OrderStatus.OPEN)
+                    if isinstance(st, OrderStatus) and st.is_terminal:
+                        continue
+                    if isinstance(st, str) and st.upper() in {"FILLED", "CANCELLED", "REJECTED", "EXPIRED", "COMPLETE"}:
+                        continue
                     oid = getattr(ord_obj, "order_id", "")
-                    if oid and adapter.cancel_order(oid):
-                        orders_cancelled += 1
+                    if oid:
+                        try:
+                            if adapter.cancel_order(oid):
+                                orders_cancelled += 1
+                        except Exception as cancel_exc:
+                            cancel_errors.append(f"{oid}: {cancel_exc}")
         except Exception as exc:
             logger.warning("Kill-switch open order cancel probe note: %s", exc)
 
@@ -128,6 +147,7 @@ class KillSwitchController:
             "engaged_at_ist": now_ist,
             "actor": actor,
             "orders_cancelled": orders_cancelled,
+            "cancel_errors": cancel_errors,
         }
         with self._lock:
             path = self.state_file
@@ -141,6 +161,18 @@ class KillSwitchController:
             trading_broker=trading_broker,
             orders_cancelled=orders_cancelled,
         )
+        try:
+            telegram_notifier.notify_event(
+                "KILL_SWITCH",
+                "Emergency Kill Switch ENGAGED",
+                [
+                    f"Reason: {clean_reason}",
+                    f"Actor: {actor} | Broker: {trading_broker.upper()}",
+                    f"Open Orders Cancelled: {orders_cancelled}",
+                ],
+            )
+        except Exception:
+            pass
         return {**payload, "audit_event": audit_event}
 
     def reset(
@@ -175,12 +207,18 @@ class KillSwitchController:
         return {**payload, "audit_event": audit_event}
 
 
-def fetch_broker_margin_summary(broker_id: str, timeout: float = 3.5) -> Dict[str, Any]:
-    """Fetch live margin/balance snapshot from the active trading broker if authenticated."""
+def fetch_broker_margin_summary(
+    broker_id: str,
+    timeout: float = 3.5,
+    exchange: str = "NSE",
+) -> Dict[str, Any]:
+    """Fetch live segment-aware margin/balance snapshot (Equity for NSE/BSE, Commodity for MCX)."""
     bid = (broker_id or "upstox").strip().lower()
+    sched = get_exchange_schedule(exchange)
     if bid == "upstox":
         token = upstox_auth.get_valid_token()
-        url = f"{config.UPSTOX_BASE_URL}/v2/user/get-funds-and-margin?segment=SEC"
+        seg = sched.upstox_margin_segment
+        url = f"{config.UPSTOX_BASE_URL}/v2/user/get-funds-and-margin?segment={seg}"
         req = urllib.request.Request(
             url,
             headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
@@ -188,15 +226,22 @@ def fetch_broker_margin_summary(broker_id: str, timeout: float = 3.5) -> Dict[st
         )
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             raw = json.loads(resp.read().decode("utf-8"))
-        eq = ((raw.get("data") or {}).get("equity")) or {}
+        bucket_key = "commodity" if seg == "COM" else "equity"
+        eq = ((raw.get("data") or {}).get(bucket_key)) or {}
         avail = float(eq.get("available_margin") or 0.0)
         used = float(eq.get("used_margin") or 0.0)
-        return {"broker": "upstox", "available_margin": round(avail, 2), "used_margin": round(used, 2)}
+        return {
+            "broker": "upstox",
+            "segment": sched.segment,
+            "available_margin": round(avail, 2),
+            "used_margin": round(used, 2),
+        }
 
     if bid == "zerodha":
         token = zerodha_auth.get_valid_token()
         api_key = zerodha_auth.api_key
-        url = f"{config.ZERODHA_BASE_URL}/user/margins?segment=equity"
+        seg = sched.zerodha_margin_segment
+        url = f"{config.ZERODHA_BASE_URL}/user/margins?segment={seg}"
         req = urllib.request.Request(
             url,
             headers={
@@ -211,13 +256,18 @@ def fetch_broker_margin_summary(broker_id: str, timeout: float = 3.5) -> Dict[st
         data = raw.get("data") or {}
         avail = float(((data.get("available") or {}).get("live_balance")) or data.get("net") or 0.0)
         used = float(((data.get("utilised") or {}).get("debits")) or 0.0)
-        return {"broker": "zerodha", "available_margin": round(avail, 2), "used_margin": round(used, 2)}
+        return {
+            "broker": "zerodha",
+            "segment": sched.segment,
+            "available_margin": round(avail, 2),
+            "used_margin": round(used, 2),
+        }
 
     raise ValueError(f"Live margin check not supported for '{broker_id}'.")
 
 
 class PreflightChecker:
-    """Runs Phase 4 safety, margin, symbol mapping, and kill-switch preflight checks."""
+    """Runs Phase 4+ safety, segment-aware margin, symbol mapping, exchange calendar, and kill-switch checks."""
 
     @staticmethod
     def run_all(
@@ -225,6 +275,7 @@ class PreflightChecker:
         trading_broker: str = "upstox",
         data_connection: str = "upstox",
         symbols: Optional[List[str]] = None,
+        exchange: str = "NSE",
         kill_switch: Optional[KillSwitchController] = None,
         now_ist: Optional[datetime] = None,
         audit: Optional[AuditTrail] = None,
@@ -232,6 +283,8 @@ class PreflightChecker:
     ) -> Dict[str, Any]:
         ks = kill_switch or kill_switch_controller
         trail = audit or audit_trail
+        clean_exch = normalize_exchange(exchange)
+        sched = get_exchange_schedule(clean_exch)
         target_symbols = [s.strip().upper() for s in (symbols or ["RELIANCE", "NIFTY"]) if s.strip()]
         ref_dt = now_ist.astimezone(IST_TZ) if now_ist else datetime.now(tz=IST_TZ)
 
@@ -294,19 +347,19 @@ class PreflightChecker:
             )
         )
 
-        # 4. Broker Live Margin / Risk Capital Check
+        # 4. Segment-Aware Broker Live Margin / Risk Capital Check
         if t_ok:
             try:
-                margin = fetch_broker_margin_summary(trading_broker, timeout=3.0)
+                margin = fetch_broker_margin_summary(trading_broker, timeout=3.0, exchange=clean_exch)
                 avail = float(margin.get("available_margin", 0.0))
                 checks.append(
                     PreflightCheckItem(
                         id="margin_balance",
-                        name="Margin & Capital Check",
+                        name=f"Margin & Capital Check ({sched.segment.title()})",
                         passed=avail > 0,
                         status="PASS" if avail > 0 else "WARN",
                         severity="WARNING",
-                        message=f"Available equity margin: ₹{avail:,.2f} (Used: ₹{margin.get('used_margin', 0.0):,.2f}).",
+                        message=f"Available {sched.segment} margin: ₹{avail:,.2f} (Used: ₹{margin.get('used_margin', 0.0):,.2f}).",
                         detail=margin,
                     )
                 )
@@ -314,66 +367,70 @@ class PreflightChecker:
                 checks.append(
                     PreflightCheckItem(
                         id="margin_balance",
-                        name="Margin & Capital Check",
+                        name=f"Margin & Capital Check ({sched.segment.title()})",
                         passed=False,
                         status="WARN",
                         severity="WARNING",
-                        message=f"Could not read live broker margin ({exc}). Configured risk cap: ₹{config.TOTAL_CAPITAL:,.0f}.",
+                        message=f"Could not read live {sched.segment} margin ({exc}). Configured risk cap: ₹{config.TOTAL_CAPITAL:,.0f}.",
                     )
                 )
         else:
             checks.append(
                 PreflightCheckItem(
                     id="margin_balance",
-                    name="Margin & Capital Check",
+                    name=f"Margin & Capital Check ({sched.segment.title()})",
                     passed=False,
                     status="WARN",
                     severity="WARNING",
-                    message=f"Connect {t_adapter.display_name} to read live equity margin (Configured capital: ₹{config.TOTAL_CAPITAL:,.0f}).",
+                    message=f"Connect {t_adapter.display_name} to read live {sched.segment} margin (Configured capital: ₹{config.TOTAL_CAPITAL:,.0f}).",
                 )
             )
 
-        # 5. SQLite Instrument Key Mapping Check
+        # 5. SQLite Instrument Key Mapping Check (Exchange-aware)
         mapped: Dict[str, Optional[str]] = {}
         missing: List[str] = []
         lookup_broker = trading_broker if trading_broker in {"upstox", "zerodha"} else "upstox"
         for sym in target_symbols:
-            resolved = instrument_index.resolve_key(sym, broker_id=lookup_broker, exchange="NSE")
+            resolved = instrument_index.resolve_key(sym, broker_id=lookup_broker, exchange=clean_exch)
             mapped[sym] = resolved
             if not resolved:
                 missing.append(sym)
         checks.append(
             PreflightCheckItem(
                 id="symbol_mapping",
-                name="SQLite Instrument Mapping",
+                name=f"SQLite Instrument Mapping ({clean_exch})",
                 passed=len(missing) == 0,
                 status="PASS" if len(missing) == 0 else "FAIL",
                 severity="ERROR",
                 message=(
-                    f"Resolved {len(target_symbols)}/{len(target_symbols)} symbols in local SQLite for {lookup_broker}."
+                    f"Resolved {len(target_symbols)}/{len(target_symbols)} symbols on {clean_exch} in local SQLite for {lookup_broker}."
                     if not missing
-                    else f"Missing SQLite key/token for: {', '.join(missing)}. Run instrument master sync."
+                    else f"Missing {clean_exch} SQLite key/token for: {', '.join(missing)}. Run instrument master sync."
                 ),
-                detail={"broker": lookup_broker, "mapped": mapped},
+                detail={"broker": lookup_broker, "exchange": clean_exch, "mapped": mapped},
             )
         )
 
-        # 6. NSE Market Hours (IST)
-        is_weekday = ref_dt.weekday() < 5
-        t_now = ref_dt.time()
-        market_open = is_weekday and (_NSE_OPEN <= t_now <= _NSE_CLOSE)
+        # 6. Multi-Exchange Trading Hours & Holiday Calendar (IST)
+        holiday = is_exchange_holiday(ref_dt.date(), exchange=clean_exch)
+        market_open = is_market_open(ref_dt, exchange=clean_exch)
+        window_str = f"{sched.open_time.strftime('%H:%M')}–{sched.close_time.strftime('%H:%M')} IST"
+        if holiday:
+            hours_msg = f"{clean_exch} is closed today ({ref_dt.date().isoformat()} is an exchange holiday). Safe for paper/dry runs."
+        elif market_open:
+            hours_msg = f"{clean_exch} {sched.segment} session active ({ref_dt.strftime('%H:%M:%S IST')}, window {window_str})."
+        else:
+            hours_msg = f"Outside {clean_exch} hours {window_str} ({ref_dt.strftime('%a %H:%M IST')}). Safe for paper/dry runs."
+
         checks.append(
             PreflightCheckItem(
                 id="market_hours",
-                name="NSE Trading Hours (IST)",
+                name=f"{clean_exch} Trading Hours & Holiday Calendar (IST)",
                 passed=market_open,
                 status="PASS" if market_open else "WARN",
                 severity="WARNING",
-                message=(
-                    f"NSE Cash/F&O session active ({ref_dt.strftime('%H:%M:%S IST')})."
-                    if market_open
-                    else f"Outside NSE hours 09:15–15:30 IST ({ref_dt.strftime('%a %H:%M IST')}). Safe for paper/dry runs."
-                ),
+                message=hours_msg,
+                detail={"exchange": clean_exch, "holiday": holiday, "window": window_str},
             )
         )
 
@@ -391,6 +448,8 @@ class PreflightChecker:
 
         return {
             "ok": True,
+            "exchange": clean_exch,
+            "segment": sched.segment,
             "overall_ready": overall_ready,
             "passed_count": passed_count,
             "total_count": len(checks),
@@ -409,3 +468,4 @@ __all__ = [
     "fetch_broker_margin_summary",
     "kill_switch_controller",
 ]
+

@@ -18,9 +18,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, Response, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
+from web.security import security_manager
 from web.service import hub_service
 from web.spa import has_spa_bundle, render_spa_html, resolve_spa_asset
 
@@ -89,6 +90,7 @@ class FeedFailoverRequest(BaseModel):
 
 class PreflightRequest(BaseModel):
     symbols: Optional[List[str]] = None
+    exchange: str = "NSE"
 
 
 class KillSwitchRequest(BaseModel):
@@ -200,9 +202,11 @@ def create_app() -> FastAPI:
     @asynccontextmanager
     async def _lifespan(_app: FastAPI):
         reset_shutdown()
+        hub_service.start_background_services()
         try:
             yield
         finally:
+            hub_service.stop_background_services()
             request_shutdown()
 
     app = FastAPI(
@@ -211,6 +215,20 @@ def create_app() -> FastAPI:
         version="1.0.0",
         lifespan=_lifespan,
     )
+
+    @app.middleware("http")
+    async def _bearer_auth_middleware(request: Request, call_next):
+        if security_manager.is_protected_request(request.method, request.url.path):
+            auth_hdr = request.headers.get("authorization")
+            if not security_manager.verify_bearer(auth_hdr):
+                return JSONResponse(
+                    status_code=401,
+                    content={
+                        "detail": "Operator authentication required. Sign in with your admin passcode or ALGODESK_API_TOKEN.",
+                        "auth_required": True,
+                    },
+                )
+        return await call_next(request)
 
     @app.get("/", response_class=HTMLResponse)
     def index() -> HTMLResponse:
@@ -635,7 +653,10 @@ def create_app() -> FastAPI:
 
     @app.post("/api/live/preflight")
     def api_live_preflight(payload: Optional[PreflightRequest] = None) -> dict:
-        return hub_service.run_preflight(symbols=payload.symbols if payload else None)
+        return hub_service.run_preflight(
+            symbols=payload.symbols if payload else None,
+            exchange=payload.exchange if payload else "NSE",
+        )
 
     @app.post("/api/live/kill-switch")
     def api_live_kill_switch(payload: KillSwitchRequest) -> dict:
@@ -1099,6 +1120,67 @@ def create_app() -> FastAPI:
     def api_streak_quick_order(payload: Dict[str, Any]) -> dict:
         try:
             return hub_service.place_quick_order(payload)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/streak/deployments/reconcile")
+    def api_streak_deployments_reconcile(payload: Optional[Dict[str, Any]] = None) -> dict:
+        try:
+            dep_id = payload.get("deployment_id") if isinstance(payload, dict) else None
+            return hub_service.reconcile_deployments(deployment_id=dep_id)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/streak/oms/orders")
+    def api_streak_oms_orders(
+        deployment_id: Optional[str] = Query(default=None),
+        limit: int = Query(default=100),
+    ) -> dict:
+        return hub_service.list_oms_orders(deployment_id=deployment_id, limit=limit)
+
+    @app.get("/api/data/history")
+    def api_data_history(
+        symbol: Optional[str] = Query(default=None),
+        exchange: Optional[str] = Query(default=None),
+        timeframe: Optional[str] = Query(default=None),
+    ) -> dict:
+        return hub_service.get_asset_data_history(symbol=symbol, exchange=exchange, timeframe=timeframe)
+
+    @app.get("/api/security/status")
+    def api_security_status() -> dict:
+        return hub_service.get_security_status()
+
+    @app.post("/api/security/claim")
+    def api_security_claim(payload: Dict[str, Any]) -> dict:
+        try:
+            return hub_service.claim_admin_passcode(str(payload.get("passcode", "")))
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/security/login")
+    def api_security_login(payload: Dict[str, Any]) -> dict:
+        try:
+            return hub_service.login_admin(str(payload.get("passcode") or payload.get("token") or ""))
+        except PermissionError as exc:
+            raise HTTPException(status_code=401, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/notifications/telegram")
+    def api_telegram_get() -> dict:
+        return hub_service.get_telegram_settings()
+
+    @app.post("/api/notifications/telegram")
+    def api_telegram_update(payload: Dict[str, Any]) -> dict:
+        try:
+            return hub_service.update_telegram_settings(payload)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/notifications/telegram/test")
+    def api_telegram_test() -> dict:
+        try:
+            return hub_service.send_telegram_test()
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 

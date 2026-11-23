@@ -154,7 +154,7 @@ class RiskLimitManager:
             reasons.append(
                 f"Order notional ₹{notional:,.2f} exceeds per-trade cap ₹{max_trade_notional:,.2f} ({limits['max_capital_per_trade_pct']}%)."
             )
-        if str(transaction_type).upper() == "BUY":
+        if str(transaction_type).upper() in {"BUY", "SHORT"}:
             if current_open_positions >= int(limits["max_open_positions"]):
                 reasons.append(
                     f"Open positions ({current_open_positions}) reached limit ({limits['max_open_positions']})."
@@ -183,7 +183,11 @@ class RiskLimitManager:
         funds: Optional[Dict[str, float]] = None,
         positions: Optional[List[Dict[str, Any]]] = None,
         orders: Optional[List[Dict[str, Any]]] = None,
+        broker_adapter: Optional[Any] = None,
+        notifier: Optional[Any] = None,
     ) -> Dict[str, Any]:
+        from notifications.telegram import telegram_notifier
+
         limits = self.load_limits()
         broker_id = (trading_broker or "upstox").strip().lower()
         broker_connected = False
@@ -201,7 +205,7 @@ class RiskLimitManager:
             broker_note = f"Evaluated against {broker_id.upper()} live state."
         else:
             try:
-                adapter = BrokerRegistry.get(broker_id)
+                adapter = broker_adapter or BrokerRegistry.get(broker_id)
                 snap = adapter.health_check(timeout=2.5)
                 broker_connected = bool(snap.is_connected)
                 if broker_connected and adapter.capabilities.supports_trading:
@@ -211,22 +215,25 @@ class RiskLimitManager:
                         live_positions.append(
                             {
                                 "symbol": getattr(p, "symbol", ""),
-                                "quantity": int(getattr(p, "quantity", 0)),
+                                "quantity": int(getattr(p, "signed_quantity", getattr(p, "quantity", 0))),
                                 "average_price": float(getattr(p, "average_price", 0.0)),
-                                "last_price": float(getattr(p, "last_price", 0.0)),
+                                "last_price": float(getattr(p, "last_price", getattr(p, "average_price", 0.0))),
                                 "realized_pnl": float(getattr(p, "realized_pnl", 0.0)),
                                 "unrealized_pnl": float(getattr(p, "unrealized_pnl", 0.0)),
                             }
                         )
                     raw_ord = adapter.get_orders() or []
-                    live_orders = [
-                        {
-                            "order_id": getattr(o, "order_id", ""),
-                            "symbol": getattr(o, "symbol", ""),
-                            "status": str(getattr(o, "status", "")),
-                        }
-                        for o in raw_ord
-                    ]
+                    for o in raw_ord:
+                        req_obj = getattr(o, "request", None)
+                        live_orders.append(
+                            {
+                                "order_id": getattr(o, "order_id", ""),
+                                "symbol": getattr(o, "symbol", getattr(req_obj, "symbol", "")),
+                                "status": str(getattr(o, "status", "")),
+                                "remaining_quantity": int(getattr(o, "remaining_quantity", 0)),
+                                "price": float(getattr(req_obj, "price", 0.0) or 0.0) if req_obj is not None else 0.0,
+                            }
+                        )
                     broker_note = f"Connected to {adapter.display_name} ({snap.account_name or snap.client_id})."
                 else:
                     broker_note = f"{adapter.display_name} disconnected ({snap.message}). Evaluating configured capital envelope."
@@ -252,9 +259,22 @@ class RiskLimitManager:
                     max_single_pos_val = notional
             daily_pnl += float(p.get("realized_pnl", 0.0)) + float(p.get("unrealized_pnl", 0.0))
 
+        # Include pending open order notional exposure
+        pending_order_exposure = 0.0
+        active_order_count = 0
+        for o in live_orders:
+            st = str(o.get("status") or "").upper()
+            if any(term in st for term in ("FILLED", "CANCELLED", "REJECTED", "EXPIRED", "COMPLETE")):
+                continue
+            active_order_count += 1
+            rem_qty = abs(int(o.get("remaining_quantity") or o.get("pending_quantity") or 0))
+            o_px = float(o.get("price") or o.get("limit_price") or 0.0)
+            pending_order_exposure += rem_qty * o_px
+
+        total_exposure = gross_exposure + pending_order_exposure
         max_single_pos_pct = (max_single_pos_val / capital_base) * 100.0 if capital_base > 0 else 0.0
         daily_loss = max(0.0, -daily_pnl)
-        exposure_util_pct = (gross_exposure / float(limits["max_gross_exposure_inr"])) * 100.0
+        exposure_util_pct = (total_exposure / float(limits["max_gross_exposure_inr"])) * 100.0
         daily_loss_util_pct = (daily_loss / float(limits["max_daily_loss_inr"])) * 100.0
 
         breaches: List[Dict[str, Any]] = []
@@ -274,12 +294,12 @@ class RiskLimitManager:
                     "message": f"Open positions ({len(open_positions)}) exceeded limit ({limits['max_open_positions']}).",
                 }
             )
-        if gross_exposure > float(limits["max_gross_exposure_inr"]):
+        if total_exposure > float(limits["max_gross_exposure_inr"]):
             breaches.append(
                 {
                     "rule": "max_gross_exposure_inr",
                     "severity": "CRITICAL",
-                    "message": f"Gross exposure ₹{gross_exposure:,.2f} exceeded cap ₹{limits['max_gross_exposure_inr']:,.2f}.",
+                    "message": f"Total exposure ₹{total_exposure:,.2f} (positions + pending orders) exceeded cap ₹{limits['max_gross_exposure_inr']:,.2f}.",
                 }
             )
         if max_single_pos_pct > float(limits["max_capital_per_trade_pct"]):
@@ -299,6 +319,7 @@ class RiskLimitManager:
                     reason=f"Auto-halt: daily loss ₹{daily_loss:,.2f} breached cap ₹{limits['max_daily_loss_inr']:,.2f}",
                     actor="risk_guard",
                     trading_broker=broker_id,
+                    broker_adapter=broker_adapter,
                 )
                 kill_auto_triggered = True
             self._audit.log(
@@ -311,6 +332,18 @@ class RiskLimitManager:
                     "auto_kill_switch": True,
                 },
             )
+            eff_notifier = notifier or telegram_notifier
+            try:
+                eff_notifier.notify_event(
+                    "DAILY_LOSS_BREACH",
+                    f"Daily Loss Breach on {broker_id.upper()} — Kill Switch Engaged",
+                    [
+                        f"Daily Loss: ₹{daily_loss:,.2f} (Limit: ₹{limits['max_daily_loss_inr']:,.2f})",
+                        f"Open Positions: {len(open_positions)} | Pending Orders: {active_order_count}",
+                    ],
+                )
+            except Exception:
+                pass
 
         return {
             "ok": True,
@@ -323,8 +356,9 @@ class RiskLimitManager:
                 "available_margin_inr": round(avail_margin, 2),
                 "used_margin_inr": round(used_margin, 2),
                 "open_positions_count": len(open_positions),
-                "open_orders_count": len(live_orders),
-                "gross_exposure_inr": round(gross_exposure, 2),
+                "open_orders_count": active_order_count,
+                "pending_order_exposure_inr": round(pending_order_exposure, 2),
+                "gross_exposure_inr": round(total_exposure, 2),
                 "exposure_utilization_pct": round(min(exposure_util_pct, 999.0), 1),
                 "daily_pnl_inr": round(daily_pnl, 2),
                 "daily_loss_inr": round(daily_loss, 2),
@@ -339,6 +373,94 @@ class RiskLimitManager:
         }
 
 
-risk_limit_manager = RiskLimitManager()
+class RiskWatchdog:
+    """
+    Headless continuous risk & reconciliation background thread.
+    Runs independently of the web UI so daily-loss limits engage the kill switch
+    and notify Telegram even when no browser is open.
+    """
 
-__all__ = ["RiskLimitManager", "risk_limit_manager"]
+    def __init__(
+        self,
+        risk_mgr: Optional[RiskLimitManager] = None,
+        *,
+        interval_sec: float = 10.0,
+        broker_provider: Optional[Any] = None,
+        state_provider: Optional[Any] = None,
+        notifier: Optional[Any] = None,
+    ) -> None:
+        self._risk = risk_mgr or risk_limit_manager
+        self._interval = max(1.0, float(interval_sec))
+        self._broker_provider = broker_provider
+        self._state_provider = state_provider
+        self._notifier = notifier
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._last_eval: Optional[Dict[str, Any]] = None
+        self._lock = threading.RLock()
+
+    def run_once(self) -> Dict[str, Any]:
+        if self._state_provider is not None:
+            snapshot = self._state_provider() or {}
+            res = self._risk.evaluate(
+                trading_broker=str(snapshot.get("trading_broker") or "upstox"),
+                funds=snapshot.get("funds"),
+                positions=snapshot.get("positions"),
+                orders=snapshot.get("orders"),
+                broker_adapter=snapshot.get("broker_adapter"),
+                notifier=self._notifier,
+            )
+        else:
+            broker_id = "upstox"
+            adapter = None
+            if callable(self._broker_provider):
+                broker_id, adapter = self._broker_provider()
+            res = self._risk.evaluate(
+                trading_broker=broker_id,
+                broker_adapter=adapter,
+                notifier=self._notifier,
+            )
+        with self._lock:
+            self._last_eval = res
+        return res
+
+    def start(self) -> None:
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._stop.clear()
+            self._thread = threading.Thread(
+                target=self._loop,
+                name="algodesk-risk-watchdog",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        th = self._thread
+        if th is not None and th.is_alive():
+            th.join(timeout=2.0)
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            try:
+                self.run_once()
+            except Exception:
+                pass
+            self._stop.wait(self._interval)
+
+    def status(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "running": bool(self._thread is not None and self._thread.is_alive()),
+                "interval_sec": self._interval,
+                "last_evaluation": self._last_eval,
+            }
+
+
+risk_limit_manager = RiskLimitManager()
+risk_watchdog = RiskWatchdog(risk_limit_manager, interval_sec=15.0)
+
+__all__ = ["RiskLimitManager", "RiskWatchdog", "risk_limit_manager", "risk_watchdog"]
+

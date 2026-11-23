@@ -24,14 +24,91 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from backtest.registry import StrategyRegistry, strategy_registry
 from config import IST_TZ, config
+from core.calendar import session_minutes
 from core.historical import (
     HistoricalDataManager,
     historical_data_manager,
     normalize_timeframe,
+    parse_timeframe,
     resolve_base_timeframe,
 )
 from core.jobs import JobCancelledError
 from indicators.toolkit import IndicatorToolkit, available_backends
+
+
+def compute_sharpe_metrics(
+    raw_curve: List[Dict[str, Any]],
+    initial_capital: float,
+    timeframe: str,
+    exchange: str = "NSE",
+) -> Dict[str, Any]:
+    """
+    Compute statistically sound Sharpe ratios across all timeframes:
+    - `daily_sharpe_ratio`: Headline Sharpe computed from end-of-day resampled
+      equity returns annualized by `sqrt(252)` (comparable across 1m, 5m, 15m, 1d).
+    - `bar_sharpe_ratio`: Bar-frequency Sharpe annualized by the exact number of
+      bars per trading year for `(timeframe, exchange)`.
+    """
+    count, unit = parse_timeframe(timeframe)
+    if unit == "minute":
+        sess_mins = float(session_minutes(exchange))
+        bars_per_year = 252.0 * max(1.0, sess_mins / float(max(1, count)))
+    elif unit == "day":
+        bars_per_year = 252.0 / float(max(1, count))
+    elif unit == "week":
+        bars_per_year = 52.0
+    elif unit == "month":
+        bars_per_year = 12.0
+    else:
+        bars_per_year = 252.0
+
+    # Bar-level returns
+    bar_rets: List[float] = []
+    prev_eq = max(1.0, float(initial_capital))
+    eod_equity: Dict[str, float] = {}
+    for pt in raw_curve:
+        eq = float(pt.get("equity", prev_eq))
+        if prev_eq > 0:
+            bar_rets.append((eq - prev_eq) / prev_eq)
+        prev_eq = eq
+        day_key = str(pt.get("date") or "")[:10]
+        if day_key:
+            eod_equity[day_key] = eq
+
+    bar_sharpe = 0.0
+    if len(bar_rets) >= 2:
+        mean_b = sum(bar_rets) / float(len(bar_rets))
+        var_b = sum((r - mean_b) ** 2 for r in bar_rets) / float(len(bar_rets) - 1)
+        std_b = math.sqrt(max(0.0, var_b))
+        if std_b > 1e-12:
+            bar_sharpe = (mean_b / std_b) * math.sqrt(bars_per_year)
+
+    # Daily-resampled returns (end-of-day equity per calendar trading date)
+    daily_rets: List[float] = []
+    prev_d_eq = max(1.0, float(initial_capital))
+    for d_key in sorted(eod_equity.keys()):
+        d_eq = eod_equity[d_key]
+        if prev_d_eq > 0:
+            daily_rets.append((d_eq - prev_d_eq) / prev_d_eq)
+        prev_d_eq = d_eq
+
+    daily_sharpe = 0.0
+    if len(daily_rets) >= 2:
+        mean_d = sum(daily_rets) / float(len(daily_rets))
+        var_d = sum((r - mean_d) ** 2 for r in daily_rets) / float(len(daily_rets) - 1)
+        std_d = math.sqrt(max(0.0, var_d))
+        if std_d > 1e-12:
+            daily_sharpe = (mean_d / std_d) * math.sqrt(252.0)
+
+    headline = daily_sharpe if len(daily_rets) >= 2 else bar_sharpe
+    return {
+        "sharpe_ratio": round(headline, 2),
+        "daily_sharpe_ratio": round(daily_sharpe, 2),
+        "bar_sharpe_ratio": round(bar_sharpe, 2),
+        "sharpe_method": "daily_resampled_sqrt252" if len(daily_rets) >= 2 else "exact_session_bars",
+        "sharpe_bars_per_year": round(bars_per_year, 2),
+        "trading_days_in_curve": len(eod_equity),
+    }
 
 
 def format_bar_timestamp(bar: Dict[str, Any], timeframe: str) -> str:
@@ -178,6 +255,8 @@ class BacktestEngine:
         side: Optional[str] = None,
         initial_capital: float = 500000.0,
         slippage_bps: float = 5.0,
+        spread_bps: float = 0.0,
+        max_volume_participation_pct: float = 0.0,
         fee_bps: float = 5.0,
         stop_loss_pct: float = 5.0,
         take_profit_pct: float = 12.0,
@@ -206,11 +285,14 @@ class BacktestEngine:
         resolved_params = strat_inst.resolve_params(params)
 
         eff_side = (side or (rule_def.get("side") if isinstance(rule_def, dict) else None) or "BUY").strip().upper()
-        is_short = eff_side == "SELL"
+        is_short = eff_side in {"SELL", "SHORT"}
         eff_holding = (holding_type or ("MIS" if segment == "equity_intraday" else "CNC")).strip().upper()
         mis_eod_squareoff = is_intraday_tf and eff_holding == "MIS"
 
         cap = max(1000.0, float(initial_capital or 500000.0))
+        eff_spread_bps = max(0.0, float(spread_bps or 0.0))
+        half_spread_rate = (eff_spread_bps / 2.0) / 10000.0
+        vol_cap_pct = max(0.0, min(100.0, float(max_volume_participation_pct or 0.0)))
         cost_rate = max(0.0, (float(slippage_bps or 0.0) + float(fee_bps or 0.0)) / 10000.0)
         sl_pct = max(0.0, float(stop_loss_pct or 0.0))
         tp_pct = max(0.0, float(take_profit_pct or 0.0))
@@ -304,16 +386,25 @@ class BacktestEngine:
                 return cash + (shares * entry_price) + ((entry_price - close_px) * shares)
             return cash + (shares * close_px)
 
-        def _open_trade(fill_px: float, bar_ts: str, bar_i: int) -> bool:
+        def _open_trade(fill_px_raw: float, bar_ts: str, bar_i: int, bar_vol: int = 0) -> bool:
             nonlocal cash, shares, entry_price, entry_date, entry_bar_idx, entry_cost, entry_leg_charges, extreme_since_entry
-            if fill_px <= 0 or cash <= 0:
+            if fill_px_raw <= 0 or cash <= 0:
                 return False
+            # Apply half-spread adversely (higher buy fill for LONG, lower sell fill for SHORT)
+            fill_px = fill_px_raw * (1.0 - half_spread_rate) if is_short else fill_px_raw * (1.0 + half_spread_rate)
             entry_side = "SELL" if is_short else "BUY"
+            max_vol_qty = (
+                max(1, int(bar_vol * (vol_cap_pct / 100.0)))
+                if (vol_cap_pct > 0 and bar_vol > 0)
+                else 0
+            )
             if use_real_charges and charges_cfg is not None:
                 from charges.calculator import charges_engine
 
                 est_rate = (charges_cfg.slippage_bps / 10000.0) + charges_cfg.stt_buy_pct + charges_cfg.stamp_duty_buy_pct + 0.001
                 qty = int(max(0.0, cash - charges_cfg.brokerage_flat_per_order * 1.2) // (fill_px * (1.0 + est_rate)))
+                if max_vol_qty > 0:
+                    qty = min(qty, max_vol_qty)
                 if qty < 1:
                     return False
                 leg = charges_engine.calculate_leg(
@@ -322,6 +413,8 @@ class BacktestEngine:
                 total_outlay = (qty * fill_px) + leg.total_charges
                 if total_outlay > cash and qty > 1:
                     qty = max(1, int((cash - leg.total_charges) // fill_px))
+                    if max_vol_qty > 0:
+                        qty = min(qty, max_vol_qty)
                     leg = charges_engine.calculate_leg(
                         side=entry_side, price=fill_px, quantity=qty, cfg=charges_cfg, include_slippage=True
                     )
@@ -339,6 +432,8 @@ class BacktestEngine:
             else:
                 buy_eff = fill_px * (1.0 + cost_rate)
                 qty = int(cash // buy_eff)
+                if max_vol_qty > 0:
+                    qty = min(qty, max_vol_qty)
                 if qty < 1:
                     return False
                 shares = qty
@@ -355,11 +450,14 @@ class BacktestEngine:
 
         def _close_trade(exit_px_raw: float, exit_date_str: str, exit_bar_i: int, reason: str) -> None:
             nonlocal cash, shares, entry_price, entry_date, entry_bar_idx, entry_cost, entry_leg_charges, extreme_since_entry, gross_pnl_total
+            # Apply half-spread adversely on exit (higher buy-cover for SHORT, lower sell for LONG)
+            exit_px_eff = exit_px_raw * (1.0 + half_spread_rate) if is_short else exit_px_raw * (1.0 - half_spread_rate)
             gross_trade_pnl = (
-                (entry_price - exit_px_raw) * shares if is_short else (exit_px_raw - entry_price) * shares
+                (entry_price - exit_px_eff) * shares if is_short else (exit_px_eff - entry_price) * shares
             )
             gross_pnl_total += gross_trade_pnl
             exit_side = "BUY" if is_short else "SELL"
+            exit_px_raw = exit_px_eff
             if use_real_charges and charges_cfg is not None:
                 from charges.calculator import ChargeBreakdown, charges_engine
 
@@ -455,24 +553,29 @@ class BacktestEngine:
             # 2) Execute pending ENTRY from previous bar at THIS bar's open (never on last bar or EOD MIS bar)
             entered_this_bar = False
             if shares == 0 and pending_entry and i < n_rows - 1 and in_window and not is_session_last_bar:
-                entered_this_bar = _open_trade(bar_open, bar_ts, i)
+                bar_vol = int(float(bar.get("volume") or 0))
+                entered_this_bar = _open_trade(bar_open, bar_ts, i, bar_vol=bar_vol)
             pending_entry = False
 
             # 3) Intrabar SL / TSL / TP / MIS EOD square-off (ONLY on bars strictly AFTER entry bar!)
+            # Includes realistic gap-through-stop fills on BOTH long and short positions.
             if shares > 0 and not entered_this_bar and i > entry_bar_idx:
                 exit_reason = ""
                 exit_px = bar_close
                 if not is_short:
                     if bar_high > extreme_since_entry:
                         extreme_since_entry = bar_high
-                    if sl_pct > 0 and bar_low <= entry_price * (1.0 - sl_pct / 100.0):
-                        exit_px = min(bar_open, entry_price * (1.0 - sl_pct / 100.0)) if bar_open < entry_price * (1.0 - sl_pct / 100.0) else entry_price * (1.0 - sl_pct / 100.0)
+                    stop_lvl = entry_price * (1.0 - sl_pct / 100.0)
+                    tsl_lvl = extreme_since_entry * (1.0 - tsl_pct / 100.0)
+                    tp_lvl = entry_price * (1.0 + tp_pct / 100.0)
+                    if sl_pct > 0 and bar_low <= stop_lvl:
+                        exit_px = min(bar_open, stop_lvl) if bar_open < stop_lvl else stop_lvl
                         exit_reason = f"STOP_LOSS (-{sl_pct:.1f}%)"
-                    elif tsl_pct > 0 and extreme_since_entry > entry_price and bar_low <= extreme_since_entry * (1.0 - tsl_pct / 100.0):
-                        exit_px = extreme_since_entry * (1.0 - tsl_pct / 100.0)
+                    elif tsl_pct > 0 and extreme_since_entry > entry_price and bar_low <= tsl_lvl:
+                        exit_px = min(bar_open, tsl_lvl) if bar_open < tsl_lvl else tsl_lvl
                         exit_reason = f"TRAILING_SL (-{tsl_pct:.1f}%)"
-                    elif tp_pct > 0 and bar_high >= entry_price * (1.0 + tp_pct / 100.0):
-                        exit_px = max(bar_open, entry_price * (1.0 + tp_pct / 100.0)) if bar_open > entry_price * (1.0 + tp_pct / 100.0) else entry_price * (1.0 + tp_pct / 100.0)
+                    elif tp_pct > 0 and bar_high >= tp_lvl:
+                        exit_px = max(bar_open, tp_lvl) if bar_open > tp_lvl else tp_lvl
                         exit_reason = f"TAKE_PROFIT (+{tp_pct:.1f}%)"
                     elif is_session_last_bar:
                         exit_px = bar_close
@@ -480,14 +583,17 @@ class BacktestEngine:
                 else:
                     if bar_low < extreme_since_entry:
                         extreme_since_entry = bar_low
-                    if sl_pct > 0 and bar_high >= entry_price * (1.0 + sl_pct / 100.0):
-                        exit_px = entry_price * (1.0 + sl_pct / 100.0)
+                    stop_lvl = entry_price * (1.0 + sl_pct / 100.0)
+                    tsl_lvl = extreme_since_entry * (1.0 + tsl_pct / 100.0)
+                    tp_lvl = entry_price * (1.0 - tp_pct / 100.0)
+                    if sl_pct > 0 and bar_high >= stop_lvl:
+                        exit_px = max(bar_open, stop_lvl) if bar_open > stop_lvl else stop_lvl
                         exit_reason = f"STOP_LOSS (-{sl_pct:.1f}%)"
-                    elif tsl_pct > 0 and extreme_since_entry < entry_price and bar_high >= extreme_since_entry * (1.0 + tsl_pct / 100.0):
-                        exit_px = extreme_since_entry * (1.0 + tsl_pct / 100.0)
+                    elif tsl_pct > 0 and extreme_since_entry < entry_price and bar_high >= tsl_lvl:
+                        exit_px = max(bar_open, tsl_lvl) if bar_open > tsl_lvl else tsl_lvl
                         exit_reason = f"TRAILING_SL (-{tsl_pct:.1f}%)"
-                    elif tp_pct > 0 and bar_low <= entry_price * (1.0 - tp_pct / 100.0):
-                        exit_px = entry_price * (1.0 - tp_pct / 100.0)
+                    elif tp_pct > 0 and bar_low <= tp_lvl:
+                        exit_px = min(bar_open, tp_lvl) if bar_open < tp_lvl else tp_lvl
                         exit_reason = f"TAKE_PROFIT (+{tp_pct:.1f}%)"
                     elif is_session_last_bar:
                         exit_px = bar_close
@@ -534,14 +640,8 @@ class BacktestEngine:
         years = max(span_days / 365.25, 1.0 / 252.0)
         cagr_pct = ((max(final_equity, 1.0) / cap) ** (1.0 / years) - 1.0) * 100.0 if years >= 0.08 else total_return_pct
 
-        sharpe = 0.0
-        if len(daily_returns) >= 2:
-            mean_r = sum(daily_returns) / float(len(daily_returns))
-            var_r = sum((r - mean_r) ** 2 for r in daily_returns) / float(len(daily_returns) - 1)
-            std_r = math.sqrt(max(0.0, var_r))
-            if std_r > 0:
-                ann_factor = 252.0 if tf == "1day" else (252.0 * 12.0)
-                sharpe = (mean_r / std_r) * math.sqrt(ann_factor)
+        sharpe_metrics = compute_sharpe_metrics(raw_curve, cap, tf, exchange=clean_exch)
+        sharpe = float(sharpe_metrics["sharpe_ratio"])
 
         wins = [t for t in trades if t["pnl"] > 0]
         losses = [t for t in trades if t["pnl"] < 0]
@@ -643,6 +743,19 @@ class BacktestEngine:
             "cagr_pct": round(cagr_pct, 2),
             "max_drawdown_pct": round(max_drawdown_pct, 2),
             "sharpe_ratio": round(sharpe, 2),
+            "daily_sharpe_ratio": sharpe_metrics["daily_sharpe_ratio"],
+            "bar_sharpe_ratio": sharpe_metrics["bar_sharpe_ratio"],
+            "sharpe_method": sharpe_metrics["sharpe_method"],
+            "execution_assumptions": {
+                "fill_model": "next_bar_open",
+                "no_same_bar_exit": True,
+                "gap_through_stops": True,
+                "slippage_bps": float(slippage_bps or 0.0),
+                "spread_bps": eff_spread_bps,
+                "max_volume_participation_pct": vol_cap_pct,
+                "sharpe_method": sharpe_metrics["sharpe_method"],
+                "sharpe_bars_per_year": sharpe_metrics["sharpe_bars_per_year"],
+            },
             "total_trades": len(trades),
             "win_rate_pct": round(win_rate, 1),
             "profit_factor": round(profit_factor, 2),
@@ -678,6 +791,7 @@ __all__ = [
     "BacktestEngine",
     "backtest_engine",
     "collect_strategy_indicators",
+    "compute_sharpe_metrics",
     "extract_hhmm",
     "format_bar_timestamp",
     "within_time_window",

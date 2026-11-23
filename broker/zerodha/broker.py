@@ -260,7 +260,62 @@ class ZerodhaBroker(BrokerBase):
         token = self.access_token or zerodha_auth_manager.get_valid_token()
         return KiteTickerAdapter(api_key=zerodha_auth_manager.api_key, access_token=token)
 
+    @staticmethod
+    def _kite_status(raw_status: Any, filled_qty: int = 0, total_qty: int = 0) -> OrderStatus:
+        text = str(raw_status or "").strip().upper()
+        if text in {"COMPLETE", "FILLED"}:
+            return OrderStatus.FILLED
+        if text in {"REJECTED", "FAILED"}:
+            return OrderStatus.REJECTED
+        if text in {"CANCELLED", "CANCELED"}:
+            return OrderStatus.CANCELLED
+        if text in {"EXPIRED"}:
+            return OrderStatus.EXPIRED
+        if filled_qty > 0 and total_qty > 0 and filled_qty < total_qty:
+            return OrderStatus.PARTIALLY_FILLED
+        if text in {"OPEN", "TRIGGER PENDING"}:
+            return OrderStatus.OPEN
+        return OrderStatus.PENDING
+
+    def _rest_request_json(
+        self,
+        url: str,
+        *,
+        method: str = "GET",
+        form_data: Optional[Dict[str, Any]] = None,
+        timeout: float = 6.0,
+    ) -> Dict[str, Any]:
+        import urllib.parse
+
+        token = self.access_token or zerodha_auth_manager.get_valid_token()
+        api_key = zerodha_auth_manager.api_key
+        headers = {
+            "X-Kite-Version": "3",
+            "Authorization": f"token {api_key}:{token}",
+            "Accept": "application/json",
+        }
+        data_bytes = None
+        if form_data is not None:
+            clean_form = {k: str(v) for k, v in form_data.items() if v is not None}
+            data_bytes = urllib.parse.urlencode(clean_form).encode("utf-8")
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+        req = urllib.request.Request(url, data=data_bytes, headers=headers, method=method)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8")
+            return json.loads(raw) if raw.strip() else {}
+
     def place_order(self, order: OrderRequest) -> Optional[BrokerOrder]:
+        try:
+            exchange = order.require_exchange()
+            normalized_product = _normalize_kite_product(order.product or self.product)
+        except ValueError as exc:
+            return BrokerOrder(
+                order_id=order.client_order_id or uuid.uuid4().hex[:16],
+                request=order,
+                status=OrderStatus.REJECTED,
+                rejection_reason=str(exc),
+            )
+
         if not self._connected and not self.connect():
             return BrokerOrder(
                 order_id=order.client_order_id or uuid.uuid4().hex[:16],
@@ -268,30 +323,76 @@ class ZerodhaBroker(BrokerBase):
                 status=OrderStatus.REJECTED,
                 rejection_reason="Zerodha Kite is not connected",
             )
-        if self._kite is None:
-            return BrokerOrder(
-                order_id=order.client_order_id or uuid.uuid4().hex[:16],
-                request=order,
-                status=OrderStatus.REJECTED,
-                rejection_reason="kiteconnect SDK is not installed",
-            )
-        try:
-            oid = str(
-                self._kite.place_order(
-                    variety=self._kite.VARIETY_REGULAR,
-                    exchange=order.metadata.get("exchange", "NSE"),
-                    tradingsymbol=order.symbol,
-                    transaction_type="BUY" if order.side in {"BUY", "SHORT"} else "SELL",
-                    quantity=order.quantity,
-                    product=self.product,
-                    order_type=order.order_type,
-                    price=float(order.price) if order.price is not None else None,
-                    trigger_price=float(order.trigger_price) if order.trigger_price is not None else None,
-                    validity=order.validity,
-                    tag=(order.tag or "")[:20] or None,
+
+        # Canonical direction mapping: BUY/COVER -> BUY, SELL/SHORT -> SELL
+        txn_type = "BUY" if order.side in {"BUY", "COVER"} else "SELL"
+        kite_tag = (order.tag or order.client_order_id or "")[:20] or None
+
+        if self._kite is not None:
+            try:
+                oid = str(
+                    self._kite.place_order(
+                        variety=self._kite.VARIETY_REGULAR,
+                        exchange=exchange,
+                        tradingsymbol=order.symbol,
+                        transaction_type=txn_type,
+                        quantity=int(order.quantity),
+                        product=normalized_product,
+                        order_type=order.order_type,
+                        price=float(order.price) if order.price is not None else None,
+                        trigger_price=float(order.trigger_price) if order.trigger_price is not None else None,
+                        validity=order.validity,
+                        tag=kite_tag,
+                    )
                 )
+                placed = BrokerOrder(
+                    order_id=oid,
+                    request=order,
+                    status=OrderStatus.SUBMITTED,
+                    raw={
+                        "exchange": exchange,
+                        "transaction_type": txn_type,
+                        "product": normalized_product,
+                        "tag": kite_tag,
+                    },
+                )
+                self._orders.append(placed)
+                return placed
+            except Exception as exc:
+                return BrokerOrder(
+                    order_id=order.client_order_id,
+                    request=order,
+                    status=OrderStatus.REJECTED,
+                    rejection_reason=str(exc),
+                )
+
+        # Direct Kite REST v3 fallback when optional kiteconnect SDK is absent
+        form_payload = {
+            "exchange": exchange,
+            "tradingsymbol": order.symbol,
+            "transaction_type": txn_type,
+            "quantity": int(order.quantity),
+            "product": normalized_product,
+            "order_type": order.order_type,
+            "price": float(order.price) if order.price is not None else None,
+            "trigger_price": float(order.trigger_price) if order.trigger_price is not None else None,
+            "validity": order.validity,
+            "tag": kite_tag,
+        }
+        try:
+            raw_resp = self._rest_request_json(
+                f"{config.ZERODHA_BASE_URL}/orders/regular",
+                method="POST",
+                form_data=form_payload,
+                timeout=6.0,
             )
-            placed = BrokerOrder(order_id=oid, request=order, status=OrderStatus.PENDING)
+            oid = str(((raw_resp.get("data") or {}).get("order_id")) or order.client_order_id)
+            placed = BrokerOrder(
+                order_id=oid,
+                request=order,
+                status=OrderStatus.SUBMITTED,
+                raw={"response": raw_resp, "payload": form_payload},
+            )
             self._orders.append(placed)
             return placed
         except Exception as exc:
@@ -303,22 +404,205 @@ class ZerodhaBroker(BrokerBase):
             )
 
     def cancel_order(self, order_id: str) -> bool:
-        if not order_id or self._kite is None:
+        if not order_id:
             return False
-        try:
-            self._kite.cancel_order(variety=self._kite.VARIETY_REGULAR, order_id=order_id)
-            return True
-        except Exception:
-            return False
+        cancelled = False
+        if self._kite is not None:
+            try:
+                self._kite.cancel_order(variety=self._kite.VARIETY_REGULAR, order_id=order_id)
+                cancelled = True
+            except Exception:
+                cancelled = False
+        elif self._connected or self.access_token:
+            try:
+                self._rest_request_json(
+                    f"{config.ZERODHA_BASE_URL}/orders/regular/{order_id}",
+                    method="DELETE",
+                    timeout=6.0,
+                )
+                cancelled = True
+            except Exception:
+                cancelled = False
+        if cancelled:
+            for o in self._orders:
+                if o.order_id == order_id:
+                    o.status = OrderStatus.CANCELLED
+        return cancelled
+
+    def get_funds(self, segment: str = "equity") -> Dict[str, float]:
+        """Authoritative Kite Connect v3 margins read (`/user/margins?segment=...`)."""
+        seg = "commodity" if str(segment or "").strip().lower() in {"com", "commodity", "mcx"} else "equity"
+        if self._connected or self.access_token:
+            try:
+                if self._kite is not None and hasattr(self._kite, "margins"):
+                    data = self._kite.margins(segment=seg) or {}
+                else:
+                    raw = self._rest_request_json(
+                        f"{config.ZERODHA_BASE_URL}/user/margins?segment={seg}",
+                        method="GET",
+                        timeout=4.0,
+                    )
+                    data = raw.get("data") or {}
+                avail = float(((data.get("available") or {}).get("live_balance")) or data.get("net") or 0.0)
+                used = float(((data.get("utilised") or {}).get("debits")) or 0.0)
+                self._balance = AccountBalance(
+                    cash=avail + used,
+                    available_cash=avail,
+                    margin_used=used,
+                    metadata={"segment": seg, "source": "zerodha_live"},
+                )
+                return {
+                    "available": round(avail, 2),
+                    "used": round(used, 2),
+                    "total": round(avail + used, 2),
+                    "segment": seg,
+                }
+            except Exception as exc:
+                logger.warning("Zerodha live funds read failed: %s", exc)
+        return super().get_funds(segment=segment)
 
     def get_positions(self) -> Sequence[BrokerPosition]:
+        """Authoritative Kite Connect v3 positions read (`/portfolio/positions`)."""
+        if self._connected or self.access_token:
+            try:
+                if self._kite is not None and hasattr(self._kite, "positions"):
+                    data = self._kite.positions() or {}
+                else:
+                    raw = self._rest_request_json(
+                        f"{config.ZERODHA_BASE_URL}/portfolio/positions",
+                        method="GET",
+                        timeout=5.0,
+                    )
+                    data = raw.get("data") or {}
+                net_items = data.get("net") or []
+                parsed: Dict[str, BrokerPosition] = {}
+                for item in net_items:
+                    net_qty = int(item.get("quantity") or 0)
+                    if net_qty == 0:
+                        continue
+                    sym = str(item.get("tradingsymbol") or "").strip().upper()
+                    if not sym:
+                        continue
+                    avg_px = float(item.get("average_price") or item.get("last_price") or 1.0)
+                    if avg_px <= 0:
+                        avg_px = 1.0
+                    ltp = float(item.get("last_price") or avg_px)
+                    exch = str(item.get("exchange") or "NSE").strip().upper()
+                    prod = str(item.get("product") or "MIS").strip().upper()
+                    pos = BrokerPosition(
+                        symbol=sym,
+                        quantity=abs(net_qty),
+                        direction=1 if net_qty > 0 else -1,
+                        average_price=avg_px,
+                        exchange=exch,
+                        instrument_key=str(item.get("instrument_token") or ""),
+                        product=prod,
+                        realized_pnl=float(item.get("realised") or 0.0),
+                        unrealized_pnl=float(item.get("unrealised") or item.get("pnl") or 0.0),
+                        market_price=ltp,
+                        metadata={"raw": item},
+                    )
+                    parsed[f"{exch}:{sym}:{prod}"] = pos
+                self._positions = parsed
+                return list(parsed.values())
+            except Exception as exc:
+                logger.warning("Zerodha live positions read failed: %s", exc)
         return list(self._positions.values())
 
     def get_balance(self) -> AccountBalance:
+        if self._connected or self.access_token:
+            self.get_funds(segment="equity")
         return self._balance
 
     def get_orders(self) -> Sequence[BrokerOrder]:
+        """Authoritative Kite Connect v3 order book read (`/orders`)."""
+        if self._connected or self.access_token:
+            try:
+                if self._kite is not None and hasattr(self._kite, "orders"):
+                    items = self._kite.orders() or []
+                else:
+                    raw = self._rest_request_json(
+                        f"{config.ZERODHA_BASE_URL}/orders",
+                        method="GET",
+                        timeout=5.0,
+                    )
+                    items = raw.get("data") or []
+                out: List[BrokerOrder] = []
+                for item in items:
+                    oid = str(item.get("order_id") or "").strip()
+                    sym = str(item.get("tradingsymbol") or "").strip().upper()
+                    qty = max(1, int(item.get("quantity") or 1))
+                    filled = max(0, int(item.get("filled_quantity") or 0))
+                    avg_px_raw = float(item.get("average_price") or 0.0)
+                    txn = str(item.get("transaction_type") or "BUY").strip().upper()
+                    exch = str(item.get("exchange") or "NSE").strip().upper()
+                    prod = str(item.get("product") or "MIS").strip().upper()
+                    req = OrderRequest(
+                        symbol=sym or "UNKNOWN",
+                        side="BUY" if txn == "BUY" else "SELL",
+                        quantity=qty,
+                        exchange=exch,
+                        order_type=str(item.get("order_type") or "MARKET").strip().upper(),
+                        product=prod,
+                        price=float(item.get("price")) if float(item.get("price") or 0.0) > 0 else None,
+                        tag=str(item.get("tag") or ""),
+                    )
+                    out.append(
+                        BrokerOrder(
+                            order_id=oid or req.client_order_id,
+                            request=req,
+                            status=self._kite_status(item.get("status"), filled, qty),
+                            filled_quantity=filled,
+                            average_fill_price=avg_px_raw if avg_px_raw > 0 else None,
+                            rejection_reason=str(item.get("status_message") or ""),
+                            raw=item,
+                        )
+                    )
+                self._orders = out
+                return list(out)
+            except Exception as exc:
+                logger.warning("Zerodha live order book read failed: %s", exc)
         return list(self._orders)
+
+    def get_trades(self) -> Sequence["ExecutionFill"]:
+        """Authoritative Kite Connect v3 trade book read (`/trades`)."""
+        from broker.base import ExecutionFill
+
+        if self._connected or self.access_token:
+            try:
+                if self._kite is not None and hasattr(self._kite, "trades"):
+                    items = self._kite.trades() or []
+                else:
+                    raw = self._rest_request_json(
+                        f"{config.ZERODHA_BASE_URL}/trades",
+                        method="GET",
+                        timeout=5.0,
+                    )
+                    items = raw.get("data") or []
+                fills: List[ExecutionFill] = []
+                for item in items:
+                    qty = int(item.get("quantity") or 0)
+                    px = float(item.get("average_price") or item.get("price") or 0.0)
+                    if qty <= 0 or px <= 0:
+                        continue
+                    fills.append(
+                        ExecutionFill(
+                            fill_id=str(item.get("trade_id") or item.get("exchange_order_id") or uuid.uuid4().hex[:12]),
+                            order_id=str(item.get("order_id") or ""),
+                            symbol=str(item.get("tradingsymbol") or "").strip().upper(),
+                            exchange=str(item.get("exchange") or "NSE").strip().upper(),
+                            side=str(item.get("transaction_type") or "BUY").strip().upper(),
+                            quantity=qty,
+                            price=px,
+                            product=str(item.get("product") or "MIS").strip().upper(),
+                            raw=item,
+                        )
+                    )
+                return fills
+            except Exception as exc:
+                logger.warning("Zerodha live trade book read failed: %s", exc)
+        return []
 
 
 __all__ = ["ZerodhaBroker"]
+

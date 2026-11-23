@@ -326,7 +326,54 @@ class UpstoxBroker(BrokerBase):
             raise BrokerError("Upstox V3 feed authorize response missing authorized_redirect_uri.")
         return ws_url
 
+    def _upstox_status(self, raw_status: Any, filled_qty: int = 0, total_qty: int = 0) -> OrderStatus:
+        text = str(raw_status or "").strip().lower()
+        if text in {"complete", "filled", "executed"}:
+            return OrderStatus.FILLED
+        if text in {"rejected", "failed"}:
+            return OrderStatus.REJECTED
+        if text in {"cancelled", "canceled", "cancelled after market order"}:
+            return OrderStatus.CANCELLED
+        if text in {"expired"}:
+            return OrderStatus.EXPIRED
+        if filled_qty > 0 and total_qty > 0 and filled_qty < total_qty:
+            return OrderStatus.PARTIALLY_FILLED
+        if text in {"open", "trigger pending", "put order req received", "validation pending", "open pending", "modify pending", "pending"}:
+            return OrderStatus.OPEN if text == "open" else OrderStatus.PENDING
+        return _status_from_value(raw_status)
+
+    def _rest_request_json(
+        self,
+        url: str,
+        *,
+        method: str = "GET",
+        payload: Optional[Dict[str, Any]] = None,
+        timeout: float = 6.0,
+    ) -> Dict[str, Any]:
+        token = self.access_token or auth_manager.get_valid_token()
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
+        data_bytes = json.dumps(payload).encode("utf-8") if payload is not None else None
+        req = urllib.request.Request(url, data=data_bytes, headers=headers, method=method)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8")
+            return json.loads(raw) if raw.strip() else {}
+
     def place_order(self, order: OrderRequest) -> Optional[BrokerOrder]:
+        try:
+            exchange = order.require_exchange()
+            normalized_product = _normalize_product(order.product or self.product)
+        except ValueError as exc:
+            return BrokerOrder(
+                order_id=order.client_order_id or uuid.uuid4().hex[:16],
+                request=order,
+                status=OrderStatus.REJECTED,
+                rejection_reason=str(exc),
+            )
+
         if not self._connected and not self.connect():
             return BrokerOrder(
                 order_id=order.client_order_id or uuid.uuid4().hex[:16],
@@ -335,16 +382,18 @@ class UpstoxBroker(BrokerBase):
                 rejection_reason="Upstox broker is not connected",
             )
 
+        # Canonical direction mapping: BUY/COVER -> BUY, SELL/SHORT -> SELL
+        txn_type = "BUY" if order.side in {"BUY", "COVER"} else "SELL"
         payload = {
-            "quantity": order.quantity,
-            "product": self.product,
+            "quantity": int(order.quantity),
+            "product": normalized_product,
             "validity": order.validity,
             "price": float(order.price or 0.0),
-            "tag": order.tag or None,
+            "tag": (order.tag or order.client_order_id or "")[:40] or None,
             "slice": True,
-            "instrument_token": order.instrument_key or order.symbol,
+            "instrument_token": order.instrument_key or f"{exchange}_EQ|{order.symbol}",
             "order_type": order.order_type,
-            "transaction_type": "BUY" if order.side in {"BUY", "SHORT"} else "SELL",
+            "transaction_type": txn_type,
             "disclosed_quantity": 0,
             "trigger_price": float(order.trigger_price or 0.0),
             "is_amo": False,
@@ -360,8 +409,8 @@ class UpstoxBroker(BrokerBase):
                 broker_order = BrokerOrder(
                     order_id=oid,
                     request=order,
-                    status=_status_from_value(_safe_get(data_obj, "status") or "PENDING"),
-                    raw=resp if isinstance(resp, dict) else {"order_ids": order_ids or [oid]},
+                    status=self._upstox_status(_safe_get(data_obj, "status") or "PENDING"),
+                    raw=resp if isinstance(resp, dict) else {"order_ids": order_ids or [oid], "payload": payload},
                 )
                 self._orders.append(broker_order)
                 return broker_order
@@ -374,29 +423,17 @@ class UpstoxBroker(BrokerBase):
                 )
 
         # Direct Upstox Order API V3 (HFT endpoint) fallback when SDK is not installed
-        token = self.access_token or auth_manager.get_valid_token()
         url = f"{config.UPSTOX_HFT_URL}/v3/order/place"
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-            },
-            method="POST",
-        )
         try:
-            with urllib.request.urlopen(req, timeout=6.0) as resp:
-                raw_resp = json.loads(resp.read().decode("utf-8"))
+            raw_resp = self._rest_request_json(url, method="POST", payload=payload, timeout=6.0)
             data_obj = raw_resp.get("data") or {}
             order_ids = data_obj.get("order_ids") or []
             oid = str((order_ids[0] if order_ids else None) or data_obj.get("order_id") or order.client_order_id)
             broker_order = BrokerOrder(
                 order_id=oid,
                 request=order,
-                status=OrderStatus.PENDING,
-                raw=raw_resp,
+                status=self._upstox_status(data_obj.get("status") or "PENDING"),
+                raw={"response": raw_resp, "payload": payload},
             )
             self._orders.append(broker_order)
             return broker_order
@@ -440,21 +477,10 @@ class UpstoxBroker(BrokerBase):
             except Exception:
                 return False
 
-        token = self.access_token or auth_manager.get_valid_token()
         url = f"{config.UPSTOX_HFT_URL}/v3/order/modify"
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-            },
-            method="PUT",
-        )
         try:
-            with urllib.request.urlopen(req, timeout=6.0) as resp:
-                return resp.status < 300
+            self._rest_request_json(url, method="PUT", payload=payload, timeout=6.0)
+            return True
         except Exception:
             return False
 
@@ -463,38 +489,179 @@ class UpstoxBroker(BrokerBase):
             return False
         if not self._connected and not self.connect():
             return False
+        cancelled = False
         if self._sdk is not None and self._order_api is not None:
             try:
                 self._order_api.cancel_order(order_id)
-                return True
+                cancelled = True
             except Exception:
-                return False
+                cancelled = False
+        else:
+            url = f"{config.UPSTOX_HFT_URL}/v3/order/cancel?order_id={order_id}"
+            try:
+                self._rest_request_json(url, method="DELETE", timeout=6.0)
+                cancelled = True
+            except Exception:
+                cancelled = False
 
-        token = self.access_token or auth_manager.get_valid_token()
-        url = f"{config.UPSTOX_HFT_URL}/v3/order/cancel?order_id={order_id}"
-        req = urllib.request.Request(
-            url,
-            headers={
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-            },
-            method="DELETE",
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=6.0) as resp:
-                return resp.status < 300
-        except Exception:
-            return False
+        if cancelled:
+            for o in self._orders:
+                if o.order_id == order_id:
+                    o.status = OrderStatus.CANCELLED
+                    o.updated_at = _utc_now()
+        return cancelled
+
+    def get_funds(self, segment: str = "equity") -> Dict[str, float]:
+        """Authoritative Upstox margin/funds read (`/v2/user/get-funds-and-margin`)."""
+        seg_key = "COM" if str(segment or "").strip().lower() in {"com", "commodity", "mcx"} else "SEC"
+        if self._connected or self.access_token:
+            try:
+                url = f"{config.UPSTOX_BASE_URL}/v2/user/get-funds-and-margin?segment={seg_key}"
+                raw = self._rest_request_json(url, method="GET", timeout=4.0)
+                data = raw.get("data") or {}
+                bucket = (data.get("commodity") if seg_key == "COM" else data.get("equity")) or {}
+                avail = float(bucket.get("available_margin") or 0.0)
+                used = float(bucket.get("used_margin") or 0.0)
+                self._balance = AccountBalance(
+                    cash=avail + used,
+                    available_cash=avail,
+                    margin_used=used,
+                    metadata={"segment": seg_key, "source": "upstox_live"},
+                )
+                return {
+                    "available": round(avail, 2),
+                    "used": round(used, 2),
+                    "total": round(avail + used, 2),
+                    "segment": seg_key,
+                }
+            except Exception as exc:
+                logger.warning("Upstox live funds read failed: %s", exc)
+        return super().get_funds(segment=segment)
 
     def get_positions(self) -> Sequence[BrokerPosition]:
+        """Authoritative Upstox positions read (`/v2/portfolio/short-term-positions`)."""
+        if self._connected or self.access_token:
+            try:
+                url = f"{config.UPSTOX_BASE_URL}/v2/portfolio/short-term-positions"
+                raw = self._rest_request_json(url, method="GET", timeout=5.0)
+                items = raw.get("data") or []
+                parsed: Dict[str, BrokerPosition] = {}
+                for item in items:
+                    net_qty = int(item.get("quantity") or 0)
+                    if net_qty == 0:
+                        continue
+                    sym = str(item.get("tradingsymbol") or item.get("trading_symbol") or "").strip().upper()
+                    if not sym:
+                        continue
+                    avg_px = float(item.get("average_price") or item.get("buy_price") or item.get("sell_price") or item.get("last_price") or 1.0)
+                    if avg_px <= 0:
+                        avg_px = 1.0
+                    ltp = float(item.get("last_price") or avg_px)
+                    exch = str(item.get("exchange") or "NSE").strip().upper()
+                    prod = str(item.get("product") or "I").strip().upper()
+                    pos = BrokerPosition(
+                        symbol=sym,
+                        quantity=abs(net_qty),
+                        direction=1 if net_qty > 0 else -1,
+                        average_price=avg_px,
+                        exchange=exch,
+                        instrument_key=str(item.get("instrument_token") or ""),
+                        product="MIS" if prod == "I" else ("CNC" if prod == "D" else prod),
+                        realized_pnl=float(item.get("realised") or item.get("realized") or 0.0),
+                        unrealized_pnl=float(item.get("unrealised") or item.get("unrealized") or item.get("pnl") or 0.0),
+                        market_price=ltp,
+                        metadata={"raw": item},
+                    )
+                    parsed[f"{exch}:{sym}:{pos.product}"] = pos
+                self._positions = parsed
+                return list(parsed.values())
+            except Exception as exc:
+                logger.warning("Upstox live positions read failed: %s", exc)
         return list(self._positions.values())
 
     def get_balance(self) -> AccountBalance:
+        if self._connected or self.access_token:
+            self.get_funds(segment="equity")
         return self._balance
 
     def get_orders(self) -> Sequence[BrokerOrder]:
+        """Authoritative Upstox order book read (`/v2/order/retrieve-all`)."""
+        if self._connected or self.access_token:
+            try:
+                url = f"{config.UPSTOX_BASE_URL}/v2/order/retrieve-all"
+                raw = self._rest_request_json(url, method="GET", timeout=5.0)
+                items = raw.get("data") or []
+                out: List[BrokerOrder] = []
+                for item in items:
+                    oid = str(item.get("order_id") or "").strip()
+                    sym = str(item.get("tradingsymbol") or item.get("trading_symbol") or "").strip().upper()
+                    qty = max(1, int(item.get("quantity") or 1))
+                    filled = max(0, int(item.get("filled_quantity") or 0))
+                    avg_px_raw = float(item.get("average_price") or 0.0)
+                    txn = str(item.get("transaction_type") or "BUY").strip().upper()
+                    exch = str(item.get("exchange") or "NSE").strip().upper()
+                    prod = str(item.get("product") or "I").strip().upper()
+                    req = OrderRequest(
+                        symbol=sym or "UNKNOWN",
+                        side="BUY" if txn == "BUY" else "SELL",
+                        quantity=qty,
+                        exchange=exch,
+                        instrument_key=str(item.get("instrument_token") or ""),
+                        order_type=str(item.get("order_type") or "MARKET").strip().upper(),
+                        product="MIS" if prod == "I" else ("CNC" if prod == "D" else prod),
+                        price=float(item.get("price")) if float(item.get("price") or 0.0) > 0 else None,
+                        tag=str(item.get("tag") or ""),
+                    )
+                    out.append(
+                        BrokerOrder(
+                            order_id=oid or req.client_order_id,
+                            request=req,
+                            status=self._upstox_status(item.get("status"), filled, qty),
+                            filled_quantity=filled,
+                            average_fill_price=avg_px_raw if avg_px_raw > 0 else None,
+                            rejection_reason=str(item.get("status_message") or item.get("status_message_raw") or ""),
+                            raw=item,
+                        )
+                    )
+                self._orders = out
+                return list(out)
+            except Exception as exc:
+                logger.warning("Upstox live order book read failed: %s", exc)
         return list(self._orders)
+
+    def get_trades(self) -> Sequence["ExecutionFill"]:
+        """Authoritative Upstox trade book read (`/v2/order/trades/get-trades-for-day`)."""
+        from broker.base import ExecutionFill
+
+        if self._connected or self.access_token:
+            try:
+                url = f"{config.UPSTOX_BASE_URL}/v2/order/trades/get-trades-for-day"
+                raw = self._rest_request_json(url, method="GET", timeout=5.0)
+                items = raw.get("data") or []
+                fills: List[ExecutionFill] = []
+                for item in items:
+                    qty = int(item.get("quantity") or 0)
+                    px = float(item.get("average_price") or item.get("price") or 0.0)
+                    if qty <= 0 or px <= 0:
+                        continue
+                    fills.append(
+                        ExecutionFill(
+                            fill_id=str(item.get("trade_id") or item.get("exchange_order_id") or uuid.uuid4().hex[:12]),
+                            order_id=str(item.get("order_id") or ""),
+                            symbol=str(item.get("tradingsymbol") or item.get("trading_symbol") or "").strip().upper(),
+                            exchange=str(item.get("exchange") or "NSE").strip().upper(),
+                            side=str(item.get("transaction_type") or "BUY").strip().upper(),
+                            quantity=qty,
+                            price=px,
+                            product=str(item.get("product") or "MIS").strip().upper(),
+                            raw=item,
+                        )
+                    )
+                return fills
+            except Exception as exc:
+                logger.warning("Upstox live trade book read failed: %s", exc)
+        return []
 
 
 __all__ = ["UpstoxBroker"]
+

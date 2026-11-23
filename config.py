@@ -324,6 +324,40 @@ class AppConfig:
             return p if p.is_absolute() else (self.BASE_DIR / p)
         return self.DATA_DIR / ".credentials.json"
 
+    @property
+    def OMS_DB_PATH(self) -> Path:
+        rel = os.getenv("ALGODESK_OMS_DB", "").strip()
+        if rel:
+            p = Path(rel)
+            return p if p.is_absolute() else (self.BASE_DIR / p)
+        return self.SQLITE_DIR / "oms.db"
+
+    @property
+    def TELEGRAM_SETTINGS_FILE(self) -> Path:
+        rel = os.getenv("ALGODESK_TELEGRAM_SETTINGS_FILE", "").strip()
+        if rel:
+            p = Path(rel)
+            return p if p.is_absolute() else (self.BASE_DIR / p)
+        return self.DATA_DIR / "telegram_settings.json"
+
+    @property
+    def TELEGRAM_BOT_TOKEN(self) -> str:
+        return self._resolve_credential("TELEGRAM_BOT_TOKEN", "telegram_bot_token")
+
+    @property
+    def TELEGRAM_ALLOWED_CHAT_ID(self) -> str:
+        return self._resolve_credential("TELEGRAM_ALLOWED_CHAT_ID", "telegram_allowed_chat_id")
+
+    @property
+    def ENABLE_LIVE_TRADING(self) -> bool:
+        self.reload_if_changed()
+        return os.getenv("ALGODESK_ENABLE_LIVE_TRADING", "false").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+
     # ── Local 0o600 Credentials Vault (popup-free persistence) ────────────
     def _read_local_vault(self) -> Dict[str, str]:
         path = self.CREDENTIALS_VAULT_FILE
@@ -531,6 +565,18 @@ def current_ist() -> datetime:
 
 config = AppConfig()
 
+
+def is_live_trading_enabled() -> bool:
+    """Master safety switch for real broker order dispatch (default False)."""
+    config.reload_if_changed()
+    return os.getenv("ALGODESK_ENABLE_LIVE_TRADING", "false").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 __all__: List[str] = [
     "AppConfig",
     "IST",
@@ -538,6 +584,7 @@ __all__: List[str] = [
     "config",
     "current_ist",
     "is_keychain_enabled",
+    "is_live_trading_enabled",
     "keychain_delete",
     "keychain_get",
     "keychain_set",

@@ -16,7 +16,7 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from broker.base import BrokerBase
+from broker.base import BrokerBase, OrderRequest as CanonicalOrderRequest
 from broker.registry import BrokerRegistry
 from core.audit import AuditTrail, audit_trail
 from core.preflight import KillSwitchController, kill_switch_controller
@@ -24,17 +24,50 @@ from core.preflight import KillSwitchController, kill_switch_controller
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class OrderRequest:
-    trading_symbol: str
-    exchange: str
-    transaction_type: str  # BUY | SELL
-    quantity: int
-    order_type: str = "MARKET"  # MARKET | LIMIT | SL | SL-M
-    product: str = "I"  # I / MIS / CNC / D
-    price: float = 0.0
-    trigger_price: float = 0.0
-    tag: str = "algodesk"
+def OrderRequest(
+    symbol: Optional[str] = None,
+    side: Optional[str] = None,
+    quantity: int = 1,
+    exchange: str = "",
+    order_type: str = "MARKET",
+    product: str = "MIS",
+    price: Optional[float] = None,
+    trigger_price: Optional[float] = None,
+    tag: str = "algodesk",
+    *,
+    trading_symbol: Optional[str] = None,
+    transaction_type: Optional[str] = None,
+    instrument_key: str = "",
+    validity: str = "DAY",
+    client_order_id: str = "",
+    algo_tag: str = "",
+    metadata: Optional[Dict[str, Any]] = None,
+) -> CanonicalOrderRequest:
+    """
+    Backwards-compatible constructor returning the single canonical
+    `broker.base.OrderRequest` model (accepting either `symbol`/`side` or
+    legacy `trading_symbol`/`transaction_type` arguments).
+    """
+    eff_symbol = (symbol or trading_symbol or "").strip().upper()
+    eff_side = (side or transaction_type or "BUY").strip().upper()
+    eff_price = float(price) if (price is not None and float(price) > 0) else None
+    eff_trigger = float(trigger_price) if (trigger_price is not None and float(trigger_price) > 0) else None
+    return CanonicalOrderRequest(
+        symbol=eff_symbol,
+        side=eff_side,
+        quantity=int(quantity),
+        exchange=(exchange or "").strip().upper(),
+        instrument_key=instrument_key,
+        order_type=order_type,
+        product=product,
+        price=eff_price,
+        trigger_price=eff_trigger,
+        validity=validity,
+        tag=tag,
+        client_order_id=client_order_id,
+        algo_tag=algo_tag,
+        metadata=dict(metadata or {}),
+    )
 
 
 @dataclass
@@ -67,7 +100,7 @@ class BaseStrategy(ABC):
     name: str = "base_strategy"
 
     @abstractmethod
-    def on_bar(self, bar: Dict[str, Any]) -> Optional[OrderRequest]: ...
+    def on_bar(self, bar: Dict[str, Any]) -> Optional[CanonicalOrderRequest]: ...
 
 
 class CanonicalOrderManager:
@@ -76,19 +109,11 @@ class CanonicalOrderManager:
     def __init__(self, broker: Optional[BrokerBase] = None, broker_id: str = "upstox") -> None:
         self._broker = broker or BrokerRegistry.get(broker_id)
 
-    def place(self, req: OrderRequest) -> Any:
+    def place(self, req: CanonicalOrderRequest) -> Any:
         if not self._broker.capabilities.supports_trading:
             raise ValueError(f"{self._broker.display_name} does not support order execution.")
-        return self._broker.place_order(
-            symbol=req.trading_symbol,
-            exchange=req.exchange,
-            qty=req.quantity,
-            side=req.transaction_type,
-            order_type=req.order_type,
-            price=req.price,
-            trigger_price=req.trigger_price,
-            product=req.product,
-        )
+        req.require_exchange()
+        return self._broker.place_order(req)
 
 
 class CanonicalSessionManager:
@@ -116,16 +141,17 @@ class CanonicalSessionManager:
         self._kill_switch = kill_switch or kill_switch_controller
         self._audit = audit or audit_trail
 
-    def submit_signal_order(self, req: OrderRequest) -> Any:
+    def submit_signal_order(self, req: CanonicalOrderRequest) -> Any:
         if self.state.kill_switch_engaged or self._kill_switch.is_engaged():
             try:
                 self._audit.log(
                     event_type="ORDER_BLOCKED_KILL_SWITCH",
                     actor="session_manager",
                     payload={
-                        "trading_symbol": req.trading_symbol,
+                        "trading_symbol": req.symbol,
                         "exchange": req.exchange,
                         "transaction_type": req.transaction_type,
+                        "side": req.side,
                         "quantity": req.quantity,
                     },
                 )
@@ -134,9 +160,9 @@ class CanonicalSessionManager:
             raise RuntimeError("Trading kill switch is engaged; order rejected.")
         if self.risk_engine is not None and hasattr(self.risk_engine, "validate_order"):
             verdict = self.risk_engine.validate_order(
-                symbol=req.trading_symbol,
+                symbol=req.symbol,
                 quantity=req.quantity,
-                price=req.price,
+                price=float(req.price or 0.0),
                 transaction_type=req.transaction_type,
                 current_open_positions=len(self.state.open_orders),
             )
@@ -149,11 +175,14 @@ class CanonicalSessionManager:
                 event_type="ORDER_SUBMITTED",
                 actor="session_manager",
                 payload={
-                    "trading_symbol": req.trading_symbol,
+                    "trading_symbol": req.symbol,
                     "exchange": req.exchange,
                     "transaction_type": req.transaction_type,
+                    "side": req.side,
+                    "product": req.product,
                     "quantity": req.quantity,
                     "order_type": req.order_type,
+                    "client_order_id": req.client_order_id,
                 },
             )
         except Exception:

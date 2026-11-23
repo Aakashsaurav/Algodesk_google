@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import {
   ArrowLeft,
   Bell,
@@ -6,6 +6,7 @@ import {
   Download,
   Eye,
   FileSpreadsheet,
+  Lock,
   Receipt,
   Rocket,
   X,
@@ -13,6 +14,7 @@ import {
 import { CandlestickChartPanel } from './CandlestickChartPanel';
 import type { QuickOrderTarget } from './QuickOrderModal';
 import type { BacktestFullResult, BacktestTradeRow } from './types';
+import { fetchSecurityStatus, type SecurityStatus } from '../../utils/authClient';
 
 interface BacktestResultsViewProps {
   result: BacktestFullResult;
@@ -142,12 +144,25 @@ export function BacktestResultsView({
 
   // Deploy modal state
   const [deployOpen, setDeployOpen] = useState(false);
-  const [deployExecMode, setDeployExecMode] = useState<'live_alert' | 'paper' | 'live_auto'>('live_alert');
+  const [deployExecMode, setDeployExecMode] = useState<'live_alert' | 'paper' | 'live_auto'>('paper');
+  const [deployEvalMode, setDeployEvalMode] = useState<'completed_bar' | 'intrabar'>('completed_bar');
+  const [deployExchange, setDeployExchange] = useState<string>(result.deploy_spec?.exchange || 'NSE');
+  const [deployProduct, setDeployProduct] = useState<string>(
+    result.deploy_spec?.product || (result.holding_type === 'CNC' ? 'CNC' : 'MIS')
+  );
   const [deployName, setDeployName] = useState(`${result.strategy_label} — Live`);
   const [deployBusy, setDeployBusy] = useState(false);
   const [deployMsg, setDeployMsg] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
+  const [securityStatus, setSecurityStatus] = useState<SecurityStatus | null>(null);
   const [ohlcvExporting, setOhlcvExporting] = useState(false);
   const [ohlcvError, setOhlcvError] = useState('');
+
+  useEffect(() => {
+    if (!deployOpen) return;
+    void fetchSecurityStatus().then((st) => {
+      if (st) setSecurityStatus(st);
+    });
+  }, [deployOpen]);
 
   const combinedStats = useMemo(
     () => computeTradeAnalytics(result.trades || [], includeCharges),
@@ -236,6 +251,9 @@ export function BacktestResultsView({
           ...(result.deploy_spec || {}),
           name: deployName.trim() || `${result.strategy_label} Live`,
           exec_mode: deployExecMode,
+          evaluation_mode: deployEvalMode,
+          exchange: deployExchange,
+          product: deployProduct,
         }),
       });
       const body = await res.json().catch(() => ({}));
@@ -599,6 +617,32 @@ export function BacktestResultsView({
                 </div>
               </div>
             </div>
+
+            {/* Sharpe (Daily √252) & Execution Realism Footnote */}
+            <div className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-800/80 bg-[#0b1120]/70 px-5 py-2 font-mono text-[11px] text-slate-400">
+              <div className="flex flex-wrap items-center gap-3">
+                <span>
+                  Sharpe (Daily √252):{' '}
+                  <strong className="text-slate-200">
+                    {Number(result.daily_sharpe_ratio ?? result.sharpe_daily ?? result.sharpe_ratio ?? 0).toFixed(2)}
+                  </strong>
+                </span>
+                {typeof (result.bar_sharpe_ratio ?? result.sharpe_bar) === 'number' && (
+                  <span>
+                    Bar Sharpe:{' '}
+                    <strong className="text-slate-300">
+                      {Number(result.bar_sharpe_ratio ?? result.sharpe_bar).toFixed(2)}
+                    </strong>
+                  </span>
+                )}
+                <span>
+                  Profit Factor: <strong className="text-slate-200">{Number(result.profit_factor ?? 0).toFixed(2)}</strong>
+                </span>
+              </div>
+              <span className="text-[10px] text-slate-500">
+                Next-bar open fills · Gap-through stops · No same-bar exit
+              </span>
+            </div>
           </div>
 
           {/* Hypothetical Daily Summary + Hypothetical Monthly Performance */}
@@ -945,6 +989,56 @@ export function BacktestResultsView({
                   ))}
                 </div>
               </div>
+
+              {/* Evaluation Mode, Exchange & Product */}
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                <div className="sm:col-span-1">
+                  <label className="mb-1.5 block font-semibold text-slate-300">Exchange</label>
+                  <select
+                    value={deployExchange}
+                    onChange={(e) => setDeployExchange(e.target.value)}
+                    className="min-h-[36px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-2.5 font-mono text-xs text-slate-100 focus:border-sky-400 focus:outline-none"
+                  >
+                    <option value="NSE">NSE</option>
+                    <option value="BSE">BSE</option>
+                    <option value="NFO">NFO</option>
+                    <option value="BFO">BFO</option>
+                    <option value="MCX">MCX</option>
+                  </select>
+                </div>
+                <div className="sm:col-span-1">
+                  <label className="mb-1.5 block font-semibold text-slate-300">Product</label>
+                  <select
+                    value={deployProduct}
+                    onChange={(e) => setDeployProduct(e.target.value)}
+                    className="min-h-[36px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-2.5 font-mono text-xs text-slate-100 focus:border-sky-400 focus:outline-none"
+                  >
+                    <option value="MIS">MIS (Intraday)</option>
+                    <option value="CNC">CNC (Delivery)</option>
+                    <option value="NRML">NRML (F&amp;O/MCX)</option>
+                  </select>
+                </div>
+                <div className="sm:col-span-1">
+                  <label className="mb-1.5 block font-semibold text-slate-300">Signal Evaluation</label>
+                  <select
+                    value={deployEvalMode}
+                    onChange={(e) => setDeployEvalMode(e.target.value as 'completed_bar' | 'intrabar')}
+                    className="min-h-[36px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-2.5 text-xs text-slate-100 focus:border-sky-400 focus:outline-none"
+                  >
+                    <option value="completed_bar">Completed Candle Close (Recommended)</option>
+                    <option value="intrabar">Intrabar Live Tick</option>
+                  </select>
+                </div>
+              </div>
+
+              {securityStatus && !securityStatus.live_trading_enabled && (
+                <div className="flex items-start gap-2 rounded-lg border border-amber-800/70 bg-amber-950/30 px-3 py-2 text-[11px] text-amber-200">
+                  <Lock className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-400" />
+                  <span>
+                    <strong>Live Trading Locked</strong> (<code>ALGODESK_ENABLE_LIVE_TRADING=false</code>). Paper Trading and 1-Click Alerts are ready; enable the server env flag before Gated Auto-Execute.
+                  </span>
+                </div>
+              )}
 
               {deployMsg && (
                 <div

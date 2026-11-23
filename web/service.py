@@ -31,7 +31,7 @@ from backtest.engine import backtest_engine
 from backtest.portfolio import VALID_ALLOCATION_MODES, VALID_SIGNAL_RANKINGS, portfolio_backtest_engine
 from backtest.registry import strategy_registry
 from baskets.store import basket_store
-from broker.base import BrokerHealthSnapshot, ConnectionState, OrderRequest
+from broker.base import BrokerHealthSnapshot, ConnectionState, OrderRequest, OrderStatus
 from broker.registry import BrokerRegistry, SelectionStore
 from broker.upstox.auth import auth_manager as upstox_auth_manager
 from broker.zerodha.auth import zerodha_auth_manager
@@ -45,14 +45,16 @@ from core.jobs import analytics_job_runner
 from core.preflight import PreflightChecker, kill_switch_controller
 from deploy.manager import deployment_manager
 from discover.catalog import list_discover_catalog
+from execution.oms import oms_manager
 from indicators.toolkit import available_backends, backend_diagnostics, refresh_backend_cache
+from notifications.telegram import telegram_notifier
 from options.payoff import (
     OPTIONS_TEMPLATES,
     analyze_options_strategy,
     build_template_legs,
     list_options_templates,
 )
-from risk.limits import risk_limit_manager
+from risk.limits import risk_limit_manager, risk_watchdog
 from rules.engine import (
     SUPPORTED_OPERANDS,
     SUPPORTED_OPERATORS,
@@ -66,6 +68,7 @@ from screener.nse_universe_sync import nse_universe_sync
 from screener.registry import screen_registry
 from screener.universes import DEFAULT_WATCHLIST, universe_resolver
 from technicals.analyzer import technicals_analyzer
+from web.security import is_live_trading_enabled, security_manager, validate_python_plugin_ast
 
 logger = logging.getLogger(__name__)
 
@@ -190,6 +193,10 @@ class BrokerHubService:
             "brokers": brokers,
             "selections": selections,
             "credentials": self._credential_summary(),
+            "security": security_manager.status(),
+            "live_trading_enabled": is_live_trading_enabled(),
+            "telegram": telegram_notifier.get_status(),
+            "watchdog": risk_watchdog.status(),
             "runtime": {
                 "python_version": platform.python_version(),
                 "machine": platform.machine(),
@@ -682,16 +689,22 @@ class BrokerHubService:
     def unregister_live_listener(self, listener_queue) -> None:
         feed_manager.unregister_listener(listener_queue)
 
-    def run_preflight(self, symbols: Optional[List[str]] = None) -> Dict[str, Any]:
+    def run_preflight(
+        self,
+        symbols: Optional[List[str]] = None,
+        exchange: str = "NSE",
+    ) -> Dict[str, Any]:
         sel = self._store.load()
         res = PreflightChecker.run_all(
             trading_broker=sel.get("trading_broker", "upstox"),
             data_connection=sel.get("data_connection", "upstox"),
             symbols=symbols,
+            exchange=exchange,
         )
         return {
             **res,
             "kill_switch": kill_switch_controller.status(),
+            "live_trading_enabled": is_live_trading_enabled(),
             "audit_verify": audit_trail.verify_chain(),
             "audit_events": audit_trail.list_events(limit=20),
         }
@@ -992,11 +1005,69 @@ class BrokerHubService:
 
     def get_risk_status(self) -> Dict[str, Any]:
         sel = self._store.load()
-        return risk_limit_manager.evaluate(trading_broker=sel.get("trading_broker", "upstox"))
+        res = risk_limit_manager.evaluate(trading_broker=sel.get("trading_broker", "upstox"))
+        return {
+            **res,
+            "watchdog": risk_watchdog.status(),
+            "live_trading_enabled": is_live_trading_enabled(),
+            "telegram": telegram_notifier.get_status(),
+        }
 
     def update_risk_limits(self, updates: Dict[str, Any]) -> Dict[str, Any]:
         risk_limit_manager.save_limits(updates, actor="operator")
         return self.get_risk_status()
+
+    # ── Security, Telegram, OMS Reconciliation & Data History Catalog ─────
+
+    def get_security_status(self) -> Dict[str, Any]:
+        return {"ok": True, **security_manager.status()}
+
+    def claim_admin_passcode(self, passcode: str) -> Dict[str, Any]:
+        return security_manager.claim_passcode(passcode)
+
+    def login_admin(self, passcode: str) -> Dict[str, Any]:
+        return security_manager.login(passcode)
+
+    def get_telegram_settings(self) -> Dict[str, Any]:
+        return {"ok": True, **telegram_notifier.get_status()}
+
+    def update_telegram_settings(self, updates: Dict[str, Any]) -> Dict[str, Any]:
+        telegram_notifier.save_settings(updates)
+        return {"ok": True, **telegram_notifier.get_status()}
+
+    def send_telegram_test(self) -> Dict[str, Any]:
+        return telegram_notifier.send_test()
+
+    def get_asset_data_history(
+        self,
+        *,
+        symbol: Optional[str] = None,
+        exchange: Optional[str] = None,
+        timeframe: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        return {
+            "ok": True,
+            "storage": historical_data_manager.storage_info(),
+            "history": historical_data_manager.list_asset_history(
+                symbol=symbol,
+                exchange=exchange,
+                timeframe=timeframe,
+            ),
+        }
+
+    def start_background_services(self) -> None:
+        """Start headless risk watchdog daemon."""
+        try:
+            risk_watchdog.start()
+        except Exception as exc:
+            logger.warning("RiskWatchdog startup skipped: %s", exc)
+
+    def stop_background_services(self) -> None:
+        """Cleanly stop headless background threads on server shutdown."""
+        try:
+            risk_watchdog.stop()
+        except Exception:
+            pass
 
     # ── Phase 6: Full Streak Platform (Visual + Python, Portfolio Backtest,
     #    Real Charges, Options Payoff, Technicals, Baskets, Discover, Deploy) ─
@@ -1273,7 +1344,12 @@ class BrokerHubService:
         }
 
     def list_deployments(self) -> Dict[str, Any]:
-        return deployment_manager.list_deployments()
+        data = deployment_manager.list_deployments()
+        return {
+            **data,
+            "live_trading_enabled": is_live_trading_enabled(),
+            "oms_orders": oms_manager.list_orders(limit=50),
+        }
 
     def start_deployment(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         sel = self._store.load()
@@ -1298,10 +1374,25 @@ class BrokerHubService:
             segment=str(payload.get("segment") or "equity_intraday"),
             charges_overrides=payload.get("charges_overrides") if isinstance(payload.get("charges_overrides"), dict) else None,
             product=str(payload.get("product") or "MIS"),
+            side=str(payload.get("side") or "BUY"),
+            evaluation_mode=str(payload.get("evaluation_mode") or "completed_bar"),
             provider=eff_provider,
             poll_interval_sec=float(payload.get("poll_interval_sec") or 2.0),
             backtest_run_id=payload.get("backtest_run_id"),
         )
+
+    def reconcile_deployments(self, deployment_id: Optional[str] = None) -> Dict[str, Any]:
+        return deployment_manager.reconcile_orders(deployment_id=deployment_id)
+
+    def list_oms_orders(
+        self,
+        deployment_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> Dict[str, Any]:
+        return {
+            "ok": True,
+            "orders": oms_manager.list_orders(deployment_id=deployment_id, limit=limit),
+        }
 
     def control_deployment(self, deployment_id: str, action: str) -> Dict[str, Any]:
         return deployment_manager.control(deployment_id, action)
@@ -1381,11 +1472,10 @@ class BrokerHubService:
         if not stem or stem.startswith("_"):
             raise ValueError("Filename must start with a letter or digit (e.g. my_custom_screen.py).")
 
-        # Validate Python syntax before touching disk
-        try:
-            compile(raw_code, f"{stem}.py", "exec")
-        except SyntaxError as exc:
-            raise ValueError(f"Python syntax error on line {exc.lineno}: {exc.msg}") from exc
+        # Validate Python syntax AND static AST safety policy BEFORE writing to disk
+        ast_violations = validate_python_plugin_ast(raw_code, f"{stem}.py")
+        if ast_violations:
+            raise ValueError("Plugin rejected by safety policy: " + "; ".join(ast_violations[:3]))
 
         base_dir = (
             screen_registry.screens_dir.resolve()
@@ -1434,10 +1524,12 @@ class BrokerHubService:
         symbol = str(payload.get("symbol") or "").strip().upper()
         if not symbol:
             raise ValueError("Trading symbol is required.")
-        exchange = str(payload.get("exchange") or "NSE").strip().upper()
+        exchange = str(payload.get("exchange") or "").strip().upper()
+        if not exchange:
+            raise ValueError("Exchange (e.g. NSE, BSE, NFO, MCX) is required for live orders.")
         side = str(payload.get("side") or "BUY").strip().upper()
-        if side not in {"BUY", "SELL"}:
-            raise ValueError("Order side must be BUY or SELL.")
+        if side not in {"BUY", "SELL", "SHORT", "COVER"}:
+            raise ValueError("Order side must be BUY, SELL, SHORT, or COVER.")
         qty = int(payload.get("quantity") or 0)
         if qty < 1 or qty > 100_000:
             raise ValueError("Quantity must be between 1 and 100,000.")
@@ -1451,6 +1543,13 @@ class BrokerHubService:
         if product not in {"MIS", "CNC", "NRML"}:
             product = "MIS"
 
+        # 0) Master live-trading opt-in lock
+        if not is_live_trading_enabled():
+            raise ValueError(
+                "Live order routing is disabled by default (ALGODESK_ENABLE_LIVE_TRADING=false). "
+                "Set ALGODESK_ENABLE_LIVE_TRADING=true in .env and restart to enable real broker orders."
+            )
+
         # 1) Hard Kill Switch check
         ks = kill_switch_controller.status()
         if ks.get("engaged"):
@@ -1459,20 +1558,20 @@ class BrokerHubService:
         sel = self._store.load()
         trading_broker = str(sel.get("trading_broker") or "upstox").strip().lower()
 
-        # 2) Portfolio Risk Limits check
+        # 2) Portfolio Risk Limits check (entry + notional guard)
         risk_eval = risk_limit_manager.evaluate(trading_broker=trading_broker)
         if risk_eval.get("status") == "BREACHED":
             first_breach = (risk_eval.get("breaches") or [{}])[0].get("message", "Portfolio risk limit breached.")
             raise ValueError(f"Order blocked by Risk Limits: {first_breach}")
 
-        # 3) 6-Gate Preflight verification
-        preflight = self.run_preflight(symbols=[symbol])
+        # 3) Multi-exchange 6-Gate Preflight verification
+        preflight = self.run_preflight(symbols=[symbol], exchange=exchange)
         if not preflight.get("overall_ready"):
             failed = [c["message"] for c in (preflight.get("checks") or []) if not c.get("passed") and c.get("severity") == "ERROR"]
             reason_txt = failed[0] if failed else "Preflight safety gates did not pass."
             raise ValueError(f"Order blocked by Preflight ({trading_broker.upper()}): {reason_txt}")
 
-        # 4) Route order to active Trading Broker
+        # 4) Route order through OMS to active Trading Broker
         instrument_key = ""
         try:
             hits = instrument_index.search(q=symbol, broker_id=trading_broker, limit=5)
@@ -1486,25 +1585,57 @@ class BrokerHubService:
             pass
 
         adapter = BrokerRegistry.get(trading_broker)
+        cid = str(payload.get("client_order_id") or f"quick-{uuid.uuid4().hex[:12]}")
         req = OrderRequest(
             symbol=symbol,
+            exchange=exchange,
             side=side,
             quantity=qty,
             instrument_key=instrument_key,
             order_type=order_type,
             price=price if order_type == "LIMIT" else None,
             product=product,
-            tag=f"algodesk:quick:{uuid.uuid4().hex[:6]}",
+            tag=f"algodesk:quick:{cid[-6:]}",
             algo_tag="ALGODESK-QUICK",
+            client_order_id=cid,
         )
-        order = adapter.place_order(req)
-        order_id = str(getattr(order, "order_id", "") or f"ORD-{uuid.uuid4().hex[:8]}")
-        audit_trail.record(
+        oms_rec, _delta_qty, _fill_px = oms_manager.submit_order(
+            req,
+            adapter,
+            deployment_id="quick_order",
+            exec_mode="live_auto",
+            reason="quick_order",
+            reference_price=price,
+        )
+        oms_status = str(oms_rec.get("status") or "")
+        if oms_status == OrderStatus.REJECTED.value:
+            err_msg = str(oms_rec.get("rejection_reason") or "Order rejected by broker.")
+            audit_trail.log(
+                event_type="QUICK_ORDER_REJECTED",
+                actor="operator",
+                broker_id=trading_broker,
+                details={
+                    "client_order_id": oms_rec.get("client_order_id"),
+                    "broker_order_id": oms_rec.get("broker_order_id"),
+                    "symbol": symbol,
+                    "exchange": exchange,
+                    "side": side,
+                    "quantity": qty,
+                    "product": product,
+                    "reason": err_msg,
+                },
+            )
+            raise ValueError(f"Broker rejected quick order: {err_msg}")
+
+        order_id = str(oms_rec.get("broker_order_id") or oms_rec.get("client_order_id") or "")
+        audit_trail.log(
             event_type="QUICK_ORDER_PLACED",
             actor="operator",
-            payload={
-                "broker": trading_broker,
+            broker_id=trading_broker,
+            details={
+                "client_order_id": oms_rec.get("client_order_id"),
                 "order_id": order_id,
+                "status": oms_status,
                 "symbol": symbol,
                 "exchange": exchange,
                 "side": side,
@@ -1518,13 +1649,15 @@ class BrokerHubService:
             "ok": True,
             "broker": trading_broker,
             "order_id": order_id,
+            "client_order_id": oms_rec.get("client_order_id"),
+            "status": oms_status,
             "symbol": symbol,
             "exchange": exchange,
             "side": side,
             "quantity": qty,
             "order_type": order_type,
             "product": product,
-            "message": f"{side} {qty} {symbol} ({product}) submitted to {trading_broker.upper()} (Order ID: {order_id}).",
+            "message": f"{side} {qty} {exchange}:{symbol} ({product}) submitted to {trading_broker.upper()} ({oms_status}, ID: {order_id}).",
         }
 
 
