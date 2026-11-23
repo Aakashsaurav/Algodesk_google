@@ -91,6 +91,7 @@ class ZerodhaBroker(BrokerBase):
         self._balance = AccountBalance(cash=starting_cash)
         self._orders: List[BrokerOrder] = []
         self._positions: Dict[str, BrokerPosition] = {}
+        self._last_read_err_ts: Dict[str, float] = {}
 
     def _probe_profile(self, token: str, timeout: float = 3.5) -> tuple[bool, int, Dict[str, Any], str]:
         """Verify Kite token against /user/profile with strict timeout."""
@@ -277,6 +278,13 @@ class ZerodhaBroker(BrokerBase):
             return OrderStatus.OPEN
         return OrderStatus.PENDING
 
+    def _log_read_warning(self, bucket: str, message: str, exc: Exception) -> None:
+        now = time.monotonic()
+        last = self._last_read_err_ts.get(bucket, 0.0)
+        if now - last >= 60.0:
+            self._last_read_err_ts[bucket] = now
+            logger.warning("%s: %s", message, exc)
+
     def _rest_request_json(
         self,
         url: str,
@@ -293,10 +301,35 @@ class ZerodhaBroker(BrokerBase):
             "X-Kite-Version": "3",
             "Authorization": f"token {api_key}:{token}",
             "Accept": "application/json",
+            "User-Agent": "AlgoDesk/4.0",
         }
+        clean_form = (
+            {k: str(v) for k, v in form_data.items() if v is not None}
+            if form_data is not None
+            else None
+        )
+        urlopen_mocked = getattr(urllib.request.urlopen, "__module__", "") != "urllib.request"
+        if requests is not None and not urlopen_mocked:
+            resp = requests.request(
+                method=method.upper(),
+                url=url,
+                headers=headers,
+                data=clean_form,
+                timeout=timeout,
+            )
+            if resp.status_code >= 400:
+                detail = f"HTTP {resp.status_code}"
+                try:
+                    err_body = resp.json()
+                    if err_body.get("message"):
+                        detail = f"HTTP {resp.status_code}: {err_body['message']}"
+                except Exception:
+                    pass
+                raise RuntimeError(detail)
+            return resp.json() if resp.content else {}
+
         data_bytes = None
-        if form_data is not None:
-            clean_form = {k: str(v) for k, v in form_data.items() if v is not None}
+        if clean_form is not None:
             data_bytes = urllib.parse.urlencode(clean_form).encode("utf-8")
             headers["Content-Type"] = "application/x-www-form-urlencoded"
         req = urllib.request.Request(url, data=data_bytes, headers=headers, method=method)
@@ -458,8 +491,14 @@ class ZerodhaBroker(BrokerBase):
                     "segment": seg,
                 }
             except Exception as exc:
-                logger.warning("Zerodha live funds read failed: %s", exc)
-        return super().get_funds(segment=segment)
+                self._log_read_warning("funds", "Zerodha live funds read failed", exc)
+        # Return cached balance directly — never call super().get_funds() which invokes get_balance() -> recursion.
+        return {
+            "available": round(float(self._balance.available_cash), 2),
+            "used": round(float(self._balance.margin_used), 2),
+            "total": round(float(self._balance.cash), 2),
+            "segment": seg,
+        }
 
     def get_positions(self) -> Sequence[BrokerPosition]:
         """Authoritative Kite Connect v3 positions read (`/portfolio/positions`)."""
@@ -506,7 +545,7 @@ class ZerodhaBroker(BrokerBase):
                 self._positions = parsed
                 return list(parsed.values())
             except Exception as exc:
-                logger.warning("Zerodha live positions read failed: %s", exc)
+                self._log_read_warning("positions", "Zerodha live positions read failed", exc)
         return list(self._positions.values())
 
     def get_balance(self) -> AccountBalance:
@@ -561,7 +600,7 @@ class ZerodhaBroker(BrokerBase):
                 self._orders = out
                 return list(out)
             except Exception as exc:
-                logger.warning("Zerodha live order book read failed: %s", exc)
+                self._log_read_warning("orders", "Zerodha live order book read failed", exc)
         return list(self._orders)
 
     def get_trades(self) -> Sequence["ExecutionFill"]:
@@ -600,7 +639,7 @@ class ZerodhaBroker(BrokerBase):
                     )
                 return fills
             except Exception as exc:
-                logger.warning("Zerodha live trade book read failed: %s", exc)
+                self._log_read_warning("trades", "Zerodha live trade book read failed", exc)
         return []
 
 

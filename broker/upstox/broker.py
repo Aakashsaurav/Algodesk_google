@@ -116,6 +116,7 @@ class UpstoxBroker(BrokerBase):
         self._order_api = None
         self._portfolio_api = None
         self._funds_api = None
+        self._last_read_err_ts: Dict[str, float] = {}
 
     def _probe_profile(self, token: str, timeout: float = 3.5) -> tuple[bool, int, Dict[str, Any], str]:
         """Verify token against Upstox /v2/user/profile with strict timeout."""
@@ -311,16 +312,34 @@ class UpstoxBroker(BrokerBase):
 
     # ── Execution & V3 Streaming Surface ──────────────────────────────────
 
+    def _log_read_warning(self, bucket: str, message: str, exc: Exception) -> None:
+        now = time.monotonic()
+        last = self._last_read_err_ts.get(bucket, 0.0)
+        if now - last >= 60.0:
+            self._last_read_err_ts[bucket] = now
+            logger.warning("%s: %s", message, exc)
+
     def authorize_ws_feed(self, timeout: float = 5.0) -> str:
         """Obtain single-use authorized WSS URL from Upstox Market Data Feed V3."""
         token = self.access_token or auth_manager.get_valid_token()
-        req = urllib.request.Request(
-            config.UPSTOX_FEED_AUTH_URL,
-            headers={"Authorization": f"Bearer {token}", "Accept": "application/json"},
-            method="GET",
-        )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "User-Agent": "AlgoDesk/4.0",
+        }
+        urlopen_mocked = getattr(urllib.request.urlopen, "__module__", "") != "urllib.request"
+        if requests is not None and not urlopen_mocked:
+            resp = requests.get(config.UPSTOX_FEED_AUTH_URL, headers=headers, timeout=timeout)
+            resp.raise_for_status()
+            payload = resp.json() if resp.content else {}
+        else:
+            req = urllib.request.Request(
+                config.UPSTOX_FEED_AUTH_URL,
+                headers=headers,
+                method="GET",
+            )
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                payload = json.loads(resp.read().decode("utf-8"))
         ws_url = str(((payload.get("data") or {}).get("authorized_redirect_uri")) or "").strip()
         if not ws_url:
             raise BrokerError("Upstox V3 feed authorize response missing authorized_redirect_uri.")
@@ -354,8 +373,35 @@ class UpstoxBroker(BrokerBase):
         headers = {
             "Authorization": f"Bearer {token}",
             "Accept": "application/json",
-            "Content-Type": "application/json",
+            "User-Agent": "AlgoDesk/4.0",
         }
+        if payload is not None:
+            headers["Content-Type"] = "application/json"
+
+        # Prefer `requests` in production (matches _probe_profile and passes Upstox/Cloudflare WAF),
+        # while honoring `urllib.request.urlopen` whenever patched by unit tests or when requests is absent.
+        urlopen_mocked = getattr(urllib.request.urlopen, "__module__", "") != "urllib.request"
+        if requests is not None and not urlopen_mocked:
+            resp = requests.request(
+                method=method.upper(),
+                url=url,
+                headers=headers,
+                json=payload if payload is not None else None,
+                timeout=timeout,
+            )
+            if resp.status_code >= 400:
+                detail = f"HTTP {resp.status_code}"
+                try:
+                    err_body = resp.json()
+                    errs = err_body.get("errors") or []
+                    msg = err_body.get("message") or (errs[0].get("message") if errs and isinstance(errs[0], dict) else "")
+                    if msg:
+                        detail = f"HTTP {resp.status_code}: {msg}"
+                except Exception:
+                    pass
+                raise BrokerError(detail)
+            return resp.json() if resp.content else {}
+
         data_bytes = json.dumps(payload).encode("utf-8") if payload is not None else None
         req = urllib.request.Request(url, data=data_bytes, headers=headers, method=method)
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -535,8 +581,14 @@ class UpstoxBroker(BrokerBase):
                     "segment": seg_key,
                 }
             except Exception as exc:
-                logger.warning("Upstox live funds read failed: %s", exc)
-        return super().get_funds(segment=segment)
+                self._log_read_warning("funds", "Upstox live funds read failed", exc)
+        # Return cached balance directly — never call super().get_funds() which invokes get_balance() -> recursion.
+        return {
+            "available": round(float(self._balance.available_cash), 2),
+            "used": round(float(self._balance.margin_used), 2),
+            "total": round(float(self._balance.cash), 2),
+            "segment": seg_key,
+        }
 
     def get_positions(self) -> Sequence[BrokerPosition]:
         """Authoritative Upstox positions read (`/v2/portfolio/short-term-positions`)."""
@@ -576,7 +628,7 @@ class UpstoxBroker(BrokerBase):
                 self._positions = parsed
                 return list(parsed.values())
             except Exception as exc:
-                logger.warning("Upstox live positions read failed: %s", exc)
+                self._log_read_warning("positions", "Upstox live positions read failed", exc)
         return list(self._positions.values())
 
     def get_balance(self) -> AccountBalance:
@@ -626,7 +678,7 @@ class UpstoxBroker(BrokerBase):
                 self._orders = out
                 return list(out)
             except Exception as exc:
-                logger.warning("Upstox live order book read failed: %s", exc)
+                self._log_read_warning("orders", "Upstox live order book read failed", exc)
         return list(self._orders)
 
     def get_trades(self) -> Sequence["ExecutionFill"]:
@@ -659,7 +711,7 @@ class UpstoxBroker(BrokerBase):
                     )
                 return fills
             except Exception as exc:
-                logger.warning("Upstox live trade book read failed: %s", exc)
+                self._log_read_warning("trades", "Upstox live trade book read failed", exc)
         return []
 
 

@@ -971,6 +971,42 @@ class SafeStrat(BacktestStrategy):
             self.assertEqual(res4["api_calls_made"], 0)
             self.assertTrue(res4.get("catalog_hit"))
 
+    # ── Test 13: Broker get_funds HTTP 403 Never Recurses & Clean GET Headers ──
+    def test_13_broker_funds_http_403_no_recursion_and_clean_get_headers(self) -> None:
+        upstox = UpstoxBroker(access_token="dummy-upstox-tok", initial_balance=250000.0)
+        upstox._connected = True
+        seen_upstox_reqs: List[Any] = []
+
+        def fake_upstox_403(req, timeout=4.0):
+            seen_upstox_reqs.append(req)
+            raise urllib.error.HTTPError(req.full_url, 403, "Forbidden", hdrs=None, fp=None)
+
+        with patch("urllib.request.urlopen", side_effect=fake_upstox_403):
+            funds = upstox.get_funds(segment="equity")
+
+        # Must make strictly 1 HTTP call (no get_funds -> super().get_funds -> get_balance -> get_funds recursion)
+        self.assertEqual(len(seen_upstox_reqs), 1)
+        self.assertEqual(funds["available"], 250000.0)
+        hdrs = {k.lower(): v for k, v in seen_upstox_reqs[0].header_items()}
+        self.assertIn("user-agent", hdrs)
+        self.assertNotIn("content-type", hdrs)
+
+        # Verify ZerodhaBroker.get_funds also makes strictly 1 call on HTTP error (no recursion)
+        zerodha = ZerodhaBroker(access_token="dummy-kite-tok", initial_balance=180000.0)
+        zerodha._connected = True
+        zerodha._kite = None
+        seen_kite_reqs: List[Any] = []
+
+        def fake_kite_403(req, timeout=4.0):
+            seen_kite_reqs.append(req)
+            raise urllib.error.HTTPError(req.full_url, 403, "Forbidden", hdrs=None, fp=None)
+
+        with patch("urllib.request.urlopen", side_effect=fake_kite_403):
+            k_funds = zerodha.get_funds(segment="equity")
+
+        self.assertEqual(len(seen_kite_reqs), 1)
+        self.assertEqual(k_funds["available"], 180000.0)
+
 
 if __name__ == "__main__":
     unittest.main()
