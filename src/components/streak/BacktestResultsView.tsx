@@ -827,6 +827,7 @@ export function BacktestResultsView({
               fromDate={result.from_date}
               toDate={result.to_date}
               trades={activeTrades}
+              backtestRunId={result.run_id}
               onQuickOrder={onQuickOrder}
               height={320}
               compactHeader

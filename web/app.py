@@ -1012,6 +1012,19 @@ def create_app() -> FastAPI:
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    @app.get("/api/streak/backtest/{run_id}/chart")
+    def api_streak_backtest_chart(
+        run_id: str,
+        symbol: Optional[str] = Query(default=None),
+        limit: int = Query(default=3000, ge=50, le=10000),
+    ) -> dict:
+        try:
+            return hub_service.get_backtest_chart_series(run_id=run_id, symbol=symbol, max_bars=limit)
+        except KeyError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
     @app.post("/api/streak/formula/validate")
     def api_streak_formula_validate(payload: Dict[str, Any]) -> dict:
         try:

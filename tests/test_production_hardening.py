@@ -1752,8 +1752,134 @@ class SafeStrat(BacktestStrategy):
         self.assertIn("/api/security/claim", fallback_html)
         self.assertNotIn("localStorage", fallback_html.split("installFallbackAuth")[1].split("const state =")[0])
 
+    # ── Test 25: Backtest Chart Endpoint Returns Strategy Indicators ──────
+    def test_25_backtest_chart_series_returns_strategy_indicators(self) -> None:
+        from backtest.portfolio import PortfolioBacktestEngine
+
+        # Build 75 synthetic daily candles
+        candles = []
+        d0 = date(2025, 1, 1)
+        for i in range(75):
+            day = (d0 + timedelta(days=i)).isoformat()
+            px = 100.0 + (i * 0.6) + (8.0 if 25 <= i <= 45 else -4.0 if i > 55 else 0.0)
+            candles.append(
+                {
+                    "trade_date": day,
+                    "ts_ist": f"{day}T09:15:00+05:30",
+                    "open": px - 0.5,
+                    "high": px + 2.0,
+                    "low": px - 2.0,
+                    "close": px,
+                    "volume": 100000 + i * 500,
+                }
+            )
+
+        rule_def = {
+            "id": "sma_ema_rsi_test",
+            "name": "SMA20/50 + RSI14 / EMA20 Exit",
+            "side": "BUY",
+            "entry": {
+                "logic": "AND",
+                "conditions": [
+                    {
+                        "left": {"type": "sma", "period": 20},
+                        "operator": "crosses_above",
+                        "right": {"type": "sma", "period": 50},
+                    },
+                    {
+                        "left": {"type": "rsi", "period": 14},
+                        "operator": ">",
+                        "right": {"type": "number", "value": 45},
+                    },
+                ],
+            },
+            "exit": {
+                "logic": "OR",
+                "conditions": [
+                    {
+                        "left": {"type": "close"},
+                        "operator": "crosses_below",
+                        "right": {"type": "ema", "period": 20},
+                    }
+                ],
+            },
+        }
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            hist = HistoricalDataManager(db_path=tmp / "hist.db", parquet_dir=tmp / "pq")
+            single = BacktestEngine(hist_manager=hist)
+            port = PortfolioBacktestEngine(
+                single_engine=single,
+                hist_manager=hist,
+                runs_file=tmp / "runs.json",
+            )
+            res = port.run(
+                symbols=["TESTSTRAT"],
+                exchange="NSE",
+                strategy="visual_rule",
+                rule_def=rule_def,
+                mode="individual",
+                timeframe="1day",
+                from_date="2025-01-01",
+                to_date="2025-04-30",
+                stop_loss_pct=0.0,
+                take_profit_pct=0.0,
+                trailing_sl_pct=0.0,
+                fetcher=lambda *a, **k: candles,
+            )
+            run_id = res["run_id"]
+            chart_payload = port.get_chart_series(run_id=run_id, symbol="TESTSTRAT")
+            self.assertTrue(chart_payload["ok"])
+            self.assertEqual(chart_payload["symbol"], "TESTSTRAT")
+            self.assertEqual(len(chart_payload["bars"]), 75)
+
+            ind_map = {ind["id"]: ind for ind in chart_payload["indicators"]}
+            # Must contain strategy's actual indicators, NOT raw CLOSE copy
+            self.assertIn("SMA(20)", ind_map)
+            self.assertIn("SMA(50)", ind_map)
+            self.assertIn("EMA(20)", ind_map)
+            self.assertIn("RSI(14)", ind_map)
+            self.assertNotIn("CLOSE", ind_map)
+            self.assertNotIn("EMA(50)", ind_map)
+
+            # Verify pane classification and alignment
+            self.assertEqual(ind_map["SMA(20)"]["pane"], "overlay")
+            self.assertEqual(ind_map["SMA(50)"]["pane"], "overlay")
+            self.assertEqual(ind_map["EMA(20)"]["pane"], "overlay")
+            self.assertEqual(ind_map["RSI(14)"]["pane"], "oscillator")
+            self.assertEqual(ind_map["RSI(14)"]["levels"], [30.0, 70.0])
+            for ind in chart_payload["indicators"]:
+                self.assertEqual(len(ind["values"]), len(chart_payload["bars"]))
+
+            # Verify HTTP route GET /api/streak/backtest/{run_id}/chart
+            from web.local_server import _StdlibBrokerHandler, hub_service
+
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _StdlibBrokerHandler)
+            srv_port = server.server_address[1]
+            th = threading.Thread(target=server.serve_forever, daemon=True)
+            th.start()
+            try:
+                with (
+                    patch.object(_StdlibBrokerHandler, "_enforce_auth", return_value=True),
+                    patch.object(hub_service, "get_backtest_chart_series", side_effect=port.get_chart_series),
+                ):
+                    with urllib.request.urlopen(
+                        f"http://127.0.0.1:{srv_port}/api/streak/backtest/{run_id}/chart?symbol=TESTSTRAT",
+                        timeout=5,
+                    ) as resp:
+                        http_body = json.loads(resp.read().decode("utf-8"))
+                        self.assertEqual(resp.status, 200)
+                        self.assertTrue(http_body["ok"])
+                        self.assertIn("SMA(20)", http_body["indicator_columns"])
+                        self.assertIn("RSI(14)", http_body["indicator_columns"])
+            finally:
+                server.shutdown()
+                server.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 

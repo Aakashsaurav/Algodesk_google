@@ -553,6 +553,20 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
                 self._send_json(400, {"detail": str(exc)})
             return
 
+        if len(parts) == 5 and parts[0] == "api" and parts[1] == "streak" and parts[2] == "backtest" and parts[4] == "chart":
+            try:
+                sym = query.get("symbol", [None])[0]
+                limit = int(query.get("limit", ["3000"])[0] or 3000)
+                self._send_json(
+                    200,
+                    hub_service.get_backtest_chart_series(run_id=parts[3], symbol=sym, max_bars=limit),
+                )
+            except KeyError as exc:
+                self._send_json(404, {"detail": str(exc)})
+            except Exception as exc:
+                self._send_json(400, {"detail": str(exc)})
+            return
+
         if path == "/api/streak/deployments":
             self._send_json(200, hub_service.list_deployments())
             return

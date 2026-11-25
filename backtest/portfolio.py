@@ -359,6 +359,203 @@ class PortfolioBacktestEngine:
             writer.writerow([r.get("symbol", "") if h == "trading_symbol" else r.get(h, "") for h in headers])
         return filename, buf.getvalue()
 
+    @staticmethod
+    def _classify_indicator_series(
+        col_name: str,
+        values: List[Optional[float]],
+        closes: List[float],
+        all_cols_lower: set[str],
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Classify a strategy indicator column into:
+        - `None` (skip trivial identity OHLCV copies or redundant helper flags)
+        - `{"pane": "overlay" | "oscillator", "kind": "line" | "histogram", "levels": [...]}`
+        """
+        raw = (col_name or "").strip()
+        if not raw:
+            return None
+        norm = re.sub(r"\s+", "", raw).lower()
+        # Strip leading scalar multiplier like "1.02*sma(20)" -> "sma(20)"
+        base_norm = re.sub(r"^[0-9.]+\*", "", norm)
+
+        # Skip pure unshifted OHLCV identity copies already shown by candlesticks & volume
+        if norm in {
+            "open", "high", "low", "close", "volume",
+            "open(0)", "high(0)", "low(0)", "close(0)", "volume(0)",
+            "open[0]", "high[0]", "low[0]", "close[0]", "volume[0]",
+        }:
+            return None
+
+        # Skip redundant +1/-1 Supertrend direction flag when the price-scale Supertrend line is present
+        if (base_norm.startswith("supertrend_dir") or base_norm.startswith("supertrenddir")) and any(
+            c.startswith("supertrend(") for c in all_cols_lower
+        ):
+            return None
+
+        non_null = [v for v in values if v is not None and math.isfinite(v)]
+        if not non_null:
+            return None
+
+        if "macd_hist" in base_norm or base_norm.startswith("macdhist"):
+            return {"pane": "oscillator", "kind": "histogram", "levels": [0.0]}
+
+        osc_prefixes = (
+            "rsi", "macd", "adx", "plus_di", "minus_di", "stoch", "atr",
+            "roc", "cci", "mfi", "williams", "willr", "obv", "cmf", "aroon",
+            "volsma", "vol_sma", "volume_sma", "supertrend_dir", "supertrenddir",
+            "momentum", "mom(", "ao(", "uo(", "tsi(", "trix", "dpo", "bop", "cmo", "kst",
+        )
+        if any(base_norm.startswith(p) for p in osc_prefixes):
+            levels: List[float] = []
+            if base_norm.startswith("rsi"):
+                levels = [30.0, 70.0]
+            elif base_norm.startswith("stoch"):
+                levels = [20.0, 80.0]
+            elif base_norm.startswith("adx"):
+                levels = [25.0]
+            elif base_norm.startswith(("macd", "roc", "cci", "mom(", "momentum", "cmf", "ao(")):
+                levels = [0.0]
+            return {"pane": "oscillator", "kind": "line", "levels": levels}
+
+        overlay_prefixes = (
+            "sma", "ema", "wma", "dema", "tema", "hma", "vwma", "rma", "kama", "alma",
+            "vwap", "supertrend", "bb_", "bollinger", "keltner", "kc_", "donchian", "dc_",
+            "rollinghigh", "rollinglow", "ichimoku", "tenkan", "kijun", "senkou", "chikou",
+            "psar", "parabolic", "pivot", "max(", "min(", "high(", "low(", "open(", "close(",
+        )
+        if any(base_norm.startswith(p) for p in overlay_prefixes):
+            return {"pane": "overlay", "kind": "line", "levels": []}
+
+        # Numeric scale heuristic for custom Python plugin indicator columns
+        valid_closes = [c for c in closes if c is not None and math.isfinite(c) and c > 0]
+        if valid_closes:
+            min_c = min(valid_closes)
+            max_c = max(valid_closes)
+            unique_small = {round(v, 4) for v in non_null[:100]}
+            if unique_small.issubset({-1.0, 0.0, 1.0}):
+                return {"pane": "oscillator", "kind": "line", "levels": [0.0]}
+            in_price_band = sum(1 for v in non_null if (min_c * 0.4) <= v <= (max_c * 2.2))
+            if in_price_band / float(len(non_null)) >= 0.7:
+                return {"pane": "overlay", "kind": "line", "levels": []}
+
+        return {"pane": "oscillator", "kind": "line", "levels": []}
+
+    def get_chart_series(
+        self,
+        run_id: str,
+        symbol: Optional[str] = None,
+        max_bars: int = 3000,
+    ) -> Dict[str, Any]:
+        """
+        Return the exact OHLCV bars and strategy-used indicator series for a
+        backtest run & symbol so the backtest candlestick chart renders the
+        strategy's real indicators instead of fixed defaults.
+        """
+        safe_id = re.sub(r"[^a-zA-Z0-9_-]+", "", run_id or "")
+        meta = self._load_export_meta(safe_id)
+        if not meta:
+            raise KeyError(
+                f"Chart indicator data for backtest run '{run_id}' is not available."
+            )
+
+        ind_cols: List[str] = list(meta.get("indicator_columns") or [])
+        clean_sym = (symbol or "").strip().upper()
+        raw_rows: List[Dict[str, Any]] = []
+
+        if "symbol_files" in meta:
+            run_dir = self._exports_dir / safe_id
+            sym_files: Dict[str, str] = meta.get("symbol_files") or {}
+            if not sym_files:
+                raise KeyError(f"No symbols stored for backtest run '{run_id}'.")
+            if not clean_sym or clean_sym in {"ALL", "COMBINED"}:
+                clean_sym = sorted(sym_files.keys())[0]
+            if clean_sym not in sym_files:
+                raise KeyError(f"Symbol '{clean_sym}' not found in backtest run '{run_id}'.")
+            csv_path = run_dir / sym_files[clean_sym]
+            if not csv_path.exists():
+                raise KeyError(f"Export file for '{clean_sym}' is missing.")
+            with csv_path.open("r", encoding="utf-8", newline="") as fh:
+                reader = csv.DictReader(fh)
+                for rec in reader:
+                    raw_rows.append(rec)
+        else:
+            by_sym: Dict[str, List[Dict[str, Any]]] = meta.get("by_symbol") or {}
+            if not by_sym:
+                raise KeyError(f"No symbols stored for backtest run '{run_id}'.")
+            if not clean_sym or clean_sym in {"ALL", "COMBINED"}:
+                clean_sym = sorted(by_sym.keys())[0]
+            if clean_sym not in by_sym:
+                raise KeyError(f"Symbol '{clean_sym}' not found in backtest run '{run_id}'.")
+            raw_rows = list(by_sym[clean_sym])
+
+        if max_bars > 0 and len(raw_rows) > max_bars:
+            raw_rows = raw_rows[-max_bars:]
+
+        def _parse_num(val: Any) -> Optional[float]:
+            if val is None or val == "":
+                return None
+            try:
+                num = float(val)
+                return num if math.isfinite(num) else None
+            except (TypeError, ValueError):
+                return None
+
+        bars: List[Dict[str, Any]] = []
+        closes: List[float] = []
+        raw_series: Dict[str, List[Optional[float]]] = {c: [] for c in ind_cols}
+
+        for rec in raw_rows:
+            ts = str(rec.get("timestamp") or "").strip()
+            o_val = _parse_num(rec.get("open"))
+            h_val = _parse_num(rec.get("high"))
+            l_val = _parse_num(rec.get("low"))
+            c_val = _parse_num(rec.get("close"))
+            v_val = _parse_num(rec.get("volume")) or 0.0
+            if o_val is None or h_val is None or l_val is None or c_val is None:
+                continue
+            bars.append(
+                {
+                    "ts_ist": ts,
+                    "trade_date": ts[:10],
+                    "open": o_val,
+                    "high": h_val,
+                    "low": l_val,
+                    "close": c_val,
+                    "volume": int(v_val),
+                }
+            )
+            closes.append(c_val)
+            for col in ind_cols:
+                raw_series[col].append(_parse_num(rec.get(col)))
+
+        all_cols_lower = {re.sub(r"\s+", "", c).lower() for c in ind_cols}
+        indicators: List[Dict[str, Any]] = []
+        for col in ind_cols:
+            vals = raw_series[col]
+            meta_cls = self._classify_indicator_series(col, vals, closes, all_cols_lower)
+            if meta_cls is None:
+                continue
+            indicators.append(
+                {
+                    "id": col,
+                    "label": col,
+                    "pane": meta_cls["pane"],
+                    "kind": meta_cls["kind"],
+                    "levels": meta_cls["levels"],
+                    "values": vals,
+                }
+            )
+
+        return {
+            "ok": True,
+            "run_id": safe_id,
+            "symbol": clean_sym,
+            "strategy": str(meta.get("strategy") or "strategy"),
+            "bars": bars,
+            "indicators": indicators,
+            "indicator_columns": [ind["id"] for ind in indicators],
+        }
+
     def _save_run_snapshot(self, result: Dict[str, Any]) -> None:
         snapshot = {
             "run_id": result["run_id"],

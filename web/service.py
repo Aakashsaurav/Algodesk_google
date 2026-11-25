@@ -1287,6 +1287,18 @@ class BrokerHubService:
     def export_backtest_ohlcv_csv(self, run_id: str, symbol: Optional[str] = None) -> tuple[str, str]:
         return portfolio_backtest_engine.export_ohlcv_csv(run_id=run_id, symbol=symbol)
 
+    def get_backtest_chart_series(
+        self,
+        run_id: str,
+        symbol: Optional[str] = None,
+        max_bars: int = 3000,
+    ) -> Dict[str, Any]:
+        return portfolio_backtest_engine.get_chart_series(
+            run_id=run_id,
+            symbol=symbol,
+            max_bars=max_bars,
+        )
+
     def validate_formula_expr(self, expression: str, *, expect_boolean: bool = False) -> Dict[str, Any]:
         from rules.formula import validate_formula
 

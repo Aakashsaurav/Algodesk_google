@@ -23,6 +23,15 @@ interface OhlcvBar {
   volume: number;
 }
 
+interface StrategyIndicatorSeries {
+  id: string;
+  label: string;
+  pane: 'overlay' | 'oscillator';
+  kind: 'line' | 'histogram';
+  levels?: number[];
+  values: Array<number | null>;
+}
+
 interface CandlestickChartPanelProps {
   symbols: string[];
   activeSymbol: string;
@@ -31,6 +40,7 @@ interface CandlestickChartPanelProps {
   timeframe: string;
   onTimeframeChange?: (tf: string) => void;
   trades?: BacktestTradeRow[];
+  backtestRunId?: string;
   fromDate?: string;
   toDate?: string;
   onQuickOrder?: (target: QuickOrderTarget) => void;
@@ -46,9 +56,24 @@ const CHART_TFS = [
   { id: '1day', label: '1 Day' },
 ];
 
+const INDICATOR_COLORS = [
+  '#38bdf8', // sky
+  '#f59e0b', // amber
+  '#a78bfa', // violet
+  '#f472b6', // pink
+  '#34d399', // emerald
+  '#fb923c', // orange
+  '#22d3ee', // cyan
+  '#e879f9', // fuchsia
+  '#facc15', // yellow
+  '#fb7185', // rose
+];
+
 const MAX_LOADED_BARS = 3000;
 const MIN_VISIBLE_BARS = 10;
 const DEFAULT_VISIBLE_BARS = 100;
+const OSC_PANE_HEIGHT = 82;
+const OSC_PANE_GAP = 8;
 
 function computeEma(bars: OhlcvBar[], period: number): Array<number | null> {
   if (bars.length < period) return bars.map(() => null);
@@ -69,6 +94,25 @@ function normalizeTs(value: string): string {
   return (value || '').trim().replace('T', ' ').slice(0, 16);
 }
 
+function oscillatorGroupKey(label: string): string {
+  const norm = label.toLowerCase().replace(/\s+/g, '');
+  if (norm.startsWith('macd')) return 'macd';
+  if (norm.startsWith('rsi')) return 'rsi';
+  if (norm.startsWith('stoch')) return 'stoch';
+  if (norm.startsWith('adx') || norm.startsWith('plus_di') || norm.startsWith('minus_di')) return 'adx';
+  if (norm.startsWith('atr_pct')) return 'atr_pct';
+  if (norm.startsWith('atr')) return 'atr';
+  if (norm.startsWith('vol')) return 'vol';
+  return norm.split('(')[0] || norm;
+}
+
+function formatIndicatorVal(val: number): string {
+  const abs = Math.abs(val);
+  if (abs >= 1000) return val.toFixed(1);
+  if (abs >= 10) return val.toFixed(2);
+  return val.toFixed(3);
+}
+
 export function CandlestickChartPanel({
   symbols,
   activeSymbol,
@@ -77,6 +121,7 @@ export function CandlestickChartPanel({
   timeframe,
   onTimeframeChange,
   trades = [],
+  backtestRunId,
   fromDate,
   toDate,
   onQuickOrder,
@@ -84,8 +129,12 @@ export function CandlestickChartPanel({
   compactHeader = false,
 }: CandlestickChartPanelProps) {
   const [bars, setBars] = useState<OhlcvBar[]>([]);
+  const [strategyIndicators, setStrategyIndicators] = useState<StrategyIndicatorSeries[]>([]);
+  const [usingStrategyIndicators, setUsingStrategyIndicators] = useState(false);
+  const [enabledIndicators, setEnabledIndicators] = useState<Record<string, boolean>>({});
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
+  // Default overlays used ONLY when no backtestRunId is provided (e.g. Create Strategy preview)
   const [showEma20, setShowEma20] = useState(true);
   const [showEma50, setShowEma50] = useState(false);
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
@@ -99,6 +148,7 @@ export function CandlestickChartPanel({
   const viewRangeRef = useRef(viewRange);
   const barsLenRef = useRef(0);
   const wheelPanAccumRef = useRef(0);
+  const lastRunIdRef = useRef<string | undefined>(undefined);
   const dragRef = useRef<{
     pointerId: number;
     startClientX: number;
@@ -110,22 +160,11 @@ export function CandlestickChartPanel({
   viewRangeRef.current = viewRange;
   barsLenRef.current = bars.length;
 
-  // SVG Layout Constants
-  const svgW = 760;
-  const svgH = height;
-  const padL = 14;
-  const padR = 66;
-  const padT = 16;
-  const padB = 26;
-  const volH = 56;
-  const priceH = svgH - padT - padB - volH - 10;
-  const plotW = svgW - padL - padR;
-
   const computeDefaultRange = useCallback(
     (total: number) => {
       if (total <= 0) return { start: 0, end: 0 };
       if (total <= 45) return { start: 0, end: total };
-      // Start with a comfortable ~70-85 bar window so pan/drag and zoom in/out both work immediately
+      // Start with a comfortable ~70-100 bar window so pan/drag and zoom in/out both work immediately
       const span = Math.min(total - Math.min(12, Math.floor(total * 0.2)), DEFAULT_VISIBLE_BARS);
       const effSpan = Math.max(MIN_VISIBLE_BARS, Math.min(total, span));
       return { start: Math.max(0, total - effSpan), end: total };
@@ -140,7 +179,42 @@ export function CandlestickChartPanel({
       setLoading(true);
       setError('');
       try {
-        // Load extra warmup/context bars before fromDate so EMA20/EMA50 and panning both have full history
+        // When viewing a backtest result, load the exact backtest candles + strategy indicators first
+        if (backtestRunId) {
+          const chartRes = await apiFetch(
+            `/api/streak/backtest/${encodeURIComponent(backtestRunId)}/chart?symbol=${encodeURIComponent(clean)}&limit=${MAX_LOADED_BARS}`
+          );
+          if (chartRes.ok) {
+            const chartBody = await chartRes.json();
+            if (Array.isArray(chartBody.bars) && chartBody.bars.length > 0) {
+              const loadedBars: OhlcvBar[] = chartBody.bars;
+              const loadedInds: StrategyIndicatorSeries[] = Array.isArray(chartBody.indicators)
+                ? chartBody.indicators
+                : [];
+              setBars(loadedBars);
+              setStrategyIndicators(loadedInds);
+              setUsingStrategyIndicators(true);
+              setEnabledIndicators((prev) => {
+                const isNewRun = lastRunIdRef.current !== backtestRunId;
+                lastRunIdRef.current = backtestRunId;
+                const next: Record<string, boolean> = {};
+                for (const ind of loadedInds) {
+                  next[ind.id] = isNewRun || prev[ind.id] === undefined ? true : prev[ind.id];
+                }
+                return next;
+              });
+              setViewRange(computeDefaultRange(loadedBars.length));
+              setHoverIdx(null);
+              setLoading(false);
+              return;
+            }
+          }
+        }
+
+        // Standalone chart (Create Strategy preview or pruned historical run fallback)
+        setStrategyIndicators([]);
+        setUsingStrategyIndicators(false);
+
         let paddedFrom = fromDate;
         if (fromDate && /^\d{4}-\d{2}-\d{2}$/.test(fromDate)) {
           const d = new Date(`${fromDate}T00:00:00Z`);
@@ -209,12 +283,14 @@ export function CandlestickChartPanel({
       } catch (err) {
         setError(err instanceof Error ? err.message : 'Unable to load chart candles.');
         setBars([]);
+        setStrategyIndicators([]);
+        setUsingStrategyIndicators(false);
         setViewRange({ start: 0, end: 0 });
       } finally {
         setLoading(false);
       }
     },
-    [exchange, fromDate, toDate, computeDefaultRange]
+    [backtestRunId, exchange, fromDate, toDate, computeDefaultRange]
   );
 
   useEffect(() => {
@@ -230,6 +306,145 @@ export function CandlestickChartPanel({
     () => (bars.length > 0 ? bars.slice(clampedStart, clampedEnd) : []),
     [bars, clampedStart, clampedEnd]
   );
+
+  // Assign stable colors to strategy indicators
+  const coloredStrategyIndicators = useMemo(
+    () =>
+      strategyIndicators.map((ind, idx) => ({
+        ...ind,
+        color: INDICATOR_COLORS[idx % INDICATOR_COLORS.length],
+        enabled: enabledIndicators[ind.id] ?? true,
+      })),
+    [strategyIndicators, enabledIndicators]
+  );
+
+  // Active price overlays (strategy overlays in backtest mode; EMA20/EMA50 in standalone preview)
+  const fallbackEma20Full = useMemo(
+    () => (!usingStrategyIndicators && showEma20 ? computeEma(bars, 20) : []),
+    [bars, usingStrategyIndicators, showEma20]
+  );
+  const fallbackEma50Full = useMemo(
+    () => (!usingStrategyIndicators && showEma50 ? computeEma(bars, 50) : []),
+    [bars, usingStrategyIndicators, showEma50]
+  );
+
+  const activeOverlays = useMemo(() => {
+    if (usingStrategyIndicators) {
+      return coloredStrategyIndicators
+        .filter((ind) => ind.pane === 'overlay' && ind.enabled)
+        .map((ind) => ({
+          id: ind.id,
+          label: ind.label,
+          color: ind.color,
+          fullValues: ind.values,
+          visibleValues: ind.values.slice(clampedStart, clampedEnd),
+        }));
+    }
+    const list: Array<{
+      id: string;
+      label: string;
+      color: string;
+      fullValues: Array<number | null>;
+      visibleValues: Array<number | null>;
+    }> = [];
+    if (showEma20 && fallbackEma20Full.length > 0) {
+      list.push({
+        id: 'EMA(20)',
+        label: 'EMA20',
+        color: '#38bdf8',
+        fullValues: fallbackEma20Full,
+        visibleValues: fallbackEma20Full.slice(clampedStart, clampedEnd),
+      });
+    }
+    if (showEma50 && fallbackEma50Full.length > 0) {
+      list.push({
+        id: 'EMA(50)',
+        label: 'EMA50',
+        color: '#f59e0b',
+        fullValues: fallbackEma50Full,
+        visibleValues: fallbackEma50Full.slice(clampedStart, clampedEnd),
+      });
+    }
+    return list;
+  }, [
+    usingStrategyIndicators,
+    coloredStrategyIndicators,
+    showEma20,
+    showEma50,
+    fallbackEma20Full,
+    fallbackEma50Full,
+    clampedStart,
+    clampedEnd,
+  ]);
+
+  // Group enabled oscillator indicators into dedicated sub-panes (up to 3 panes) so scales never collide
+  const oscillatorPanes = useMemo(() => {
+    if (!usingStrategyIndicators) return [];
+    const activeOsc = coloredStrategyIndicators.filter((ind) => ind.pane === 'oscillator' && ind.enabled);
+    const groups = new Map<string, typeof activeOsc>();
+    for (const ind of activeOsc) {
+      const gKey = oscillatorGroupKey(ind.label);
+      const arr = groups.get(gKey) || [];
+      arr.push(ind);
+      groups.set(gKey, arr);
+    }
+    return Array.from(groups.entries())
+      .slice(0, 3)
+      .map(([groupKey, items]) => {
+        const levelsSet = new Set<number>();
+        let lo = Infinity;
+        let hi = -Infinity;
+        const series = items.map((ind) => {
+          (ind.levels || []).forEach((lv) => levelsSet.add(lv));
+          const vis = ind.values.slice(clampedStart, clampedEnd);
+          for (const v of vis) {
+            if (v !== null && Number.isFinite(v)) {
+              if (v < lo) lo = v;
+              if (v > hi) hi = v;
+            }
+          }
+          return {
+            id: ind.id,
+            label: ind.label,
+            color: ind.color,
+            kind: ind.kind,
+            fullValues: ind.values,
+            visibleValues: vis,
+          };
+        });
+        const levels = Array.from(levelsSet);
+        for (const lv of levels) {
+          if (lv < lo) lo = lv;
+          if (lv > hi) hi = lv;
+        }
+        if (!Number.isFinite(lo) || !Number.isFinite(hi)) {
+          lo = 0;
+          hi = 100;
+        }
+        const pad = (hi - lo) * 0.12 || 1;
+        return {
+          groupKey,
+          series,
+          levels,
+          minVal: lo - pad,
+          maxVal: hi + pad,
+        };
+      });
+  }, [usingStrategyIndicators, coloredStrategyIndicators, clampedStart, clampedEnd]);
+
+  // SVG Layout Constants (dynamically extended when strategy uses oscillator sub-panes)
+  const svgW = 760;
+  const padL = 14;
+  const padR = 66;
+  const padT = 16;
+  const padB = 26;
+  const volH = 48;
+  const mainChartH = height;
+  const priceH = mainChartH - padT - padB - volH - 10;
+  const volTop = padT + priceH + 8;
+  const oscTotalH = oscillatorPanes.length * (OSC_PANE_HEIGHT + OSC_PANE_GAP);
+  const svgH = mainChartH + oscTotalH;
+  const plotW = svgW - padL - padR;
 
   const zoomAt = useCallback((scaleFactor: number, anchorRatio = 0.5) => {
     const total = barsLenRef.current;
@@ -317,18 +532,6 @@ export function CandlestickChartPanel({
     return () => el.removeEventListener('wheel', handleWheel);
   }, [panByBars, plotW, svgW, zoomAt]);
 
-  // Compute EMAs on FULL history so values never shift while zooming/panning
-  const ema20Full = useMemo(() => (showEma20 ? computeEma(bars, 20) : []), [bars, showEma20]);
-  const ema50Full = useMemo(() => (showEma50 ? computeEma(bars, 50) : []), [bars, showEma50]);
-  const ema20Visible = useMemo(
-    () => (showEma20 ? ema20Full.slice(clampedStart, clampedEnd) : []),
-    [ema20Full, showEma20, clampedStart, clampedEnd]
-  );
-  const ema50Visible = useMemo(
-    () => (showEma50 ? ema50Full.slice(clampedStart, clampedEnd) : []),
-    [ema50Full, showEma50, clampedStart, clampedEnd]
-  );
-
   const activeFullIdx =
     hoverIdx !== null && visibleBars[hoverIdx]
       ? clampedStart + hoverIdx
@@ -383,7 +586,7 @@ export function CandlestickChartPanel({
     return map;
   }, [trades, bars, activeSymbol, timeframe]);
 
-  // Dynamic Y-axis auto-scale based on visible bars
+  // Dynamic Y-axis auto-scale based on visible bars AND active price overlays
   const { minP, maxP, maxVol } = useMemo(() => {
     if (!visibleBars.length) return { minP: 0, maxP: 100, maxVol: 1 };
     let lo = Infinity;
@@ -394,9 +597,20 @@ export function CandlestickChartPanel({
       if (b.high > hi) hi = b.high;
       if (b.volume > mv) mv = b.volume;
     }
-    const pad = (hi - lo) * 0.1 || 1;
+    const barLo = lo;
+    const barHi = hi;
+    // Include enabled price-scale overlays within a sane band around visible price range
+    for (const ov of activeOverlays) {
+      for (const v of ov.visibleValues) {
+        if (v !== null && Number.isFinite(v) && v >= barLo * 0.5 && v <= barHi * 1.8) {
+          if (v < lo) lo = v;
+          if (v > hi) hi = v;
+        }
+      }
+    }
+    const pad = (hi - lo) * 0.08 || 1;
     return { minP: lo - pad, maxP: hi + pad, maxVol: mv };
-  }, [visibleBars]);
+  }, [visibleBars, activeOverlays]);
 
   const stepX = visibleBars.length > 0 ? plotW / Math.max(visibleBars.length, 1) : 10;
   const candleW = Math.max(1.5, Math.min(18, stepX * 0.68));
@@ -407,16 +621,19 @@ export function CandlestickChartPanel({
   const priceForY = (y: number) =>
     maxP - ((y - padT) / Math.max(1, priceH)) * (maxP - minP);
 
-  const buildLinePath = (series: Array<number | null>) => {
+  const buildLinePath = (
+    series: Array<number | null>,
+    yMap: (v: number) => number = yForPrice
+  ) => {
     const pts: string[] = [];
     let drawing = false;
     series.forEach((v, i) => {
-      if (v === null) {
+      if (v === null || !Number.isFinite(v)) {
         drawing = false;
         return;
       }
       const x = padL + i * stepX + stepX / 2;
-      const y = yForPrice(v);
+      const y = yMap(v);
       pts.push(`${drawing ? 'L' : 'M'}${x.toFixed(1)},${y.toFixed(1)}`);
       drawing = true;
     });
@@ -450,6 +667,31 @@ export function CandlestickChartPanel({
     const d = b.trade_date || b.ts_ist.slice(0, 10);
     return spansMultiYear ? d.slice(2) : d.slice(5);
   };
+
+  // Live indicator readout values at hovered / latest bar
+  const indicatorReadouts = useMemo(() => {
+    if (activeFullIdx < 0) return [];
+    const items: Array<{ id: string; label: string; color: string; value: number | null }> = [];
+    for (const ov of activeOverlays) {
+      items.push({
+        id: ov.id,
+        label: ov.label,
+        color: ov.color,
+        value: ov.fullValues[activeFullIdx] ?? null,
+      });
+    }
+    for (const pane of oscillatorPanes) {
+      for (const s of pane.series) {
+        items.push({
+          id: s.id,
+          label: s.label,
+          color: s.color,
+          value: s.fullValues[activeFullIdx] ?? null,
+        });
+      }
+    }
+    return items;
+  }, [activeFullIdx, activeOverlays, oscillatorPanes]);
 
   const visibleCount = visibleBars.length;
   const minSpan = Math.min(bars.length, MIN_VISIBLE_BARS);
@@ -601,27 +843,64 @@ export function CandlestickChartPanel({
             </div>
           )}
 
+          {/* Strategy Indicator Toggles (in Backtest mode) or default EMA20/EMA50 (in standalone preview) */}
+          {usingStrategyIndicators ? (
+            coloredStrategyIndicators.length > 0 ? (
+              coloredStrategyIndicators.map((ind) => (
+                <button
+                  key={ind.id}
+                  type="button"
+                  onClick={() =>
+                    setEnabledIndicators((prev) => ({ ...prev, [ind.id]: !ind.enabled }))
+                  }
+                  title={`Toggle ${ind.label} (${ind.pane === 'overlay' ? 'price overlay' : 'oscillator pane'})`}
+                  className={`inline-flex min-h-[28px] items-center gap-1.5 rounded-md border px-2 font-mono text-[11px] font-semibold transition-colors ${
+                    ind.enabled
+                      ? 'border-slate-600 bg-slate-800/80 text-slate-100'
+                      : 'border-slate-800 bg-[#0b1120] text-slate-500 hover:text-slate-300'
+                  }`}
+                >
+                  <span
+                    className="h-2 w-2 rounded-full"
+                    style={{
+                      backgroundColor: ind.color,
+                      opacity: ind.enabled ? 1 : 0.35,
+                    }}
+                  />
+                  <span>{ind.label}</span>
+                </button>
+              ))
+            ) : (
+              <span className="rounded-md border border-slate-800 bg-[#0b1120] px-2 py-1 font-mono text-[11px] text-slate-500">
+                Price Action
+              </span>
+            )
+          ) : (
+            <>
+              <button
+                type="button"
+                onClick={() => setShowEma20((v) => !v)}
+                className={`min-h-[28px] rounded-md border px-2 font-mono text-[11px] font-semibold ${
+                  showEma20 ? 'border-sky-500/70 bg-sky-500/15 text-sky-300' : 'border-slate-700 text-slate-400'
+                }`}
+              >
+                EMA20
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowEma50((v) => !v)}
+                className={`min-h-[28px] rounded-md border px-2 font-mono text-[11px] font-semibold ${
+                  showEma50 ? 'border-amber-500/70 bg-amber-500/15 text-amber-300' : 'border-slate-700 text-slate-400'
+                }`}
+              >
+                EMA50
+              </button>
+            </>
+          )}
+
           <button
             type="button"
-            onClick={() => setShowEma20((v) => !v)}
-            className={`min-h-[28px] rounded-md border px-2 font-mono text-[11px] font-semibold ${
-              showEma20 ? 'border-sky-500/70 bg-sky-500/15 text-sky-300' : 'border-slate-700 text-slate-400'
-            }`}
-          >
-            EMA20
-          </button>
-          <button
-            type="button"
-            onClick={() => setShowEma50((v) => !v)}
-            className={`min-h-[28px] rounded-md border px-2 font-mono text-[11px] font-semibold ${
-              showEma50 ? 'border-amber-500/70 bg-amber-500/15 text-amber-300' : 'border-slate-700 text-slate-400'
-            }`}
-          >
-            EMA50
-          </button>
-          <button
-            type="button"
-            onClick={() => void fetchBars(activeSymbol, timeframe, true)}
+            onClick={() => void fetchBars(activeSymbol, timeframe, !backtestRunId)}
             disabled={loading}
             title="Refresh candles"
             className="flex h-7 w-7 items-center justify-center rounded-md border border-slate-700 text-slate-400 hover:border-sky-400 hover:text-slate-100"
@@ -631,11 +910,26 @@ export function CandlestickChartPanel({
         </div>
       </div>
 
+      {/* Live indicator readout bar for hovered / active candle */}
+      {bars.length > 0 && indicatorReadouts.length > 0 && (
+        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-b border-slate-800/70 bg-[#0d1424] px-4 py-1.5 font-mono text-[11px] tabular-nums">
+          {indicatorReadouts.map((item) => (
+            <span key={item.id} className="inline-flex items-center gap-1.5 text-slate-300">
+              <span className="h-1.5 w-3 rounded-sm" style={{ backgroundColor: item.color }} />
+              <span className="text-slate-400">{item.label}:</span>
+              <strong style={{ color: item.color }}>
+                {item.value !== null && Number.isFinite(item.value) ? formatIndicatorVal(item.value) : '—'}
+              </strong>
+            </span>
+          ))}
+        </div>
+      )}
+
       {/* Candlestick Canvas */}
       <div
         ref={chartWrapRef}
         className="relative bg-[#0b1120]"
-        style={{ minHeight: height }}
+        style={{ minHeight: svgH }}
       >
         {loading && bars.length === 0 ? (
           <div className="flex h-full min-h-[320px] items-center justify-center text-xs text-slate-400">
@@ -647,7 +941,7 @@ export function CandlestickChartPanel({
             <p>{error}</p>
             <button
               type="button"
-              onClick={() => void fetchBars(activeSymbol, timeframe, true)}
+              onClick={() => void fetchBars(activeSymbol, timeframe, !backtestRunId)}
               className="rounded-md border border-slate-700 px-3 py-1.5 font-semibold text-sky-300 hover:border-sky-400"
             >
               Fetch Candles
@@ -741,6 +1035,14 @@ export function CandlestickChartPanel({
                 <clipPath id={clipPathId}>
                   <rect x={padL} y={padT} width={plotW} height={priceH} />
                 </clipPath>
+                {oscillatorPanes.map((pane, pIdx) => {
+                  const pTop = mainChartH - padB + OSC_PANE_GAP + pIdx * (OSC_PANE_HEIGHT + OSC_PANE_GAP);
+                  return (
+                    <clipPath key={`clip-${pane.groupKey}`} id={`${clipPathId}-osc-${pIdx}`}>
+                      <rect x={padL} y={pTop} width={plotW} height={OSC_PANE_HEIGHT} />
+                    </clipPath>
+                  );
+                })}
               </defs>
 
               {/* Horizontal grid & right Y-axis */}
@@ -766,7 +1068,7 @@ export function CandlestickChartPanel({
               {visibleBars.map((b, i) => {
                 const x = padL + i * stepX + (stepX - candleW) / 2;
                 const vh = (b.volume / Math.max(1, maxVol)) * volH;
-                const y = svgH - padB - vh;
+                const y = volTop + volH - vh;
                 const up = b.close >= b.open;
                 return (
                   <rect
@@ -780,7 +1082,7 @@ export function CandlestickChartPanel({
                 );
               })}
 
-              {/* Candlesticks & Trade Markers */}
+              {/* Candlesticks, Trade Markers & Price Overlays */}
               <g clipPath={`url(#${clipPathId})`}>
                 {visibleBars.map((b, i) => {
                   const fullIdx = clampedStart + i;
@@ -822,25 +1124,17 @@ export function CandlestickChartPanel({
                   );
                 })}
 
-                {/* EMA Overlays */}
-                {showEma20 && ema20Visible.length > 0 && (
+                {/* Active Price-Scale Indicator Overlays */}
+                {activeOverlays.map((ov) => (
                   <path
-                    d={buildLinePath(ema20Visible)}
+                    key={ov.id}
+                    d={buildLinePath(ov.visibleValues)}
                     fill="none"
-                    stroke="#38bdf8"
-                    strokeWidth="1.4"
-                    opacity="0.9"
+                    stroke={ov.color}
+                    strokeWidth="1.5"
+                    opacity="0.92"
                   />
-                )}
-                {showEma50 && ema50Visible.length > 0 && (
-                  <path
-                    d={buildLinePath(ema50Visible)}
-                    fill="none"
-                    stroke="#f59e0b"
-                    strokeWidth="1.4"
-                    opacity="0.85"
-                  />
-                )}
+                ))}
               </g>
 
               {/* Latest close horizontal dashed guide (only if in visible price range) */}
@@ -877,7 +1171,113 @@ export function CandlestickChartPanel({
                 </g>
               )}
 
-              {/* Hover crosshair (vertical + horizontal price guide) */}
+              {/* Dedicated Synchronized Oscillator Sub-Panes (RSI, MACD, ADX, Stoch, ATR, etc.) */}
+              {oscillatorPanes.map((pane, pIdx) => {
+                const pTop = mainChartH - padB + OSC_PANE_GAP + pIdx * (OSC_PANE_HEIGHT + OSC_PANE_GAP);
+                const pBot = pTop + OSC_PANE_HEIGHT;
+                const yForOsc = (v: number) =>
+                  pTop + 6 + ((pane.maxVal - v) / Math.max(0.0001, pane.maxVal - pane.minVal)) * (OSC_PANE_HEIGHT - 12);
+                const midTick = (pane.minVal + pane.maxVal) / 2;
+                const oscTicks = [pane.maxVal, midTick, pane.minVal];
+                const zeroY = yForOsc(0);
+                return (
+                  <g key={`osc-${pane.groupKey}`}>
+                    <line x1={padL} y1={pTop} x2={svgW - padR} y2={pTop} stroke="#1e293b" strokeWidth="1" />
+                    <rect
+                      x={padL}
+                      y={pTop}
+                      width={plotW}
+                      height={OSC_PANE_HEIGHT}
+                      fill="rgba(15, 23, 42, 0.35)"
+                    />
+
+                    {/* Reference levels (e.g. 30/70 for RSI, 0 for MACD) */}
+                    {pane.levels.map((lv) => {
+                      const ly = yForOsc(lv);
+                      return (
+                        <line
+                          key={`lv-${lv}`}
+                          x1={padL}
+                          y1={ly}
+                          x2={svgW - padR}
+                          y2={ly}
+                          stroke="#334155"
+                          strokeDasharray="3 3"
+                          strokeWidth="0.9"
+                        />
+                      );
+                    })}
+
+                    {/* Oscillator right Y-axis labels */}
+                    {oscTicks.map((tv, ti) => {
+                      const ty = yForOsc(tv);
+                      return (
+                        <text
+                          key={`ot-${ti}`}
+                          x={svgW - padR + 6}
+                          y={ty + 3}
+                          fill="#64748b"
+                          fontSize="9"
+                          fontFamily="IBM Plex Mono, monospace"
+                        >
+                          {formatIndicatorVal(tv)}
+                        </text>
+                      );
+                    })}
+
+                    {/* Pane series label in top-left */}
+                    <text
+                      x={padL + 4}
+                      y={pTop + 11}
+                      fill="#94a3b8"
+                      fontSize="9"
+                      fontWeight="600"
+                      fontFamily="IBM Plex Mono, monospace"
+                    >
+                      {pane.series.map((s) => s.label).join(' · ')}
+                    </text>
+
+                    <g clipPath={`url(#${clipPathId}-osc-${pIdx})`}>
+                      {pane.series.map((s) =>
+                        s.kind === 'histogram' ? (
+                          <g key={`hist-${s.id}`}>
+                            {s.visibleValues.map((v, i) => {
+                              if (v === null || !Number.isFinite(v)) return null;
+                              const x = padL + i * stepX + (stepX - candleW) / 2;
+                              const vy = yForOsc(v);
+                              const topY = Math.min(zeroY, vy);
+                              const bh = Math.max(1, Math.abs(vy - zeroY));
+                              return (
+                                <rect
+                                  key={`h-${clampedStart + i}`}
+                                  x={x}
+                                  y={topY}
+                                  width={candleW}
+                                  height={bh}
+                                  fill={v >= 0 ? 'rgba(16, 185, 129, 0.55)' : 'rgba(239, 68, 68, 0.55)'}
+                                />
+                              );
+                            })}
+                          </g>
+                        ) : (
+                          <path
+                            key={`line-${s.id}`}
+                            d={buildLinePath(s.visibleValues, yForOsc)}
+                            fill="none"
+                            stroke={s.color}
+                            strokeWidth="1.4"
+                            opacity="0.92"
+                          />
+                        )
+                      )}
+                    </g>
+
+                    <line x1={padL} y1={pBot} x2={svgW - padR} y2={pBot} stroke="#1e293b" strokeWidth="0.7" />
+                  </g>
+                );
+              })}
+
+              {/* Hover crosshair (vertical across price + oscillators, horizontal price guide) */}
               {!isDragging && hoverIdx !== null && visibleBars[hoverIdx] && (
                 <g pointerEvents="none">
                   <line
