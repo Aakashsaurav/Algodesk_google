@@ -3,6 +3,7 @@ import { apiFetch } from '../../utils/authClient';
 import {
   ArrowLeft,
   Bell,
+  Calendar,
   Copy,
   Download,
   Eye,
@@ -13,6 +14,7 @@ import {
   X,
 } from 'lucide-react';
 import { CandlestickChartPanel } from './CandlestickChartPanel';
+import { PortfolioPnlChart } from './PortfolioPnlChart';
 import type { QuickOrderTarget } from './QuickOrderModal';
 import type { BacktestFullResult, BacktestTradeRow } from './types';
 import { fetchSecurityStatus, type SecurityStatus } from '../../utils/authClient';
@@ -49,8 +51,11 @@ export function computeTradeAnalytics(trades: BacktestTradeRow[], includeCharges
   const dayBuckets: Record<number, number[]> = { 1: [], 2: [], 3: [], 4: [], 5: [] };
   const monthBuckets: Record<number, { pnl: number; retSum: number; count: number }> = {};
   for (let m = 0; m < 12; m += 1) monthBuckets[m] = { pnl: 0, retSum: 0, count: 0 };
+  const yearMonthBuckets: Record<string, Record<number, { pnl: number; retSum: number; count: number }>> = {};
 
-  const cumSeries: Array<{ label: string; pnl: number }> = [{ label: 'Start', pnl: 0 }];
+  const cumSeries: Array<{ label: string; pnl: number; symbol?: string; tradePnl?: number }> = [
+    { label: 'Start', pnl: 0 },
+  ];
 
   for (const t of trades) {
     const val = includeCharges ? Number(t.pnl ?? 0) : Number(t.gross_pnl ?? t.pnl ?? 0);
@@ -62,7 +67,12 @@ export function computeTradeAnalytics(trades: BacktestTradeRow[], includeCharges
     if (cum > peak) peak = cum;
     const dd = peak - cum;
     if (dd > maxDdAbs) maxDdAbs = dd;
-    cumSeries.push({ label: (t.exit_date || t.entry_date || '').slice(0, 10), pnl: cum });
+    cumSeries.push({
+      label: (t.exit_date || t.entry_date || '').slice(0, 10),
+      pnl: cum,
+      symbol: t.symbol,
+      tradePnl: val,
+    });
 
     if (val >= 0) {
       wins += 1;
@@ -87,10 +97,20 @@ export function computeTradeAnalytics(trades: BacktestTradeRow[], includeCharges
         const dow = dt.getUTCDay();
         if (dayBuckets[dow]) dayBuckets[dow].push(retPct);
         const mo = dt.getUTCMonth();
+        const yr = dtStr.slice(0, 4);
         if (monthBuckets[mo]) {
           monthBuckets[mo].pnl += val;
           monthBuckets[mo].retSum += retPct;
           monthBuckets[mo].count += 1;
+        }
+        if (!yearMonthBuckets[yr]) {
+          yearMonthBuckets[yr] = {};
+          for (let m = 0; m < 12; m += 1) yearMonthBuckets[yr][m] = { pnl: 0, retSum: 0, count: 0 };
+        }
+        if (yearMonthBuckets[yr][mo]) {
+          yearMonthBuckets[yr][mo].pnl += val;
+          yearMonthBuckets[yr][mo].retSum += retPct;
+          yearMonthBuckets[yr][mo].count += 1;
         }
       }
     }
@@ -112,6 +132,17 @@ export function computeTradeAnalytics(trades: BacktestTradeRow[], includeCharges
     count: monthBuckets[m].count,
   }));
 
+  const availableYears = Object.keys(yearMonthBuckets).sort();
+  const monthlyByYear: Record<string, typeof monthlySummary> = {};
+  for (const yr of availableYears) {
+    monthlyByYear[yr] = MONTHS.map((label, m) => ({
+      label,
+      pnl: yearMonthBuckets[yr][m].pnl,
+      retPct: yearMonthBuckets[yr][m].retSum,
+      count: yearMonthBuckets[yr][m].count,
+    }));
+  }
+
   return {
     totalPnl,
     wins,
@@ -126,6 +157,8 @@ export function computeTradeAnalytics(trades: BacktestTradeRow[], includeCharges
     maxDdAbs,
     dailySummary,
     monthlySummary,
+    availableYears,
+    monthlyByYear,
     cumSeries,
   };
 }
@@ -142,6 +175,7 @@ export function BacktestResultsView({
   const [includeCharges, setIncludeCharges] = useState<boolean>(true);
   const [showChargesBreakdown, setShowChargesBreakdown] = useState<boolean>(false);
   const [showAllTrades, setShowAllTrades] = useState<boolean>(false);
+  const [selectedYear, setSelectedYear] = useState<string>('ALL');
 
   // Deploy modal state
   const [deployOpen, setDeployOpen] = useState(false);
@@ -301,35 +335,12 @@ export function BacktestResultsView({
     }
   };
 
-  // Zero-line P&L Chart SVG math
-  const pnlSvg = useMemo(() => {
-    const pts = activeStats.cumSeries;
-    const w = 760;
-    const h = 210;
-    const padL = 14;
-    const padR = 64;
-    const padT = 16;
-    const padB = 24;
-    const plotW = w - padL - padR;
-    const plotH = h - padT - padB;
-    const vals = pts.map((p) => p.pnl);
-    const rawMin = Math.min(0, ...vals);
-    const rawMax = Math.max(0, ...vals);
-    const span = Math.max(10, rawMax - rawMin);
-    const minV = rawMin - span * 0.1;
-    const maxV = rawMax + span * 0.1;
-    const yFor = (v: number) => padT + ((maxV - v) / Math.max(1, maxV - minV)) * plotH;
-    const xFor = (i: number) => padL + (i / Math.max(1, pts.length - 1)) * plotW;
-    const zeroY = yFor(0);
-    const linePath = pts
-      .map((p, i) => `${i === 0 ? 'M' : 'L'}${xFor(i).toFixed(1)},${yFor(p.pnl).toFixed(1)}`)
-      .join(' ');
-    const areaPath =
-      pts.length > 1
-        ? `${linePath} L${xFor(pts.length - 1).toFixed(1)},${zeroY.toFixed(1)} L${xFor(0).toFixed(1)},${zeroY.toFixed(1)} Z`
-        : '';
-    return { w, h, padL, padR, zeroY, minV, maxV, yFor, xFor, linePath, areaPath, pts };
-  }, [activeStats.cumSeries]);
+  const displayedMonthly = useMemo(() => {
+    if (selectedYear !== 'ALL' && activeStats.monthlyByYear[selectedYear]) {
+      return activeStats.monthlyByYear[selectedYear];
+    }
+    return activeStats.monthlySummary;
+  }, [selectedYear, activeStats.monthlyByYear, activeStats.monthlySummary]);
 
   const displayedTrades = showAllTrades ? activeTrades : activeTrades.slice(0, 15);
   const cb = result.charges_breakdown;
@@ -479,14 +490,20 @@ export function BacktestResultsView({
           {/* Header + Trading Charges Gross/Net Toggle + 9-Column Metrics Strip */}
           <div className="overflow-hidden rounded-xl border border-slate-800 bg-[#111827]">
             <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800 px-5 py-3.5">
-              <div className="flex items-center gap-2.5">
+              <div className="flex flex-wrap items-center gap-2.5">
                 <h3 className="font-mono text-base font-bold text-slate-100">
                   {selectedSymbol === 'COMBINED' ? 'COMBINED PORTFOLIO' : selectedSymbol}
                 </h3>
-                <span className="text-xs text-slate-500">NSE</span>
+                <span className="text-xs text-slate-500">{result.deploy_spec?.exchange || 'NSE'}</span>
                 <span className="font-mono text-xs text-slate-400">
                   · {includeCharges ? 'Net (After Real Charges)' : 'Gross (Before Charges)'}
                 </span>
+                {(result.from_date || result.to_date) && (
+                  <span className="inline-flex items-center gap-1 rounded-md border border-slate-800 bg-[#0b1120] px-2 py-0.5 font-mono text-[11px] text-slate-300">
+                    <Calendar className="h-3 w-3 text-sky-400" />
+                    {result.from_date} → {result.to_date}
+                  </span>
+                )}
               </div>
 
               <div className="flex items-center gap-3">
@@ -684,12 +701,44 @@ export function BacktestResultsView({
 
             {/* Monthly Performance Heatmap */}
             <div className="overflow-hidden rounded-xl border border-slate-800 bg-[#111827] p-4">
-              <div className="mb-3 flex items-center justify-between">
+              <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
                 <h4 className="text-xs font-semibold text-slate-300">Hypothetical Monthly Performance</h4>
-                <span className="font-mono text-xs font-semibold text-slate-400">{yearLabel}</span>
+                {activeStats.availableYears.length > 1 ? (
+                  <div className="flex items-center gap-1 font-mono text-[11px]">
+                    <button
+                      type="button"
+                      onClick={() => setSelectedYear('ALL')}
+                      className={`rounded px-2 py-0.5 font-semibold ${
+                        selectedYear === 'ALL'
+                          ? 'bg-sky-500/20 text-sky-300'
+                          : 'text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      All
+                    </button>
+                    {activeStats.availableYears.map((yr) => (
+                      <button
+                        key={yr}
+                        type="button"
+                        onClick={() => setSelectedYear(yr)}
+                        className={`rounded px-2 py-0.5 font-semibold ${
+                          selectedYear === yr
+                            ? 'bg-sky-500/20 text-sky-300'
+                            : 'text-slate-400 hover:text-slate-200'
+                        }`}
+                      >
+                        {yr}
+                      </button>
+                    ))}
+                  </div>
+                ) : (
+                  <span className="font-mono text-xs font-semibold text-slate-400">
+                    {activeStats.availableYears[0] || yearLabel}
+                  </span>
+                )}
               </div>
               <div className="grid grid-cols-6 gap-2.5">
-                {activeStats.monthlySummary.map((m) => {
+                {displayedMonthly.map((m) => {
                   const hasData = m.count > 0;
                   const pos = m.retPct >= 0;
                   const bg = !hasData
@@ -701,7 +750,7 @@ export function BacktestResultsView({
                     <div key={m.label} className="flex flex-col items-center gap-1">
                       <div
                         className={`flex h-12 w-full items-center justify-center rounded-lg border font-mono text-[11px] font-bold tabular-nums ${bg}`}
-                        title={`${m.label}: ${m.count} trades, ₹${m.pnl.toFixed(2)}`}
+                        title={`${m.label} (${selectedYear === 'ALL' ? activeStats.availableYears.join(', ') || yearLabel : selectedYear}): ${m.count} trades, ₹${m.pnl.toFixed(2)}`}
                       >
                         {hasData ? `${pos ? '+' : ''}${m.retPct.toFixed(1)}%` : '—'}
                       </div>
@@ -853,79 +902,18 @@ export function BacktestResultsView({
             )}
           </div>
 
-          {/* P&L Chart (Zero-Line Green/Red Curve matching Backtest Result-4.png) */}
-          <div className="rounded-xl border border-slate-800 bg-[#111827] p-4">
-            <div className="mb-3 flex items-center justify-between">
-              <h4 className="text-xs font-semibold text-slate-200">
-                Cumulative P&amp;L Chart ({includeCharges ? 'Net' : 'Gross'})
-              </h4>
-              <span
-                className={`font-mono text-xs font-bold tabular-nums ${
-                  activeStats.totalPnl >= 0 ? 'text-emerald-400' : 'text-red-400'
-                }`}
-              >
-                {activeStats.totalPnl >= 0 ? '+' : ''}₹{activeStats.totalPnl.toLocaleString('en-IN', { maximumFractionDigits: 2 })}
-              </span>
-            </div>
-            <div className="overflow-hidden rounded-lg border border-slate-800 bg-[#0b1120] p-2">
-              <svg viewBox={`0 0 ${pnlSvg.w} ${pnlSvg.h}`} className="block w-full">
-                <defs>
-                  <clipPath id="pnl-above-zero">
-                    <rect x={pnlSvg.padL} y={0} width={pnlSvg.w - pnlSvg.padL - pnlSvg.padR} height={pnlSvg.zeroY} />
-                  </clipPath>
-                  <clipPath id="pnl-below-zero">
-                    <rect x={pnlSvg.padL} y={pnlSvg.zeroY} width={pnlSvg.w - pnlSvg.padL - pnlSvg.padR} height={pnlSvg.h - pnlSvg.zeroY} />
-                  </clipPath>
-                </defs>
-                {/* Zero baseline */}
-                <line
-                  x1={pnlSvg.padL}
-                  y1={pnlSvg.zeroY}
-                  x2={pnlSvg.w - pnlSvg.padR}
-                  y2={pnlSvg.zeroY}
-                  stroke="#334155"
-                  strokeDasharray="3 3"
-                  strokeWidth="1"
-                />
-                <text
-                  x={pnlSvg.w - pnlSvg.padR + 6}
-                  y={pnlSvg.zeroY + 3}
-                  fill="#64748b"
-                  fontSize="10"
-                  fontFamily="IBM Plex Mono, monospace"
-                >
-                  0.0
-                </text>
-                <text
-                  x={pnlSvg.w - pnlSvg.padR + 6}
-                  y={18}
-                  fill="#10b981"
-                  fontSize="10"
-                  fontFamily="IBM Plex Mono, monospace"
-                >
-                  {pnlSvg.maxV.toFixed(0)}
-                </text>
-                <text
-                  x={pnlSvg.w - pnlSvg.padR + 6}
-                  y={pnlSvg.h - 24}
-                  fill="#ef4444"
-                  fontSize="10"
-                  fontFamily="IBM Plex Mono, monospace"
-                >
-                  {pnlSvg.minV.toFixed(0)}
-                </text>
-
-                {pnlSvg.areaPath && (
-                  <>
-                    <path d={pnlSvg.areaPath} fill="rgba(16, 185, 129, 0.22)" clipPath="url(#pnl-above-zero)" />
-                    <path d={pnlSvg.areaPath} fill="rgba(239, 68, 68, 0.22)" clipPath="url(#pnl-below-zero)" />
-                    <path d={pnlSvg.linePath} fill="none" stroke="#10b981" strokeWidth="1.8" clipPath="url(#pnl-above-zero)" />
-                    <path d={pnlSvg.linePath} fill="none" stroke="#ef4444" strokeWidth="1.8" clipPath="url(#pnl-below-zero)" />
-                  </>
-                )}
-              </svg>
-            </div>
-          </div>
+          {/* Interactive Portfolio Equity & Cumulative P&L Chart with Dates */}
+          <PortfolioPnlChart
+            title={`${selectedSymbol === 'COMBINED' ? 'Portfolio Cumulative P&L' : `${selectedSymbol} Cumulative P&L`} (${includeCharges ? 'Net' : 'Gross'})`}
+            initialCapital={result.initial_capital}
+            fromDate={result.from_date}
+            toDate={result.to_date}
+            includeCharges={includeCharges}
+            isCombined={selectedSymbol === 'COMBINED'}
+            equityCurve={result.equity_curve}
+            tradeSeries={activeStats.cumSeries}
+            totalPnl={activeStats.totalPnl}
+          />
         </div>
       </div>
 

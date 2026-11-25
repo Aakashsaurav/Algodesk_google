@@ -124,13 +124,13 @@ export function CandlestickChartPanel({
   const computeDefaultRange = useCallback(
     (total: number) => {
       if (total <= 0) return { start: 0, end: 0 };
-      if (fromDate && toDate && total <= 180) {
-        return { start: 0, end: total };
-      }
-      const span = Math.min(total, DEFAULT_VISIBLE_BARS);
-      return { start: Math.max(0, total - span), end: total };
+      if (total <= 45) return { start: 0, end: total };
+      // Start with a comfortable ~70-85 bar window so pan/drag and zoom in/out both work immediately
+      const span = Math.min(total - Math.min(12, Math.floor(total * 0.2)), DEFAULT_VISIBLE_BARS);
+      const effSpan = Math.max(MIN_VISIBLE_BARS, Math.min(total, span));
+      return { start: Math.max(0, total - effSpan), end: total };
     },
-    [fromDate, toDate]
+    []
   );
 
   const fetchBars = useCallback(
@@ -140,6 +140,16 @@ export function CandlestickChartPanel({
       setLoading(true);
       setError('');
       try {
+        // Load extra warmup/context bars before fromDate so EMA20/EMA50 and panning both have full history
+        let paddedFrom = fromDate;
+        if (fromDate && /^\d{4}-\d{2}-\d{2}$/.test(fromDate)) {
+          const d = new Date(`${fromDate}T00:00:00Z`);
+          if (!Number.isNaN(d.getTime())) {
+            const padDays = tf.includes('minute') ? 10 : 90;
+            d.setUTCDate(d.getUTCDate() - padDays);
+            paddedFrom = d.toISOString().slice(0, 10);
+          }
+        }
         const params = new URLSearchParams({
           symbol: clean,
           exchange,
@@ -147,7 +157,7 @@ export function CandlestickChartPanel({
           view: 'full',
           limit: String(MAX_LOADED_BARS),
         });
-        if (fromDate) params.set('from_date', fromDate);
+        if (paddedFrom) params.set('from_date', paddedFrom);
         if (toDate) params.set('to_date', toDate);
 
         if (!forceDownload) {
@@ -955,6 +965,49 @@ export function CandlestickChartPanel({
               })}
             </svg>
 
+            {/* Interactive Timeline Scrubber / Pan Bar */}
+            {bars.length > MIN_VISIBLE_BARS && (
+              <div className="border-t border-slate-800/80 bg-[#090f1d] px-3 py-2">
+                <div
+                  role="slider"
+                  aria-label="Chart timeline navigator"
+                  aria-valuemin={1}
+                  aria-valuemax={bars.length}
+                  aria-valuenow={clampedStart + 1}
+                  tabIndex={0}
+                  onPointerDown={(e) => {
+                    const track = e.currentTarget;
+                    const rect = track.getBoundingClientRect();
+                    const span = Math.max(1, clampedEnd - clampedStart);
+                    const total = bars.length;
+                    const jumpToClientX = (clientX: number) => {
+                      const frac = Math.max(0, Math.min(1, (clientX - rect.left) / Math.max(1, rect.width)));
+                      const centerIdx = Math.round(frac * total);
+                      const nextStart = Math.max(0, Math.min(total - span, centerIdx - Math.floor(span / 2)));
+                      setViewRange({ start: nextStart, end: nextStart + span });
+                    };
+                    jumpToClientX(e.clientX);
+                    const onMove = (ev: PointerEvent) => jumpToClientX(ev.clientX);
+                    const onUp = () => {
+                      window.removeEventListener('pointermove', onMove);
+                      window.removeEventListener('pointerup', onUp);
+                    };
+                    window.addEventListener('pointermove', onMove);
+                    window.addEventListener('pointerup', onUp);
+                  }}
+                  className="relative h-4 w-full cursor-pointer select-none rounded bg-slate-900/90 ring-1 ring-inset ring-slate-800"
+                >
+                  <div
+                    className="absolute top-0.5 bottom-0.5 rounded bg-sky-500/35 ring-1 ring-sky-400/70 transition-[left,width] duration-75"
+                    style={{
+                      left: `${(clampedStart / Math.max(1, bars.length)) * 100}%`,
+                      width: `${Math.max(4, ((clampedEnd - clampedStart) / Math.max(1, bars.length)) * 100)}%`,
+                    }}
+                  />
+                </div>
+              </div>
+            )}
+
             {/* Compact interactive status footer */}
             <div className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-800/80 bg-[#0b1120] px-3 py-1.5 font-mono text-[10px] text-slate-500">
               <span>
@@ -969,7 +1022,7 @@ export function CandlestickChartPanel({
                 )}
               </span>
               <span className="font-sans">
-                Scroll to zoom · Drag to pan · Double-click to reset
+                Scroll to zoom · Drag chart or timeline bar to pan · Double-click to reset
               </span>
             </div>
           </>
