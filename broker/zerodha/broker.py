@@ -20,15 +20,19 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from broker.base import (
     AccountBalance,
+    AmbiguousSubmissionError,
     BrokerBase,
     BrokerCapabilities,
     BrokerError,
     BrokerHealthSnapshot,
+    BrokerHttpError,
     BrokerOrder,
     BrokerPosition,
     ConnectionState,
     OrderRequest,
     OrderStatus,
+    TokenBucketRateLimiter,
+    make_broker_tag,
 )
 from broker.zerodha.auth import current_zerodha_session_bounds, zerodha_auth_manager
 from broker.zerodha.feed import KiteTickerAdapter
@@ -92,6 +96,7 @@ class ZerodhaBroker(BrokerBase):
         self._orders: List[BrokerOrder] = []
         self._positions: Dict[str, BrokerPosition] = {}
         self._last_read_err_ts: Dict[str, float] = {}
+        self._rate_limiter = TokenBucketRateLimiter(rate_per_sec=8.0, capacity=12.0)
 
     def _probe_profile(self, token: str, timeout: float = 3.5) -> tuple[bool, int, Dict[str, Any], str]:
         """Verify Kite token against /user/profile with strict timeout."""
@@ -297,6 +302,7 @@ class ZerodhaBroker(BrokerBase):
 
         token = self.access_token or zerodha_auth_manager.get_valid_token()
         api_key = zerodha_auth_manager.api_key
+        method_u = method.upper()
         headers = {
             "X-Kite-Version": "3",
             "Authorization": f"token {api_key}:{token}",
@@ -309,33 +315,79 @@ class ZerodhaBroker(BrokerBase):
             else None
         )
         urlopen_mocked = getattr(urllib.request.urlopen, "__module__", "") != "urllib.request"
-        if requests is not None and not urlopen_mocked:
-            resp = requests.request(
-                method=method.upper(),
-                url=url,
-                headers=headers,
-                data=clean_form,
-                timeout=timeout,
-            )
-            if resp.status_code >= 400:
-                detail = f"HTTP {resp.status_code}"
+        max_attempts = 3 if method_u == "GET" else 1
+
+        for attempt in range(max_attempts):
+            self._rate_limiter.acquire(timeout=3.0)
+            if requests is not None and not urlopen_mocked:
+                resp = requests.request(
+                    method=method_u,
+                    url=url,
+                    headers=headers,
+                    data=clean_form,
+                    timeout=timeout,
+                )
+                if resp.status_code >= 400:
+                    detail = f"HTTP {resp.status_code}"
+                    try:
+                        err_body = resp.json()
+                        if err_body.get("message"):
+                            detail = f"HTTP {resp.status_code}: {err_body['message']}"
+                    except Exception:
+                        pass
+                    if method_u == "GET" and resp.status_code in {429, 500, 502, 503, 504} and attempt < max_attempts - 1:
+                        time.sleep(0.15 * (2 ** attempt))
+                        continue
+                    raise BrokerHttpError(resp.status_code, detail)
+                return resp.json() if resp.content else {}
+
+            req_headers = dict(headers)
+            data_bytes = None
+            if clean_form is not None:
+                data_bytes = urllib.parse.urlencode(clean_form).encode("utf-8")
+                req_headers["Content-Type"] = "application/x-www-form-urlencoded"
+            req = urllib.request.Request(url, data=data_bytes, headers=req_headers, method=method_u)
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    raw = resp.read().decode("utf-8")
+                    return json.loads(raw) if raw.strip() else {}
+            except urllib.error.HTTPError as exc:
+                if method_u == "GET" and exc.code in {429, 500, 502, 503, 504} and attempt < max_attempts - 1:
+                    time.sleep(0.05 * (2 ** attempt))
+                    continue
+                detail = f"HTTP {exc.code}: {exc.reason}"
                 try:
-                    err_body = resp.json()
-                    if err_body.get("message"):
-                        detail = f"HTTP {resp.status_code}: {err_body['message']}"
+                    raw_err = exc.read().decode("utf-8", errors="ignore")
+                    if raw_err.strip():
+                        err_body = json.loads(raw_err)
+                        if err_body.get("message"):
+                            detail = f"HTTP {exc.code}: {err_body['message']}"
                 except Exception:
                     pass
-                raise RuntimeError(detail)
-            return resp.json() if resp.content else {}
+                raise BrokerHttpError(exc.code, detail) from exc
+        return {}
 
-        data_bytes = None
-        if clean_form is not None:
-            data_bytes = urllib.parse.urlencode(clean_form).encode("utf-8")
-            headers["Content-Type"] = "application/x-www-form-urlencoded"
-        req = urllib.request.Request(url, data=data_bytes, headers=headers, method=method)
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8")
-            return json.loads(raw) if raw.strip() else {}
+    @staticmethod
+    def _is_ambiguous_exception(exc: Exception) -> bool:
+        if isinstance(exc, AmbiguousSubmissionError):
+            return True
+        if isinstance(exc, BrokerHttpError):
+            return exc.status_code >= 500 or exc.status_code == 429
+        if isinstance(exc, (TimeoutError, ConnectionError, OSError, urllib.error.URLError)):
+            return not isinstance(exc, urllib.error.HTTPError)
+        if requests is not None and isinstance(
+            exc,
+            (
+                requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.ChunkedEncodingError,
+            ),
+        ):
+            return True
+        code_attr = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+        if isinstance(code_attr, int) and (code_attr >= 500 or code_attr == 429):
+            return True
+        return False
 
     def place_order(self, order: OrderRequest) -> Optional[BrokerOrder]:
         try:
@@ -359,9 +411,12 @@ class ZerodhaBroker(BrokerBase):
 
         # Canonical direction mapping: BUY/COVER -> BUY, SELL/SHORT -> SELL
         txn_type = "BUY" if order.side in {"BUY", "COVER"} else "SELL"
-        kite_tag = (order.tag or order.client_order_id or "")[:20] or None
+        kite_tag = make_broker_tag(order.client_order_id, max_len=20) or (order.tag or "")[:20] or None
+        if kite_tag:
+            order.tag = kite_tag
 
         if self._kite is not None:
+            self._rate_limiter.acquire(timeout=3.0)
             try:
                 oid = str(
                     self._kite.place_order(
@@ -392,6 +447,10 @@ class ZerodhaBroker(BrokerBase):
                 self._orders.append(placed)
                 return placed
             except Exception as exc:
+                if self._is_ambiguous_exception(exc):
+                    raise AmbiguousSubmissionError(
+                        f"Zerodha order submission uncertain for {order.client_order_id}: {exc}"
+                    ) from exc
                 return BrokerOrder(
                     order_id=order.client_order_id,
                     request=order,
@@ -424,11 +483,15 @@ class ZerodhaBroker(BrokerBase):
                 order_id=oid,
                 request=order,
                 status=OrderStatus.SUBMITTED,
-                raw={"response": raw_resp, "payload": form_payload},
+                raw={"response": raw_resp, "payload": form_payload, "tag": kite_tag},
             )
             self._orders.append(placed)
             return placed
         except Exception as exc:
+            if self._is_ambiguous_exception(exc):
+                raise AmbiguousSubmissionError(
+                    f"Zerodha order submission uncertain for {order.client_order_id}: {exc}"
+                ) from exc
             return BrokerOrder(
                 order_id=order.client_order_id,
                 request=order,

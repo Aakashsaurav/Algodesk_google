@@ -16,6 +16,9 @@ from abc import ABC, abstractmethod
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+import hashlib
+import threading
+import time
 from typing import Any, Dict, List, Optional, Sequence
 
 from config import IST_TZ
@@ -31,6 +34,66 @@ def _ist_iso_now() -> str:
 
 class BrokerError(RuntimeError):
     """Raised when a broker operation cannot be completed safely."""
+
+
+class BrokerHttpError(BrokerError):
+    """Typed HTTP error carrying the status code so adapters can distinguish 4xx vs 5xx/429."""
+
+    def __init__(self, status_code: int, message: str) -> None:
+        super().__init__(message)
+        self.status_code = int(status_code)
+
+
+class AmbiguousSubmissionError(BrokerError):
+    """
+    Raised when an order submission fails with a network timeout, connection drop,
+    or HTTP 5xx/429 where the broker MAY have accepted the order.
+    Callers MUST NOT treat this as REJECTED and MUST NOT blindly re-submit;
+    instead persist as SUBMITTED (uncertain) and reconcile via `find_order_by_tag`.
+    """
+
+
+def make_broker_tag(client_order_id: str, max_len: int = 20) -> str:
+    """
+    Encode a deterministic, unique per-order broker tag fitting strictly within
+    Zerodha Kite's 20-character alphanumeric/hyphen tag limit (and Upstox's 40-char limit).
+    """
+    clean = (client_order_id or "").strip()
+    if not clean:
+        return ""
+    if len(clean) <= max_len and all(ch.isalnum() or ch in "-_" for ch in clean):
+        return clean
+    digest = hashlib.sha1(clean.encode("utf-8")).hexdigest()[: max(4, max_len - 4)]
+    return f"adk-{digest}"[:max_len]
+
+
+class TokenBucketRateLimiter:
+    """Thread-safe token bucket rate limiter for broker REST API throttling."""
+
+    def __init__(self, rate_per_sec: float = 8.0, capacity: float = 12.0) -> None:
+        self._rate = max(0.5, float(rate_per_sec))
+        self._capacity = max(1.0, float(capacity))
+        self._tokens = self._capacity
+        self._last = time.monotonic()
+        self._lock = threading.Lock()
+
+    def acquire(self, tokens: float = 1.0, timeout: float = 5.0) -> bool:
+        need = max(0.1, float(tokens))
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            with self._lock:
+                now = time.monotonic()
+                elapsed = max(0.0, now - self._last)
+                self._tokens = min(self._capacity, self._tokens + elapsed * self._rate)
+                self._last = now
+                if self._tokens >= need:
+                    self._tokens -= need
+                    return True
+                wait_sec = (need - self._tokens) / self._rate
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(wait_sec, remaining, 0.25))
 
 
 class ConnectionState(str, Enum):
@@ -506,6 +569,23 @@ class BrokerBase(ABC):
             return None
         for o in self.get_orders():
             if str(o.order_id) == oid:
+                return o
+        return None
+
+    def find_order_by_tag(self, tag: str) -> Optional[BrokerOrder]:
+        """
+        Look up an order in the broker order book by its unique per-order tag or
+        client_order_id (used to recover after an AmbiguousSubmissionError).
+        """
+        needle = str(tag or "").strip()
+        if not needle:
+            return None
+        for o in self.get_orders():
+            req = getattr(o, "request", None)
+            o_tag = str(getattr(req, "tag", "") or "").strip()
+            o_cid = str(getattr(req, "client_order_id", "") or "").strip()
+            raw_tag = str((getattr(o, "raw", None) or {}).get("tag") or "").strip()
+            if needle in {o_tag, o_cid, raw_tag}:
                 return o
         return None
 

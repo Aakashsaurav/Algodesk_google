@@ -25,6 +25,7 @@ export function AdminAuthModal({
 }: AdminAuthModalProps) {
   const [passcode, setPasscode] = useState('');
   const [confirmPasscode, setConfirmPasscode] = useState('');
+  const [bootstrapCode, setBootstrapCode] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
@@ -32,6 +33,7 @@ export function AdminAuthModal({
   if (!open) return null;
 
   const needsClaim = Boolean(securityStatus?.needs_claim);
+  const bootstrapRequired = Boolean(needsClaim && securityStatus?.bootstrap_required);
   const unlocked = hasSessionToken();
   const liveEnabled = Boolean(securityStatus?.live_trading_enabled);
 
@@ -41,6 +43,10 @@ export function AdminAuthModal({
     setSuccess('');
 
     if (needsClaim) {
+      if (bootstrapRequired && !bootstrapCode.trim()) {
+        setError('Enter the one-time server bootstrap code from startup logs or data/.bootstrap_code.');
+        return;
+      }
       if (passcode.trim().length < 6) {
         setError('Passcode must be at least 6 characters.');
         return;
@@ -51,13 +57,14 @@ export function AdminAuthModal({
       }
       setBusy(true);
       try {
-        const res = await claimAdminPasscode(passcode);
+        const res = await claimAdminPasscode(passcode, bootstrapCode);
         if (!res.ok) {
           setError(res.detail || 'Could not claim admin passcode.');
           return;
         }
         setPasscode('');
         setConfirmPasscode('');
+        setBootstrapCode('');
         setSuccess('Admin passcode saved on server and session unlocked.');
         onAuthenticated(res.status || null);
         window.setTimeout(() => {
@@ -171,6 +178,21 @@ export function AdminAuthModal({
             </p>
           )}
 
+          {bootstrapRequired && (
+            <div>
+              <label className="mb-1.5 block font-semibold text-slate-300">
+                Server Bootstrap Code
+              </label>
+              <input
+                type="text"
+                value={bootstrapCode}
+                onChange={(e) => setBootstrapCode(e.target.value)}
+                placeholder="From server console or data/.bootstrap_code"
+                className="min-h-[38px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 font-mono text-xs text-slate-100 focus:border-sky-400 focus:outline-none"
+              />
+            </div>
+          )}
+
           <div>
             <label className="mb-1.5 block font-semibold text-slate-300">
               {needsClaim ? 'New Operator Passcode' : securityStatus?.has_env_token ? 'API Token or Passcode' : 'Operator Passcode'}
@@ -179,7 +201,7 @@ export function AdminAuthModal({
               type="password"
               value={passcode}
               onChange={(e) => setPasscode(e.target.value)}
-              autoFocus
+              autoFocus={!bootstrapRequired}
               placeholder={needsClaim ? 'At least 6 characters' : 'Enter passcode or token'}
               className="min-h-[38px] w-full rounded-lg border border-slate-700 bg-[#0b1120] px-3 font-mono text-xs text-slate-100 focus:border-sky-400 focus:outline-none"
             />

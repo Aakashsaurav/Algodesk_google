@@ -29,18 +29,19 @@ Latency & Safety Architecture:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import queue
 import sqlite3
 import threading
 import uuid
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 from backtest.registry import StrategyRegistry, strategy_registry
-from broker.base import BrokerBase, OrderRequest, OrderStatus
+from broker.base import BrokerBase, OrderRequest, OrderStatus, make_broker_tag
 from broker.registry import BrokerRegistry, SelectionStore
 from charges.calculator import ChargeBreakdown, ChargesConfig, charges_engine
 from config import IST_TZ, config, is_live_trading_enabled
@@ -51,7 +52,8 @@ from core.instruments import InstrumentIndex, instrument_index
 from core.preflight import KillSwitchController, kill_switch_controller
 from execution.oms import OrderManagementSystem, PaperExecutionAdapter, oms_manager
 from indicators.toolkit import IndicatorToolkit
-from risk.limits import RiskLimitManager, risk_limit_manager
+from notifications.telegram import TelegramNotifier, telegram_notifier
+from risk.limits import RiskLimitManager, RiskWatchdog, risk_limit_manager, risk_watchdog
 from rules.engine import compile_visual_strategy, visual_rule_store
 from screener.engine import compute_auto_lookback_days
 from screener.live_engine import merge_live_tick_into_candles
@@ -61,6 +63,62 @@ logger = logging.getLogger(__name__)
 
 def _now_ist() -> str:
     return datetime.now(tz=IST_TZ).isoformat(timespec="seconds")
+
+
+def _deterministic_client_order_id(
+    deployment_id: str,
+    symbol: str,
+    side: str,
+    purpose: str,
+    intent_key: str,
+) -> str:
+    """
+    Build a deterministic, unique 20-char client_order_id per trading intent so
+    repeated ticks or retries collapse cleanly in OMS & fit Zerodha's 20-char tag.
+    """
+    raw = f"{deployment_id}:{symbol.upper()}:{side.upper()}:{purpose.upper()}:{intent_key}"
+    digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+    return f"adk-{digest}"
+
+
+def _quote_age_seconds(quote: Dict[str, Any], now_ist: Optional[datetime] = None) -> Optional[float]:
+    """
+    Return age in seconds of a live quote if it carries a timestamp field, or None
+    when no timestamp metadata is present.
+    """
+    now = now_ist or datetime.now(tz=IST_TZ)
+    for key in ("ts_ist", "timestamp", "quote_ts", "updated_at_ist"):
+        raw = quote.get(key)
+        if not raw:
+            continue
+        if isinstance(raw, (int, float)):
+            val = float(raw)
+            if val > 1e12:
+                val /= 1000.0
+            dt = datetime.fromtimestamp(val, tz=timezone.utc).astimezone(IST_TZ)
+            return max(0.0, (now - dt).total_seconds())
+        text = str(raw).strip()
+        if not text:
+            continue
+        try:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=IST_TZ)
+            return max(0.0, (now - dt.astimezone(IST_TZ)).total_seconds())
+        except Exception:
+            continue
+    for key in ("epoch_ms", "ltt_ms"):
+        raw_ms = quote.get(key)
+        if raw_ms is not None:
+            try:
+                val = float(raw_ms)
+                if val > 1e12:
+                    val /= 1000.0
+                dt = datetime.fromtimestamp(val, tz=timezone.utc).astimezone(IST_TZ)
+                return max(0.0, (now - dt).total_seconds())
+            except Exception:
+                continue
+    return None
 
 
 class DeploymentManager:
@@ -80,6 +138,8 @@ class DeploymentManager:
         selection_store: Optional[SelectionStore] = None,
         oms: Optional[OrderManagementSystem] = None,
         broker_resolver: Optional[Callable[[str], BrokerBase]] = None,
+        watchdog: Optional[RiskWatchdog] = None,
+        notifier: Optional[TelegramNotifier] = None,
         require_live_env_lock: bool = True,
     ) -> None:
         self._db_path = db_path or (config.DATA_DIR / "deployments.db")
@@ -97,6 +157,8 @@ class DeploymentManager:
             else oms_manager
         )
         self._broker_resolver = broker_resolver or BrokerRegistry.get
+        self._watchdog = watchdog or risk_watchdog
+        self._notifier = notifier or telegram_notifier
         self._require_live_env_lock = require_live_env_lock
         self._paper_adapter = PaperExecutionAdapter()
 
@@ -228,6 +290,9 @@ class DeploymentManager:
                     "sym_state": {},
                     "instrument_keys": {},
                     "last_note": "Restored from disk (paused on startup for safety)." if status == "PAUSED" else "",
+                    "error_count": 0,
+                    "last_error": "",
+                    "stale_alerted_syms": set(),
                     "created_at_ist": str(r["created_at_ist"]),
                     "updated_at_ist": str(r["updated_at_ist"]),
                     "stop_event": threading.Event(),
@@ -502,6 +567,7 @@ class DeploymentManager:
         side: str = "BUY",
         provider: Optional[str] = None,
         poll_interval_sec: float = 2.0,
+        max_quote_age_sec: float = 30.0,
         backtest_run_id: Optional[str] = None,
         start_worker: bool = True,
         hist_fetcher: Optional[Callable[..., List[Dict[str, Any]]]] = None,
@@ -556,6 +622,7 @@ class DeploymentManager:
             "side": (side or "BUY").strip().upper(),
             "provider": (provider or self._selections.load().get("data_connection") or config.ACTIVE_DATA_CONNECTION or "yfinance").strip().lower(),
             "poll_interval_sec": max(1.0, min(30.0, float(poll_interval_sec or 2.0))),
+            "max_quote_age_sec": max(1.0, float(max_quote_age_sec or 30.0)),
         }
 
         strat_inst, strat_mode = self._build_strategy(spec)
@@ -589,6 +656,9 @@ class DeploymentManager:
             "sym_state": {},
             "instrument_keys": pre_keys,
             "last_note": f"Deployed ({len(spec['symbols'])} symbols). Warming up historical indicators...",
+            "error_count": 0,
+            "last_error": "",
+            "stale_alerted_syms": set(),
             "created_at_ist": now,
             "updated_at_ist": now,
             "stop_event": threading.Event(),
@@ -666,6 +736,7 @@ class DeploymentManager:
         from_date = (today_ist - timedelta(days=lookback_days)).isoformat()
 
         warmed = 0
+        warmup_errors: List[str] = []
         for sym in syms:
             if stop_ev.is_set():
                 return
@@ -697,14 +768,45 @@ class DeploymentManager:
                             "last_sig_key": "",
                         }
                     warmed += 1
+                else:
+                    warmup_errors.append(f"{sym}: empty historical series")
             except Exception as exc:
-                logger.debug("Deployment %s warmup failed for %s: %s", did, sym, exc)
+                err_txt = f"{sym}: {exc.__class__.__name__}: {exc}"
+                warmup_errors.append(err_txt)
+                logger.error("Deployment %s warmup failed for %s: %s", did, sym, exc)
 
         if stop_ev.is_set():
             return
 
+        if warmed == 0:
+            err_summary = "; ".join(warmup_errors[:3]) or "No historical bars available."
+            with self._lock:
+                rt["status"] = "ERROR"
+                rt["error_count"] = int(rt.get("error_count") or 0) + max(1, len(warmup_errors))
+                rt["last_error"] = f"Warmup failed: {err_summary}"
+                rt["last_note"] = f"Warmup FAILED (0/{len(syms)} symbols): {err_summary}"
+                self._persist_deployment_locked(rt)
+            self._audit.log(
+                event_type="DEPLOYMENT_WARMUP_FAILED",
+                actor="deploy_engine",
+                payload={"deployment_id": did, "symbols": syms, "errors": warmup_errors[:5]},
+            )
+            try:
+                self._notifier.notify_event(
+                    "DEPLOYMENT_ERROR",
+                    f"Deployment {rt['name']} Warmup FAILED — Refused to Start",
+                    [f"Symbols: {', '.join(syms[:5])}", f"Error: {err_summary}"],
+                )
+            except Exception:
+                pass
+            self._broadcast("deployments:update")
+            return
+
         with self._lock:
             rt["status"] = "RUNNING"
+            if warmup_errors:
+                rt["error_count"] = int(rt.get("error_count") or 0) + len(warmup_errors)
+                rt["last_error"] = warmup_errors[-1]
             rt["last_note"] = f"Live ({warmed}/{len(syms)} symbols warmed). Streaming via {provider.upper()}."
             self._persist_deployment_locked(rt)
         self._refresh_deploy_ws_scope()
@@ -730,7 +832,10 @@ class DeploymentManager:
                 if quotes:
                     self.process_ticks(did, quotes)
             except Exception as exc:
-                logger.debug("Deployment %s tick loop error: %s", did, exc)
+                logger.error("Deployment %s tick loop error: %s", did, exc)
+                with self._lock:
+                    rt["error_count"] = int(rt.get("error_count") or 0) + 1
+                    rt["last_error"] = f"Tick loop error: {exc.__class__.__name__}: {exc}"
             stop_ev.wait(interval)
 
     # ── Signal & Execution Evaluation ────────────────────────────────────
@@ -775,8 +880,10 @@ class DeploymentManager:
             tp_pct = float(spec.get("take_profit_pct") or 0.0)
             tsl_pct = float(spec.get("trailing_sl_pct") or 0.0)
             max_slots = max(1, int(spec.get("max_open_positions") or 5))
+            max_quote_age_sec = max(1.0, float(spec.get("max_quote_age_sec", 30.0)))
 
         strat_inst, _ = self._build_strategy(spec)
+        now_ist = datetime.now(tz=IST_TZ)
 
         for sym, q in quotes.items():
             sym_u = str(q.get("symbol") or sym).strip().upper()
@@ -784,6 +891,8 @@ class DeploymentManager:
             if raw_ltp is None or float(raw_ltp) <= 0:
                 continue
             ltp = float(raw_ltp)
+            quote_age = _quote_age_seconds(q, now_ist=now_ist)
+            is_stale_quote = quote_age is not None and quote_age > max_quote_age_sec
 
             with self._lock:
                 st = rt["sym_state"].get(sym_u)
@@ -805,6 +914,7 @@ class DeploymentManager:
             enter_sig = False
             exit_sig = False
             eval_bar_ts = ""
+            eval_error: Optional[str] = None
 
             if eval_mode == "completed_bar":
                 # Evaluate strategy ONLY when a new completed candle closes (matches backtest semantics
@@ -818,7 +928,9 @@ class DeploymentManager:
                             enter_sig, exit_sig = strat_inst.signal_at(len(new_base) - 1, new_base[-1])
                             eval_bar_ts = latest_closed_ts
                             st["indicator_eval_count"] = int(st.get("indicator_eval_count") or 0) + 1
-                        except Exception:
+                        except Exception as exc:
+                            eval_error = f"{sym_u}: {exc.__class__.__name__}: {exc}"
+                            logger.error("Deployment %s strategy eval error (%s): %s", deployment_id, sym_u, exc)
                             enter_sig, exit_sig = False, False
             else:
                 if len(combined) >= 5:
@@ -828,16 +940,42 @@ class DeploymentManager:
                         enter_sig, exit_sig = strat_inst.signal_at(len(combined) - 1, combined[-1])
                         eval_bar_ts = str(combined[-1].get("ts_ist") or "")
                         st["indicator_eval_count"] = int(st.get("indicator_eval_count") or 0) + 1
-                    except Exception:
+                    except Exception as exc:
+                        eval_error = f"{sym_u}: {exc.__class__.__name__}: {exc}"
+                        logger.error("Deployment %s strategy eval error (%s): %s", deployment_id, sym_u, exc)
                         enter_sig, exit_sig = False, False
 
+            stale_alert_msg: Optional[str] = None
+            eval_alert_msg: Optional[str] = None
+
             with self._lock:
+                dirty = False
                 st["base_bars"] = new_base
                 st["forming_bar"] = new_forming
                 st["last_ltp"] = ltp
                 if eval_bar_ts:
                     st["last_eval_bar_ts"] = eval_bar_ts
                 bar_key = eval_bar_ts or (str(combined[-1].get("ts_ist") or _now_ist()) if combined else _now_ist())
+
+                if eval_error:
+                    prev_err_count = int(rt.get("error_count") or 0)
+                    rt["error_count"] = prev_err_count + 1
+                    rt["last_error"] = eval_error
+                    rt["last_note"] = f"Strategy evaluation error ({eval_error})."
+                    dirty = True
+                    if prev_err_count == 0 or prev_err_count % 10 == 0:
+                        eval_alert_msg = eval_error
+
+                stale_set: Set[str] = rt.setdefault("stale_alerted_syms", set())
+                if is_stale_quote:
+                    if sym_u not in stale_set:
+                        stale_set.add(sym_u)
+                        stale_alert_msg = f"Quote for {sym_u} is stale ({int(quote_age or 0)}s > {int(max_quote_age_sec)}s); blocking new entries."
+                        logger.warning("Deployment %s: %s", deployment_id, stale_alert_msg)
+                        rt["last_note"] = stale_alert_msg
+                        dirty = True
+                elif sym_u in stale_set:
+                    stale_set.discard(sym_u)
 
                 pos = rt["positions"].get(sym_u)
                 if pos is not None:
@@ -874,28 +1012,96 @@ class DeploymentManager:
 
                     if exit_reason and abs_qty > 0:
                         exit_side = "COVER" if is_short_pos else "SELL"
-                        ev = self._handle_signal_locked(rt, sym_u, exit_side, abs_qty, ltp, exit_reason)
-                        if ev:
-                            actions_taken.append(ev)
-                elif enter_sig and len(rt["positions"]) < max_slots:
-                    entry_side = "SHORT" if is_short_strat else "BUY"
-                    sig_marker = f"{entry_side}:{bar_key}"
-                    if st.get("last_sig_key") != sig_marker:
-                        qty = self._compute_order_qty(rt, ltp)
-                        if qty >= 1:
-                            st["last_sig_key"] = sig_marker
-                            ev = self._handle_signal_locked(rt, sym_u, entry_side, qty, ltp, "STRATEGY_ENTRY")
+                        # C-01 GUARD: Never submit duplicate exit while an OMS order is already working!
+                        if self._oms.has_active_order(rt["id"], sym_u):
+                            rt["last_note"] = f"Working order already active for {sym_u}; suppressing duplicate {exit_side}."
+                        else:
+                            exit_purpose = exit_reason.split()[0]
+                            intent_key = str(pos.get("entry_at_ist") or bar_key)
+                            exit_coid = _deterministic_client_order_id(
+                                rt["id"], sym_u, exit_side, exit_purpose, intent_key
+                            )
+                            ev = self._handle_signal_locked(
+                                rt,
+                                sym_u,
+                                exit_side,
+                                abs_qty,
+                                ltp,
+                                exit_reason,
+                                client_order_id=exit_coid,
+                            )
                             if ev:
                                 actions_taken.append(ev)
+                                dirty = True
+                elif enter_sig and len(rt["positions"]) < max_slots:
+                    if is_stale_quote:
+                        actions_taken.append(
+                            {
+                                "kind": "blocked",
+                                "symbol": sym_u,
+                                "side": "SHORT" if is_short_strat else "BUY",
+                                "reasons": [
+                                    f"Stale quote ({int(quote_age or 0)}s > {int(max_quote_age_sec)}s); new entries blocked."
+                                ],
+                            }
+                        )
+                    elif self._oms.has_active_order(rt["id"], sym_u):
+                        rt["last_note"] = f"Working order already active for {sym_u}; suppressing duplicate entry."
+                    else:
+                        entry_side = "SHORT" if is_short_strat else "BUY"
+                        sig_marker = f"{entry_side}:{bar_key}"
+                        if st.get("last_sig_key") != sig_marker:
+                            qty = self._compute_order_qty(rt, ltp)
+                            if qty >= 1:
+                                st["last_sig_key"] = sig_marker
+                                entry_coid = _deterministic_client_order_id(
+                                    rt["id"], sym_u, entry_side, "ENTRY", bar_key
+                                )
+                                ev = self._handle_signal_locked(
+                                    rt,
+                                    sym_u,
+                                    entry_side,
+                                    qty,
+                                    ltp,
+                                    "STRATEGY_ENTRY",
+                                    client_order_id=entry_coid,
+                                )
+                                if ev:
+                                    actions_taken.append(ev)
+                                    dirty = True
 
                 # Recompute live MTM unrealized P&L (supports both signed long >0 and short <0)
+                prev_unreal = float(rt.get("unrealized_pnl") or 0.0)
                 unreal = 0.0
                 for p in rt["positions"].values():
                     unreal += (float(p["last_price"]) - float(p["entry_price"])) * int(p["qty"])
                 rt["unrealized_pnl"] = round(unreal, 2)
-                self._persist_deployment_locked(rt)
+                if abs(rt["unrealized_pnl"] - prev_unreal) >= 0.01:
+                    dirty = True
+                if dirty:
+                    self._persist_deployment_locked(rt)
 
-        self._broadcast("deployments:tick", {"actions": actions_taken})
+            if stale_alert_msg and rt["exec_mode"] != "paper":
+                try:
+                    self._notifier.notify_event(
+                        "STALE_QUOTE",
+                        f"Stale Market Data on {rt['name']} ({sym_u})",
+                        [stale_alert_msg],
+                    )
+                except Exception:
+                    pass
+            if eval_alert_msg:
+                try:
+                    self._notifier.notify_event(
+                        "STRATEGY_ERROR",
+                        f"Strategy Error in {rt['name']}",
+                        [eval_alert_msg],
+                    )
+                except Exception:
+                    pass
+
+        if actions_taken:
+            self._broadcast("deployments:tick", {"actions": actions_taken})
         return {"ok": True, "actions": actions_taken}
 
     def trigger_manual_signal(
@@ -1004,17 +1210,31 @@ class DeploymentManager:
             )
             return {"kind": "alert", "alert": alert}
 
-        # mode == "live_auto": Strictly gated by Kill Switch + RiskLimitManager + Live Master Lock
-        open_count = len(rt["positions"])
-        gross_exp = sum(abs(int(p["qty"])) * float(p["last_price"]) for p in rt["positions"].values())
-        check = self._risk.validate_order(
-            symbol=symbol,
-            quantity=qty,
-            price=price,
-            transaction_type=side,
-            current_open_positions=open_count,
-            current_gross_exposure_inr=gross_exp,
-        )
+        # mode == "live_auto": Strictly split check_exit (always allowed) vs check_entry (account-wide)
+        side_u = side.strip().upper()
+        if side_u in {"SELL", "COVER"}:
+            pos_obj = rt["positions"].get(symbol)
+            open_abs = abs(int(pos_obj["qty"])) if pos_obj is not None else None
+            check = self._risk.check_exit(
+                symbol=symbol,
+                quantity=qty,
+                price=price,
+                transaction_type=side_u,
+                open_position_qty=open_abs,
+            )
+        else:
+            acct_open, acct_gross, pending_exp, daily_loss, wd_degraded = self._account_risk_context_locked(rt)
+            check = self._risk.check_entry(
+                symbol=symbol,
+                quantity=qty,
+                price=price,
+                transaction_type=side_u,
+                current_open_positions=acct_open,
+                current_gross_exposure_inr=acct_gross,
+                pending_exposure_inr=pending_exp,
+                daily_loss_inr=daily_loss,
+                watchdog_degraded=wd_degraded,
+            )
         if not check["allowed"]:
             block_reason = "; ".join(check["reasons"])
             rt["last_note"] = f"Auto-order BLOCKED by safety gate ({block_reason})."
@@ -1023,6 +1243,29 @@ class DeploymentManager:
         return self._dispatch_live_broker_order_locked(
             rt, symbol, side, qty, price, reason, cfg, client_order_id=client_order_id
         )
+
+    def _account_risk_context_locked(self, rt: Dict[str, Any]) -> Tuple[int, float, float, float, bool]:
+        """
+        Compute account-wide live exposure, open positions, pending OMS exposure,
+        daily loss across non-paper deployments, and RiskWatchdog degraded status.
+        """
+        open_positions = 0
+        gross_exposure = 0.0
+        total_pnl = 0.0
+        for dep in self._runtime.values():
+            if dep["exec_mode"] == "paper":
+                continue
+            for p in dep["positions"].values():
+                q_abs = abs(int(p.get("qty") or 0))
+                if q_abs > 0:
+                    open_positions += 1
+                    gross_exposure += q_abs * float(p.get("last_price") or p.get("entry_price") or 0.0)
+            total_pnl += float(dep.get("realized_pnl") or 0.0) + float(dep.get("unrealized_pnl") or 0.0)
+
+        pending_exposure = self._oms.get_pending_exposure_inr(exclude_paper=True)
+        daily_loss = max(0.0, -total_pnl)
+        wd_degraded = bool(self._watchdog.is_degraded) if self._watchdog is not None else False
+        return open_positions, gross_exposure, pending_exposure, daily_loss, wd_degraded
 
     def _apply_verified_fill_locked(
         self,
@@ -1203,6 +1446,8 @@ class DeploymentManager:
 
         trading_broker = str(self._selections.load().get("trading_broker") or "upstox").strip().lower()
         adapter = self._broker_resolver(trading_broker)
+        eff_coid = (client_order_id or "").strip() or f"adk-{uuid.uuid4().hex[:14]}"
+        broker_tag = make_broker_tag(eff_coid, max_len=20)
         req = OrderRequest(
             symbol=symbol,
             side=side,
@@ -1211,8 +1456,8 @@ class DeploymentManager:
             instrument_key=rt["instrument_keys"].get(symbol, ""),
             order_type="MARKET",
             product=str(rt["spec"].get("product") or "MIS"),
-            client_order_id=client_order_id,
-            tag=f"adk:{rt['id'][:8]}",
+            client_order_id=eff_coid,
+            tag=broker_tag,
             algo_tag=f"ALGODESK-{rt['strategy_id'][:12].upper()}",
             metadata={"exchange": rt["exchange"], "deployment_id": rt["id"], "reason": reason},
         )
@@ -1327,6 +1572,160 @@ class DeploymentManager:
             self._broadcast("deployments:update")
         return result
 
+    def reconcile_positions(
+        self,
+        *,
+        deployment_id: Optional[str] = None,
+        broker_adapter: Optional[BrokerBase] = None,
+        notifier: Optional[Any] = None,
+    ) -> Dict[str, Any]:
+        """
+        Compare expected live deployment positions against authoritative broker
+        `get_positions()`. On any mismatch, immediately PAUSE affected live
+        deployments, record a SEBI audit entry, and notify Telegram.
+        """
+        with self._lock:
+            target_deps = [
+                rt
+                for rt in self._runtime.values()
+                if rt["exec_mode"] != "paper"
+                and (deployment_id is None or rt["id"] == deployment_id)
+                and (rt["status"] == "RUNNING" or bool(rt["positions"]))
+            ]
+            if not target_deps:
+                return {"ok": True, "checked_deployments": 0, "mismatches": [], "halted_deployments": []}
+
+            expected_by_sym: Dict[str, int] = {}
+            deps_by_sym: Dict[str, List[str]] = {}
+            for rt in target_deps:
+                for sym, pos in rt["positions"].items():
+                    sym_u = sym.strip().upper()
+                    q_signed = int(pos.get("qty") or 0)
+                    expected_by_sym[sym_u] = expected_by_sym.get(sym_u, 0) + q_signed
+                    deps_by_sym.setdefault(sym_u, []).append(rt["id"])
+                for sym in rt["spec"].get("symbols") or []:
+                    sym_u = str(sym).strip().upper()
+                    deps_by_sym.setdefault(sym_u, []).append(rt["id"])
+
+        trading_broker = str(self._selections.load().get("trading_broker") or "upstox").strip().lower()
+        adapter = broker_adapter or self._broker_resolver(trading_broker)
+
+        # If broker_adapter wasn't explicitly injected, skip silently when broker is offline
+        if broker_adapter is None:
+            try:
+                if not adapter.health_check(timeout=2.5).is_connected:
+                    return {
+                        "ok": True,
+                        "skipped": True,
+                        "reason": f"{adapter.display_name} disconnected",
+                        "checked_deployments": len(target_deps),
+                        "mismatches": [],
+                        "halted_deployments": [],
+                    }
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "skipped": True,
+                    "reason": str(exc),
+                    "checked_deployments": len(target_deps),
+                    "mismatches": [],
+                    "halted_deployments": [],
+                }
+
+        broker_positions = list(adapter.get_positions() or [])
+        broker_by_sym: Dict[str, int] = {}
+        for bp in broker_positions:
+            sym_u = str(getattr(bp, "symbol", "") or "").strip().upper()
+            if not sym_u:
+                continue
+            signed_q = int(getattr(bp, "signed_quantity", getattr(bp, "quantity", 0)))
+            broker_by_sym[sym_u] = broker_by_sym.get(sym_u, 0) + signed_q
+
+        all_syms = sorted(set(expected_by_sym.keys()) | set(broker_by_sym.keys()))
+        mismatches: List[Dict[str, Any]] = []
+        affected_ids: Set[str] = set()
+        for sym_u in all_syms:
+            local_q = expected_by_sym.get(sym_u, 0)
+            broker_q = broker_by_sym.get(sym_u, 0)
+            if local_q != broker_q:
+                mismatches.append(
+                    {
+                        "symbol": sym_u,
+                        "local_qty": local_q,
+                        "broker_qty": broker_q,
+                        "delta": broker_q - local_q,
+                    }
+                )
+                for did in deps_by_sym.get(sym_u, []):
+                    affected_ids.add(did)
+                if not deps_by_sym.get(sym_u):
+                    for rt in target_deps:
+                        affected_ids.add(rt["id"])
+
+        halted_deployments: List[str] = []
+        if mismatches:
+            summary_lines = [
+                f"{m['symbol']}: local={m['local_qty']} vs broker={m['broker_qty']}"
+                for m in mismatches[:5]
+            ]
+            summary_txt = "; ".join(summary_lines)
+            with self._lock:
+                for did in sorted(affected_ids):
+                    rt = self._runtime.get(did)
+                    if not rt:
+                        continue
+                    rt["stop_event"].set()
+                    rt["status"] = "PAUSED"
+                    rt["last_error"] = f"Broker position mismatch: {summary_txt}"
+                    rt["last_note"] = f"HALTED: Broker position mismatch detected ({summary_txt}). Reconcile manually before resuming."
+                    self._persist_deployment_locked(rt)
+                    halted_deployments.append(did)
+
+            self._audit.log(
+                event_type="POSITION_MISMATCH_HALT",
+                actor="reconciler",
+                payload={
+                    "broker": adapter.name,
+                    "mismatches": mismatches,
+                    "halted_deployments": halted_deployments,
+                },
+            )
+            eff_notifier = notifier or self._notifier
+            try:
+                eff_notifier.notify_event(
+                    "POSITION_MISMATCH",
+                    f"Position Mismatch on {adapter.name.upper()} — Live Deployments Halted",
+                    [
+                        *summary_lines,
+                        f"Halted deployments: {', '.join(halted_deployments)}",
+                    ],
+                )
+            except Exception:
+                pass
+            self._refresh_deploy_ws_scope()
+            self._broadcast("deployments:update")
+
+        return {
+            "ok": True,
+            "broker": adapter.name,
+            "checked_deployments": len(target_deps),
+            "mismatches": mismatches,
+            "halted_deployments": halted_deployments,
+            "reconciled_at_ist": _now_ist(),
+        }
+
+    def reconcile_startup(self, *, broker_adapter: Optional[BrokerBase] = None) -> Dict[str, Any]:
+        """Run startup order + position reconciliation for any persisted live deployments."""
+        has_live = any(rt["exec_mode"] != "paper" for rt in self._runtime.values())
+        active_live_orders = [
+            o for o in self._oms.list_orders(active_only=True, limit=50) if o.get("exec_mode") != "paper"
+        ]
+        if not has_live and not active_live_orders:
+            return {"ok": True, "skipped": True, "reason": "No persisted live deployments or active live orders."}
+        orders_res = self.reconcile_orders(broker_adapter=broker_adapter)
+        pos_res = self.reconcile_positions(broker_adapter=broker_adapter)
+        return {"ok": True, "orders": orders_res, "positions": pos_res}
+
     # ── Operator Controls (Pause / Resume / Square-Off / Stop / Alerts) ──
 
     def control(self, deployment_id: str, action: str) -> Dict[str, Any]:
@@ -1352,9 +1751,20 @@ class DeploymentManager:
                 cfg = self._charges_cfg_for(rt["spec"])
                 for psym in list(rt["positions"].keys()):
                     pos = rt["positions"][psym]
+                    signed_q = int(pos["qty"])
+                    abs_q = abs(signed_q)
+                    if abs_q <= 0:
+                        continue
+                    close_side = "COVER" if signed_q < 0 else "SELL"
                     px = float(pos["last_price"] or pos["entry_price"])
+                    sq_coid = _deterministic_client_order_id(
+                        rt["id"], psym, close_side, "SQUARE_OFF", str(pos.get("entry_at_ist") or _now_ist())
+                    )
                     if rt["exec_mode"] == "live_auto":
-                        self._dispatch_live_broker_order_locked(rt, psym, "SELL", int(pos["qty"]), px, "OPERATOR_SQUARE_OFF", cfg)
+                        if not self._oms.has_active_order(rt["id"], psym):
+                            self._dispatch_live_broker_order_locked(
+                                rt, psym, close_side, abs_q, px, "OPERATOR_SQUARE_OFF", cfg, client_order_id=sq_coid
+                            )
                     elif rt["exec_mode"] == "live_alert":
                         self._create_alert_db(
                             deployment_id=rt["id"],
@@ -1362,14 +1772,14 @@ class DeploymentManager:
                             symbol=psym,
                             exchange=rt["exchange"],
                             instrument_key=rt["instrument_keys"].get(psym, ""),
-                            side="SELL",
-                            qty=int(pos["qty"]),
+                            side=close_side,
+                            qty=abs_q,
                             signal_price=px,
                             reason="OPERATOR_SQUARE_OFF",
                             product=str(rt["spec"].get("product") or "MIS"),
                         )
                     else:
-                        self._execute_paper_fill_locked(rt, psym, "SELL", int(pos["qty"]), px, "OPERATOR_SQUARE_OFF", cfg)
+                        self._execute_paper_fill_locked(rt, psym, close_side, abs_q, px, "OPERATOR_SQUARE_OFF", cfg)
                 rt["unrealized_pnl"] = 0.0
                 rt["last_note"] = "Square-off processed."
                 self._persist_deployment_locked(rt)
@@ -1425,16 +1835,31 @@ class DeploymentManager:
             rt = self._runtime.get(did)
             if not rt:
                 raise ValueError(f"Parent deployment '{did}' not found.")
-            open_count = len(rt["positions"])
-            gross_exp = sum(p["qty"] * p["last_price"] for p in rt["positions"].values())
-            check = self._risk.validate_order(
-                symbol=str(alert["symbol"]),
-                quantity=int(alert["qty"]),
-                price=float(alert["signal_price"]),
-                transaction_type=str(alert["side"]),
-                current_open_positions=open_count,
-                current_gross_exposure_inr=gross_exp,
-            )
+            alert_side = str(alert["side"]).strip().upper()
+            alert_sym = str(alert["symbol"]).strip().upper()
+            if alert_side in {"SELL", "COVER"}:
+                pos_obj = rt["positions"].get(alert_sym)
+                open_abs = abs(int(pos_obj["qty"])) if pos_obj is not None else None
+                check = self._risk.check_exit(
+                    symbol=alert_sym,
+                    quantity=int(alert["qty"]),
+                    price=float(alert["signal_price"]),
+                    transaction_type=alert_side,
+                    open_position_qty=open_abs,
+                )
+            else:
+                acct_open, acct_gross, pending_exp, daily_loss, wd_degraded = self._account_risk_context_locked(rt)
+                check = self._risk.check_entry(
+                    symbol=alert_sym,
+                    quantity=int(alert["qty"]),
+                    price=float(alert["signal_price"]),
+                    transaction_type=alert_side,
+                    current_open_positions=acct_open,
+                    current_gross_exposure_inr=acct_gross,
+                    pending_exposure_inr=pending_exp,
+                    daily_loss_inr=daily_loss,
+                    watchdog_degraded=wd_degraded,
+                )
             if not check["allowed"]:
                 reason_txt = "; ".join(check["reasons"])
                 with self._connect() as conn:
@@ -1448,12 +1873,13 @@ class DeploymentManager:
             cfg = self._charges_cfg_for(rt["spec"])
             exec_res = self._dispatch_live_broker_order_locked(
                 rt,
-                str(alert["symbol"]),
-                str(alert["side"]),
+                alert_sym,
+                alert_side,
                 int(alert["qty"]),
                 float(alert["signal_price"]),
                 f"1CLICK_APPROVED:{alert['reason']}",
                 cfg,
+                client_order_id=_deterministic_client_order_id(rt["id"], alert_sym, alert_side, "ALERT", alert_id),
             )
             self._persist_deployment_locked(rt)
 
@@ -1532,6 +1958,8 @@ class DeploymentManager:
             "trades_count": len(trades),
             "trades": trades[:40],
             "last_note": rt.get("last_note", ""),
+            "error_count": int(rt.get("error_count") or 0),
+            "last_error": str(rt.get("last_error") or ""),
             "created_at_ist": rt["created_at_ist"],
             "updated_at_ist": rt["updated_at_ist"],
         }

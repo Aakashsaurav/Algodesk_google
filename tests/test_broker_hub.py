@@ -1099,37 +1099,38 @@ class TestBrokerHubArchitecture(unittest.TestCase):
         import threading
         from web.local_server import _AlgoDeskHTTPServer, _StdlibBrokerHandler
 
-        srv = _AlgoDeskHTTPServer(("127.0.0.1", 0), _StdlibBrokerHandler)
-        port = srv.server_address[1]
-        thread = threading.Thread(target=srv.serve_forever, daemon=True)
-        thread.start()
-        try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health", timeout=3) as r:
-                health = _json.loads(r.read().decode("utf-8"))
-                self.assertEqual(r.status, 200)
-                self.assertTrue(health["live_terminal"])
-                self.assertGreaterEqual(health["phase"], 5)
-
-            for term_path in ("/terminal", "/terminal/"):
-                with urllib.request.urlopen(f"http://127.0.0.1:{port}{term_path}", timeout=3) as r:
-                    html_body = r.read().decode("utf-8")
+        with patch.dict(os.environ, {"ALGODESK_REQUIRE_AUTH": "false"}, clear=False):
+            srv = _AlgoDeskHTTPServer(("127.0.0.1", 0), _StdlibBrokerHandler)
+            port = srv.server_address[1]
+            thread = threading.Thread(target=srv.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health", timeout=3) as r:
+                    health = _json.loads(r.read().decode("utf-8"))
                     self.assertEqual(r.status, 200)
-                    self.assertIn("Live WebSocket Terminal", html_body)
+                    self.assertTrue(health["live_terminal"])
+                    self.assertGreaterEqual(health["phase"], 5)
 
-            for poll_path in ("/api/live/feeds/poll", "/api/live/poll"):
-                req = urllib.request.Request(
-                    f"http://127.0.0.1:{port}{poll_path}",
-                    data=b"{}",
-                    headers={"Content-Type": "application/json"},
-                    method="POST",
-                )
-                with urllib.request.urlopen(req, timeout=5) as r:
-                    payload = _json.loads(r.read().decode("utf-8"))
-                    self.assertEqual(r.status, 200)
-                    self.assertIn("active_feed", payload)
-        finally:
-            srv.shutdown()
-            srv.server_close()
+                for term_path in ("/terminal", "/terminal/"):
+                    with urllib.request.urlopen(f"http://127.0.0.1:{port}{term_path}", timeout=3) as r:
+                        html_body = r.read().decode("utf-8")
+                        self.assertEqual(r.status, 200)
+                        self.assertIn("Live WebSocket Terminal", html_body)
+
+                for poll_path in ("/api/live/feeds/poll", "/api/live/poll"):
+                    req = urllib.request.Request(
+                        f"http://127.0.0.1:{port}{poll_path}",
+                        data=b"{}",
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(req, timeout=5) as r:
+                        payload = _json.loads(r.read().decode("utf-8"))
+                        self.assertEqual(r.status, 200)
+                        self.assertIn("active_feed", payload)
+            finally:
+                srv.shutdown()
+                srv.server_close()
 
     def test_upstox_v3_quotes_and_hft_orders(self) -> None:
         import io
@@ -1496,89 +1497,90 @@ class TestBrokerHubArchitecture(unittest.TestCase):
         import time as _time
         from web.local_server import _AlgoDeskHTTPServer, _StdlibBrokerHandler
 
-        srv = _AlgoDeskHTTPServer(("127.0.0.1", 0), _StdlibBrokerHandler)
-        port = srv.server_address[1]
-        thread = threading.Thread(target=srv.serve_forever, daemon=True)
-        thread.start()
-        try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/analytics/meta", timeout=3) as r:
-                meta = _json.loads(r.read().decode("utf-8"))
-                self.assertEqual(r.status, 200)
-                self.assertIn("ema_crossover", meta["strategies"])
+        with patch.dict(os.environ, {"ALGODESK_REQUIRE_AUTH": "false"}, clear=False):
+            srv = _AlgoDeskHTTPServer(("127.0.0.1", 0), _StdlibBrokerHandler)
+            port = srv.server_address[1]
+            thread = threading.Thread(target=srv.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/analytics/meta", timeout=3) as r:
+                    meta = _json.loads(r.read().decode("utf-8"))
+                    self.assertEqual(r.status, 200)
+                    self.assertIn("ema_crossover", meta["strategies"])
 
-            with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/analytics/risk", timeout=3) as r:
-                risk = _json.loads(r.read().decode("utf-8"))
-                self.assertEqual(r.status, 200)
-                self.assertIn("limits", risk)
-                self.assertIn("telemetry", risk)
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/analytics/risk", timeout=3) as r:
+                    risk = _json.loads(r.read().decode("utf-8"))
+                    self.assertEqual(r.status, 200)
+                    self.assertIn("limits", risk)
+                    self.assertIn("telemetry", risk)
 
-            # Submit an async backtest job against fake seeded data in hub_service's ohlcv
-            with patch("backtest.engine.BacktestEngine._load_candles") as mock_loader:
-                today_d = datetime.now(tz=IST_TZ).date()
-                fake_rows = [
-                    {
-                        "ts_ist": f"{(today_d - timedelta(days=90 - i)).isoformat()}T15:30:00+05:30",
-                        "trade_date": (today_d - timedelta(days=90 - i)).isoformat(),
-                        "open": 100.0 + i,
-                        "high": 102.0 + i,
-                        "low": 99.0 + i,
-                        "close": 101.0 + i,
-                        "volume": 10000,
-                        "oi": 0,
-                        "source": "upstox",
-                    }
-                    for i in range(60)
-                ]
-                mock_loader.return_value = (
-                    fake_rows,
-                    {"symbol": "RELIANCE", "exchange": "NSE", "timeframe": "1day", "api_calls_made": 0, "existing_days_skipped": 60},
-                )
-                req = urllib.request.Request(
-                    f"http://127.0.0.1:{port}/api/analytics/backtest",
-                    data=_json.dumps({"symbol": "RELIANCE", "strategy": "rsi_mean_reversion", "async_job": True}).encode("utf-8"),
+                # Submit an async backtest job against fake seeded data in hub_service's ohlcv
+                with patch("backtest.engine.BacktestEngine._load_candles") as mock_loader:
+                    today_d = datetime.now(tz=IST_TZ).date()
+                    fake_rows = [
+                        {
+                            "ts_ist": f"{(today_d - timedelta(days=90 - i)).isoformat()}T15:30:00+05:30",
+                            "trade_date": (today_d - timedelta(days=90 - i)).isoformat(),
+                            "open": 100.0 + i,
+                            "high": 102.0 + i,
+                            "low": 99.0 + i,
+                            "close": 101.0 + i,
+                            "volume": 10000,
+                            "oi": 0,
+                            "source": "upstox",
+                        }
+                        for i in range(60)
+                    ]
+                    mock_loader.return_value = (
+                        fake_rows,
+                        {"symbol": "RELIANCE", "exchange": "NSE", "timeframe": "1day", "api_calls_made": 0, "existing_days_skipped": 60},
+                    )
+                    req = urllib.request.Request(
+                        f"http://127.0.0.1:{port}/api/analytics/backtest",
+                        data=_json.dumps({"symbol": "RELIANCE", "strategy": "rsi_mean_reversion", "async_job": True}).encode("utf-8"),
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with urllib.request.urlopen(req, timeout=4) as r:
+                        started = _json.loads(r.read().decode("utf-8"))
+                        self.assertTrue(started["async"])
+                        job_id = started["job"]["job_id"]
+
+                    # Poll job until completion
+                    final_job = None
+                    for _ in range(30):
+                        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/analytics/jobs/{job_id}", timeout=3) as jr:
+                            jb = _json.loads(jr.read().decode("utf-8"))["job"]
+                            if jb["status"] in {"COMPLETED", "FAILED", "CANCELLED"}:
+                                final_job = jb
+                                break
+                        _time.sleep(0.05)
+
+                    self.assertIsNotNone(final_job)
+                    self.assertEqual(final_job["status"], "COMPLETED")
+                    self.assertEqual(final_job["result"]["symbol"], "RELIANCE")
+
+                # Also verify new analytics meta fields & reload endpoint
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/analytics/meta", timeout=3) as r:
+                    meta_full = _json.loads(r.read().decode("utf-8"))
+                    self.assertIn("screens", meta_full)
+                    self.assertIn("strategy_specs", meta_full)
+                    self.assertIn("universes", meta_full)
+                    self.assertIn("storage", meta_full)
+                    self.assertIn("indicator_backends", meta_full)
+
+                reload_req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/analytics/reload",
+                    data=b"{}",
                     headers={"Content-Type": "application/json"},
                     method="POST",
                 )
-                with urllib.request.urlopen(req, timeout=4) as r:
-                    started = _json.loads(r.read().decode("utf-8"))
-                    self.assertTrue(started["async"])
-                    job_id = started["job"]["job_id"]
-
-                # Poll job until completion
-                final_job = None
-                for _ in range(30):
-                    with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/analytics/jobs/{job_id}", timeout=3) as jr:
-                        jb = _json.loads(jr.read().decode("utf-8"))["job"]
-                        if jb["status"] in {"COMPLETED", "FAILED", "CANCELLED"}:
-                            final_job = jb
-                            break
-                    _time.sleep(0.05)
-
-                self.assertIsNotNone(final_job)
-                self.assertEqual(final_job["status"], "COMPLETED")
-                self.assertEqual(final_job["result"]["symbol"], "RELIANCE")
-
-            # Also verify new analytics meta fields & reload endpoint
-            with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/analytics/meta", timeout=3) as r:
-                meta_full = _json.loads(r.read().decode("utf-8"))
-                self.assertIn("screens", meta_full)
-                self.assertIn("strategy_specs", meta_full)
-                self.assertIn("universes", meta_full)
-                self.assertIn("storage", meta_full)
-                self.assertIn("indicator_backends", meta_full)
-
-            reload_req = urllib.request.Request(
-                f"http://127.0.0.1:{port}/api/analytics/reload",
-                data=b"{}",
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(reload_req, timeout=3) as r:
-                reloaded = _json.loads(r.read().decode("utf-8"))
-                self.assertTrue(reloaded["ok"])
-        finally:
-            srv.shutdown()
-            srv.server_close()
+                with urllib.request.urlopen(reload_req, timeout=3) as r:
+                    reloaded = _json.loads(r.read().decode("utf-8"))
+                    self.assertTrue(reloaded["ok"])
+            finally:
+                srv.shutdown()
+                srv.server_close()
 
     def test_modular_indicators_toolkit_and_backends(self) -> None:
         from indicators.toolkit import IndicatorToolkit, available_backends
@@ -2018,20 +2020,21 @@ class TestBrokerHubArchitecture(unittest.TestCase):
         self.assertGreaterEqual(golden["total_count"], 7)
         self.assertEqual(golden["passed_count"], golden["total_count"])
 
-        srv = _AlgoDeskHTTPServer(("127.0.0.1", 0), _StdlibBrokerHandler)
-        port = srv.server_address[1]
-        thread = threading.Thread(target=srv.serve_forever, daemon=True)
-        thread.start()
-        try:
-            with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/analytics/indicators/verify", timeout=5) as r:
-                body = _json.loads(r.read().decode("utf-8"))
-                self.assertEqual(r.status, 200)
-                self.assertTrue(body["ok"])
-                self.assertTrue(body["golden_reference"]["ok"])
-                self.assertIn("available_backends", body["backend_parity"])
-        finally:
-            srv.shutdown()
-            srv.server_close()
+        with patch.dict(os.environ, {"ALGODESK_REQUIRE_AUTH": "false"}, clear=False):
+            srv = _AlgoDeskHTTPServer(("127.0.0.1", 0), _StdlibBrokerHandler)
+            port = srv.server_address[1]
+            thread = threading.Thread(target=srv.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/analytics/indicators/verify", timeout=5) as r:
+                    body = _json.loads(r.read().decode("utf-8"))
+                    self.assertEqual(r.status, 200)
+                    self.assertTrue(body["ok"])
+                    self.assertTrue(body["golden_reference"]["ok"])
+                    self.assertIn("available_backends", body["backend_parity"])
+            finally:
+                srv.shutdown()
+                srv.server_close()
 
     def test_auto_lookback_and_dynamic_per_screen_columns(self) -> None:
         from screener.engine import ScreenerEngine, compute_auto_lookback_days

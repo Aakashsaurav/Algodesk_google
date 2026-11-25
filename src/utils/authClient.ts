@@ -11,8 +11,10 @@ export interface SecurityStatus {
   has_env_token: boolean;
   has_passcode: boolean;
   needs_claim: boolean;
+  bootstrap_required?: boolean;
   active_sessions: number;
   live_trading_enabled: boolean;
+  plugin_trust_notice?: string;
 }
 
 type AuthRequiredListener = (detail?: string) => void;
@@ -182,16 +184,23 @@ export async function fetchSecurityStatus(): Promise<SecurityStatus | null> {
   }
 }
 
-export async function claimAdminPasscode(passcode: string): Promise<{
+export async function claimAdminPasscode(
+  passcode: string,
+  bootstrapCode?: string
+): Promise<{
   ok: boolean;
   token?: string;
   status?: SecurityStatus;
   detail?: string;
 }> {
+  const payload: Record<string, string> = { passcode };
+  if (bootstrapCode && bootstrapCode.trim()) {
+    payload.bootstrap_code = bootstrapCode.trim();
+  }
   const res = await apiFetch('/api/security/claim', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ passcode }),
+    body: JSON.stringify(payload),
   });
   const body = await res.json().catch(() => ({}));
   if (!res.ok) {

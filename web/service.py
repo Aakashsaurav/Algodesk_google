@@ -68,7 +68,12 @@ from screener.nse_universe_sync import nse_universe_sync
 from screener.registry import screen_registry
 from screener.universes import DEFAULT_WATCHLIST, universe_resolver
 from technicals.analyzer import technicals_analyzer
-from web.security import is_live_trading_enabled, security_manager, validate_python_plugin_ast
+from web.security import (
+    PLUGIN_TRUST_NOTICE,
+    is_live_trading_enabled,
+    security_manager,
+    validate_python_plugin_ast,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1022,11 +1027,21 @@ class BrokerHubService:
     def get_security_status(self) -> Dict[str, Any]:
         return {"ok": True, **security_manager.status()}
 
-    def claim_admin_passcode(self, passcode: str) -> Dict[str, Any]:
-        return security_manager.claim_passcode(passcode)
+    def claim_admin_passcode(
+        self,
+        passcode: str,
+        *,
+        bootstrap_code: Optional[str] = None,
+        client_key: str = "local",
+    ) -> Dict[str, Any]:
+        return security_manager.claim_passcode(
+            passcode,
+            bootstrap_code=bootstrap_code,
+            client_key=client_key,
+        )
 
-    def login_admin(self, passcode: str) -> Dict[str, Any]:
-        return security_manager.login(passcode)
+    def login_admin(self, passcode: str, *, client_key: str = "local") -> Dict[str, Any]:
+        return security_manager.login(passcode, client_key=client_key)
 
     def get_telegram_settings(self) -> Dict[str, Any]:
         return {"ok": True, **telegram_notifier.get_status()}
@@ -1056,11 +1071,34 @@ class BrokerHubService:
         }
 
     def start_background_services(self) -> None:
-        """Start headless risk watchdog daemon."""
+        """Initialize one-time bootstrap secret, startup reconciliation, and headless risk watchdog."""
         try:
+            if security_manager.is_auth_enforced():
+                security_manager.ensure_bootstrap_code()
+        except Exception as exc:
+            logger.warning("Bootstrap code initialization note: %s", exc)
+
+        def _periodic_reconcile() -> None:
+            try:
+                deployment_manager.reconcile_orders()
+            except Exception as exc:
+                logger.warning("Periodic OMS order reconciliation note: %s", exc)
+            try:
+                deployment_manager.reconcile_positions()
+            except Exception as exc:
+                logger.warning("Periodic position reconciliation note: %s", exc)
+
+        try:
+            risk_watchdog.set_reconcile_callback(_periodic_reconcile)
             risk_watchdog.start()
         except Exception as exc:
             logger.warning("RiskWatchdog startup skipped: %s", exc)
+
+        # Best-effort startup reconciliation for any live deployments persisted before restart
+        try:
+            deployment_manager.reconcile_startup()
+        except Exception as exc:
+            logger.warning("Startup reconciliation note: %s", exc)
 
     def stop_background_services(self) -> None:
         """Cleanly stop headless background threads on server shutdown."""
@@ -1500,6 +1538,7 @@ class BrokerHubService:
             "kind": clean_kind,
             "filename": out_path.name,
             "specs": specs,
+            "plugin_trust_notice": PLUGIN_TRUST_NOTICE,
         }
 
     # ── Streak-style Scanner Alerts ──────────────────────────────────────

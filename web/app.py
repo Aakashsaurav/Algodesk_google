@@ -21,7 +21,7 @@ from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocket
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
-from web.security import security_manager
+from web.security import RateLimitError, security_manager
 from web.service import hub_service
 from web.spa import has_spa_bundle, render_spa_html, resolve_spa_asset
 
@@ -215,6 +215,15 @@ def create_app() -> FastAPI:
         version="1.0.0",
         lifespan=_lifespan,
     )
+
+    def _ws_authorized(websocket: WebSocket) -> bool:
+        if not security_manager.is_auth_enforced():
+            return True
+        auth_hdr = websocket.headers.get("authorization")
+        if auth_hdr and security_manager.verify_bearer(auth_hdr):
+            return True
+        q_tok = websocket.query_params.get("token")
+        return bool(q_tok and security_manager.verify_raw_token(q_tok))
 
     @app.middleware("http")
     async def _bearer_auth_middleware(request: Request, call_next):
@@ -584,6 +593,9 @@ def create_app() -> FastAPI:
 
     @app.websocket("/ws/live")
     async def ws_live(websocket: WebSocket) -> None:
+        if not _ws_authorized(websocket):
+            await websocket.close(code=4401)
+            return
         await websocket.accept()
         listener_q = hub_service.register_live_listener()
 
@@ -671,6 +683,9 @@ def create_app() -> FastAPI:
 
     @app.websocket("/ws/live-screener")
     async def ws_live_screener(websocket: WebSocket) -> None:
+        if not _ws_authorized(websocket):
+            await websocket.close(code=4401)
+            return
         await websocket.accept()
         listener_q = hub_service.register_live_screener_listener()
 
@@ -1151,16 +1166,39 @@ def create_app() -> FastAPI:
         return hub_service.get_security_status()
 
     @app.post("/api/security/claim")
-    def api_security_claim(payload: Dict[str, Any]) -> dict:
+    def api_security_claim(request: Request, payload: Dict[str, Any]) -> dict:
+        client_ip = request.client.host if request.client else "local"
         try:
-            return hub_service.claim_admin_passcode(str(payload.get("passcode", "")))
+            return hub_service.claim_admin_passcode(
+                str(payload.get("passcode", "")),
+                bootstrap_code=str(payload.get("bootstrap_code") or "") or None,
+                client_key=client_ip,
+            )
+        except RateLimitError as exc:
+            raise HTTPException(
+                status_code=429,
+                detail=str(exc),
+                headers={"Retry-After": str(exc.retry_after_sec)},
+            ) from exc
+        except PermissionError as exc:
+            raise HTTPException(status_code=401, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/api/security/login")
-    def api_security_login(payload: Dict[str, Any]) -> dict:
+    def api_security_login(request: Request, payload: Dict[str, Any]) -> dict:
+        client_ip = request.client.host if request.client else "local"
         try:
-            return hub_service.login_admin(str(payload.get("passcode") or payload.get("token") or ""))
+            return hub_service.login_admin(
+                str(payload.get("passcode") or payload.get("token") or ""),
+                client_key=client_ip,
+            )
+        except RateLimitError as exc:
+            raise HTTPException(
+                status_code=429,
+                detail=str(exc),
+                headers={"Retry-After": str(exc.retry_after_sec)},
+            ) from exc
         except PermissionError as exc:
             raise HTTPException(status_code=401, detail=str(exc)) from exc
         except ValueError as exc:
@@ -1186,6 +1224,9 @@ def create_app() -> FastAPI:
 
     @app.websocket("/ws/deployments")
     async def ws_deployments(websocket: WebSocket) -> None:
+        if not _ws_authorized(websocket):
+            await websocket.close(code=4401)
+            return
         await websocket.accept()
         listener_q = hub_service.register_deployments_listener()
 

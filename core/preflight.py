@@ -16,6 +16,9 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import stat
+import tempfile
 import threading
 import urllib.error
 import urllib.request
@@ -43,6 +46,32 @@ logger = logging.getLogger(__name__)
 
 _NSE_OPEN = time(9, 15)
 _NSE_CLOSE = time(15, 30)
+
+
+def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
+    """Atomically write JSON via temp file + fsync + os.replace to prevent partial/corrupted state."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            json.dump(payload, fh, indent=2)
+            fh.flush()
+            try:
+                os.fsync(fh.fileno())
+            except OSError:
+                pass
+        try:
+            os.chmod(tmp_path, stat.S_IRUSR | stat.S_IWUSR)
+        except OSError:
+            pass
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
 
 
 @dataclass
@@ -82,30 +111,38 @@ class KillSwitchController:
                 return {
                     "armed": True,
                     "engaged": False,
+                    "corrupted": False,
                     "reason": "",
                     "engaged_at_ist": None,
                     "actor": "system",
                 }
             try:
-                data = json.loads(path.read_text(encoding="utf-8"))
+                raw_text = path.read_text(encoding="utf-8")
+                data = json.loads(raw_text)
+                if not isinstance(data, dict) or "engaged" not in data:
+                    raise ValueError("Kill-switch state JSON missing required 'engaged' field")
                 return {
                     "armed": True,
-                    "engaged": bool(data.get("engaged", False)),
+                    "engaged": bool(data.get("engaged", True)),
+                    "corrupted": False,
                     "reason": str(data.get("reason", "")),
                     "engaged_at_ist": data.get("engaged_at_ist"),
                     "actor": str(data.get("actor", "system")),
                 }
-            except (OSError, json.JSONDecodeError):
+            except (OSError, json.JSONDecodeError, ValueError) as exc:
+                # Fail CLOSED: corrupted or unreadable state file must halt new entries!
+                logger.error("Kill-switch state file %s corrupted/unreadable (%s); failing CLOSED.", path, exc)
                 return {
                     "armed": True,
-                    "engaged": False,
-                    "reason": "",
+                    "engaged": True,
+                    "corrupted": True,
+                    "reason": f"Kill-switch state file corrupted or unreadable ({exc.__class__.__name__}); fail-closed safety halt active.",
                     "engaged_at_ist": None,
                     "actor": "system",
                 }
 
     def is_engaged(self) -> bool:
-        return bool(self.status().get("engaged", False))
+        return bool(self.status().get("engaged", True))
 
     def engage(
         self,
@@ -150,9 +187,7 @@ class KillSwitchController:
             "cancel_errors": cancel_errors,
         }
         with self._lock:
-            path = self.state_file
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            _atomic_write_json(self.state_file, payload)
 
         audit_event = self._audit.log_kill_switch(
             engaged=True,
@@ -193,9 +228,7 @@ class KillSwitchController:
             "actor": actor,
         }
         with self._lock:
-            path = self.state_file
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            _atomic_write_json(self.state_file, payload)
 
         audit_event = self._audit.log_kill_switch(
             engaged=False,

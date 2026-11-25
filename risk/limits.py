@@ -8,15 +8,18 @@ and live broker exposure + daily loss evaluation with SEBI SHA-256 audit & kill 
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from broker.registry import BrokerRegistry
 from config import IST_TZ, config
 from core.audit import AuditTrail, audit_trail
 from core.preflight import KillSwitchController, kill_switch_controller
+
+logger = logging.getLogger(__name__)
 
 
 class RiskLimitManager:
@@ -125,7 +128,7 @@ class RiskLimitManager:
         )
         return next_cfg
 
-    def validate_order(
+    def check_entry(
         self,
         *,
         symbol: str,
@@ -134,13 +137,23 @@ class RiskLimitManager:
         transaction_type: str = "BUY",
         current_open_positions: int = 0,
         current_gross_exposure_inr: float = 0.0,
+        pending_exposure_inr: float = 0.0,
+        daily_loss_inr: Optional[float] = None,
+        watchdog_degraded: bool = False,
     ) -> Dict[str, Any]:
-        """Pre-trade risk gate invoked by `CanonicalSessionManager.submit_signal_order`."""
+        """
+        Pre-trade risk gate for risk-increasing ENTRY orders (BUY / SHORT).
+        Enforces kill switch, watchdog health, daily loss cap, per-trade notional cap,
+        max open positions, and account-wide gross + pending exposure cap.
+        """
         limits = self.load_limits()
         reasons: List[str] = []
 
         if self._kill_switch.is_engaged():
             reasons.append("Emergency Kill Switch is engaged.")
+
+        if watchdog_degraded:
+            reasons.append("Risk watchdog is degraded after repeated probe failures; new entries paused.")
 
         qty = max(0, int(quantity or 0))
         px = max(0.0, float(price or 0.0))
@@ -150,19 +163,27 @@ class RiskLimitManager:
 
         if qty <= 0:
             reasons.append("Order quantity must be > 0.")
+
+        if daily_loss_inr is not None and float(daily_loss_inr) >= float(limits["max_daily_loss_inr"]):
+            reasons.append(
+                f"Daily loss ₹{float(daily_loss_inr):,.2f} reached/exceeded cap ₹{limits['max_daily_loss_inr']:,.2f}."
+            )
+
         if px > 0 and notional > max_trade_notional:
             reasons.append(
                 f"Order notional ₹{notional:,.2f} exceeds per-trade cap ₹{max_trade_notional:,.2f} ({limits['max_capital_per_trade_pct']}%)."
             )
-        if str(transaction_type).upper() in {"BUY", "SHORT"}:
-            if current_open_positions >= int(limits["max_open_positions"]):
-                reasons.append(
-                    f"Open positions ({current_open_positions}) reached limit ({limits['max_open_positions']})."
-                )
-            if px > 0 and (current_gross_exposure_inr + notional) > float(limits["max_gross_exposure_inr"]):
-                reasons.append(
-                    f"Projected gross exposure ₹{current_gross_exposure_inr + notional:,.2f} exceeds cap ₹{limits['max_gross_exposure_inr']:,.2f}."
-                )
+
+        if current_open_positions >= int(limits["max_open_positions"]):
+            reasons.append(
+                f"Open positions ({current_open_positions}) reached limit ({limits['max_open_positions']})."
+            )
+
+        projected_exposure = float(current_gross_exposure_inr) + max(0.0, float(pending_exposure_inr)) + notional
+        if px > 0 and projected_exposure > float(limits["max_gross_exposure_inr"]):
+            reasons.append(
+                f"Projected gross exposure ₹{projected_exposure:,.2f} exceeds cap ₹{limits['max_gross_exposure_inr']:,.2f}."
+            )
 
         allowed = len(reasons) == 0
         if not allowed:
@@ -170,11 +191,104 @@ class RiskLimitManager:
                 self._audit.log(
                     event_type="PRETRADE_RISK_BLOCKED",
                     actor="risk_guard",
-                    payload={"symbol": symbol, "quantity": qty, "notional": round(notional, 2), "reasons": reasons},
+                    payload={
+                        "symbol": symbol,
+                        "side": str(transaction_type).upper(),
+                        "quantity": qty,
+                        "notional": round(notional, 2),
+                        "reasons": reasons,
+                    },
                 )
             except Exception:
                 pass
-        return {"allowed": allowed, "reasons": reasons, "limits": limits}
+        return {"allowed": allowed, "reasons": reasons, "limits": limits, "kind": "entry"}
+
+    def check_exit(
+        self,
+        *,
+        symbol: str,
+        quantity: int,
+        price: float = 0.0,
+        transaction_type: str = "SELL",
+        open_position_qty: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        Pre-trade risk gate for risk-REDUCING EXIT orders (SELL / COVER).
+
+        CRITICAL SAFETY INVARIANT:
+        - Exits are ALWAYS permitted even when the Kill Switch is engaged,
+          daily loss limit is breached, watchdog is degraded, or the appreciated
+          position notional exceeds `max_capital_per_trade_pct`.
+        - Never allows an exit order to flip a position when `open_position_qty`
+          is supplied (`quantity` must not exceed `open_position_qty`).
+        """
+        limits = self.load_limits()
+        reasons: List[str] = []
+        qty = max(0, int(quantity or 0))
+        if qty <= 0:
+            reasons.append("Order quantity must be > 0.")
+        if open_position_qty is not None:
+            open_abs = abs(int(open_position_qty))
+            if open_abs == 0:
+                reasons.append(f"No open position in {symbol} to exit.")
+            elif qty > open_abs:
+                reasons.append(
+                    f"Exit quantity ({qty}) exceeds open position ({open_abs}) for {symbol}; refusing accidental flip."
+                )
+
+        allowed = len(reasons) == 0
+        if not allowed:
+            try:
+                self._audit.log(
+                    event_type="PRETRADE_EXIT_BLOCKED",
+                    actor="risk_guard",
+                    payload={
+                        "symbol": symbol,
+                        "side": str(transaction_type).upper(),
+                        "quantity": qty,
+                        "open_position_qty": open_position_qty,
+                        "reasons": reasons,
+                    },
+                )
+            except Exception:
+                pass
+        return {"allowed": allowed, "reasons": reasons, "limits": limits, "kind": "exit"}
+
+    def validate_order(
+        self,
+        *,
+        symbol: str,
+        quantity: int,
+        price: float = 0.0,
+        transaction_type: str = "BUY",
+        current_open_positions: int = 0,
+        current_gross_exposure_inr: float = 0.0,
+        pending_exposure_inr: float = 0.0,
+        daily_loss_inr: Optional[float] = None,
+        watchdog_degraded: bool = False,
+        open_position_qty: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Pre-trade risk gate routing exits to `check_exit` and entries to `check_entry`."""
+        side_u = str(transaction_type or "BUY").strip().upper()
+        if side_u in {"SELL", "COVER"}:
+            return self.check_exit(
+                symbol=symbol,
+                quantity=quantity,
+                price=price,
+                transaction_type=side_u,
+                open_position_qty=open_position_qty,
+            )
+        return self.check_entry(
+            symbol=symbol,
+            quantity=quantity,
+            price=price,
+            transaction_type=side_u,
+            current_open_positions=current_open_positions,
+            current_gross_exposure_inr=current_gross_exposure_inr,
+            pending_exposure_inr=pending_exposure_inr,
+            daily_loss_inr=daily_loss_inr,
+            watchdog_degraded=watchdog_degraded,
+        )
 
     def evaluate(
         self,
@@ -376,8 +490,9 @@ class RiskLimitManager:
 class RiskWatchdog:
     """
     Headless continuous risk & reconciliation background thread.
-    Runs independently of the web UI so daily-loss limits engage the kill switch
-    and notify Telegram even when no browser is open.
+    Runs independently of the web UI so daily-loss limits engage the kill switch,
+    positions/orders reconcile periodically, and repeated failures flip the watchdog
+    into a visible `degraded` state that blocks new live entries and alerts Telegram.
     """
 
     def __init__(
@@ -388,41 +503,102 @@ class RiskWatchdog:
         broker_provider: Optional[Any] = None,
         state_provider: Optional[Any] = None,
         notifier: Optional[Any] = None,
+        reconcile_callback: Optional[Callable[[], Any]] = None,
+        reconcile_every_n: int = 4,
+        degraded_threshold: int = 3,
     ) -> None:
         self._risk = risk_mgr or risk_limit_manager
         self._interval = max(1.0, float(interval_sec))
         self._broker_provider = broker_provider
         self._state_provider = state_provider
         self._notifier = notifier
+        self._reconcile_callback = reconcile_callback
+        self._reconcile_every_n = max(1, int(reconcile_every_n))
+        self._degraded_threshold = max(1, int(degraded_threshold))
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._last_eval: Optional[Dict[str, Any]] = None
+        self._consecutive_failures: int = 0
+        self._degraded: bool = False
+        self._degraded_alerted: bool = False
+        self._last_error: str = ""
+        self._tick_count: int = 0
         self._lock = threading.RLock()
 
-    def run_once(self) -> Dict[str, Any]:
-        if self._state_provider is not None:
-            snapshot = self._state_provider() or {}
-            res = self._risk.evaluate(
-                trading_broker=str(snapshot.get("trading_broker") or "upstox"),
-                funds=snapshot.get("funds"),
-                positions=snapshot.get("positions"),
-                orders=snapshot.get("orders"),
-                broker_adapter=snapshot.get("broker_adapter"),
-                notifier=self._notifier,
-            )
-        else:
-            broker_id = "upstox"
-            adapter = None
-            if callable(self._broker_provider):
-                broker_id, adapter = self._broker_provider()
-            res = self._risk.evaluate(
-                trading_broker=broker_id,
-                broker_adapter=adapter,
-                notifier=self._notifier,
-            )
+    @property
+    def is_degraded(self) -> bool:
+        with self._lock:
+            return self._degraded
+
+    def set_reconcile_callback(self, cb: Optional[Callable[[], Any]]) -> None:
+        with self._lock:
+            self._reconcile_callback = cb
+
+    def _record_failure(self, exc: Exception) -> None:
+        from notifications.telegram import telegram_notifier
+
+        should_alert = False
+        with self._lock:
+            self._consecutive_failures += 1
+            self._last_error = f"{exc.__class__.__name__}: {exc}"
+            if self._consecutive_failures >= self._degraded_threshold:
+                self._degraded = True
+                if not self._degraded_alerted:
+                    self._degraded_alerted = True
+                    should_alert = True
+            fails = self._consecutive_failures
+            err_msg = self._last_error
+
+        logger.error("RiskWatchdog failure #%d: %s", fails, err_msg)
+        if should_alert:
+            eff_notifier = self._notifier or telegram_notifier
+            try:
+                eff_notifier.notify_event(
+                    "WATCHDOG_DEGRADED",
+                    "Risk Watchdog DEGRADED — New Entries Paused",
+                    [
+                        f"Consecutive failures: {fails}",
+                        f"Last error: {err_msg}",
+                    ],
+                )
+            except Exception:
+                pass
+
+    def _record_success(self, res: Dict[str, Any]) -> None:
         with self._lock:
             self._last_eval = res
-        return res
+            self._consecutive_failures = 0
+            self._degraded = False
+            self._degraded_alerted = False
+            self._last_error = ""
+
+    def run_once(self) -> Dict[str, Any]:
+        try:
+            if self._state_provider is not None:
+                snapshot = self._state_provider() or {}
+                res = self._risk.evaluate(
+                    trading_broker=str(snapshot.get("trading_broker") or "upstox"),
+                    funds=snapshot.get("funds"),
+                    positions=snapshot.get("positions"),
+                    orders=snapshot.get("orders"),
+                    broker_adapter=snapshot.get("broker_adapter"),
+                    notifier=self._notifier,
+                )
+            else:
+                broker_id = "upstox"
+                adapter = None
+                if callable(self._broker_provider):
+                    broker_id, adapter = self._broker_provider()
+                res = self._risk.evaluate(
+                    trading_broker=broker_id,
+                    broker_adapter=adapter,
+                    notifier=self._notifier,
+                )
+            self._record_success(res)
+            return res
+        except Exception as exc:
+            self._record_failure(exc)
+            raise
 
     def start(self) -> None:
         with self._lock:
@@ -447,7 +623,17 @@ class RiskWatchdog:
             try:
                 self.run_once()
             except Exception:
+                # Failure count, degraded flag, logging & Telegram alert already recorded in run_once()
                 pass
+
+            self._tick_count += 1
+            cb = self._reconcile_callback
+            if cb is not None and (self._tick_count % self._reconcile_every_n == 0):
+                try:
+                    cb()
+                except Exception as exc:
+                    logger.warning("RiskWatchdog periodic reconciliation note: %s", exc)
+
             self._stop.wait(self._interval)
 
     def status(self) -> Dict[str, Any]:
@@ -455,6 +641,9 @@ class RiskWatchdog:
             return {
                 "running": bool(self._thread is not None and self._thread.is_alive()),
                 "interval_sec": self._interval,
+                "degraded": self._degraded,
+                "consecutive_failures": self._consecutive_failures,
+                "last_error": self._last_error,
                 "last_evaluation": self._last_eval,
             }
 

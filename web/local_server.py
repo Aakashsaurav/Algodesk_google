@@ -35,7 +35,7 @@ from core.ws_protocol import (
     send_ws_pong,
     send_ws_text,
 )
-from web.security import security_manager
+from web.security import RateLimitError, security_manager
 from web.service import hub_service
 from web.spa import ensure_spa_bundle, has_spa_bundle, render_spa_html, resolve_spa_asset
 
@@ -75,10 +75,28 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length).decode("utf-8")
         return json.loads(raw) if raw.strip() else {}
 
+    def _enforce_auth(self, method: str, path: str) -> bool:
+        """Enforce deny-by-default Bearer auth across all HTTP verbs."""
+        if not security_manager.is_protected_request(method, path):
+            return True
+        if security_manager.verify_bearer(self.headers.get("Authorization")):
+            return True
+        self._send_json(
+            401,
+            {
+                "detail": "Operator authentication required. Sign in with your admin passcode or ALGODESK_API_TOKEN.",
+                "auth_required": True,
+            },
+        )
+        return False
+
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
+
+        if not self._enforce_auth("GET", path):
+            return
 
         if path in {"/", "/terminal", "/terminal/"}:
             body_html = render_spa_html(path)
@@ -652,16 +670,8 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
 
-        if security_manager.is_protected_request("POST", path):
-            if not security_manager.verify_bearer(self.headers.get("Authorization")):
-                self._send_json(
-                    401,
-                    {
-                        "detail": "Operator authentication required. Sign in with your admin passcode or ALGODESK_API_TOKEN.",
-                        "auth_required": True,
-                    },
-                )
-                return
+        if not self._enforce_auth("POST", path):
+            return
 
         try:
             body = self._read_json_body()
@@ -1063,15 +1073,34 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
                 return
 
             if path == "/api/security/claim":
-                self._send_json(200, hub_service.claim_admin_passcode(str(body.get("passcode", ""))))
-                return
-
-            if path == "/api/security/login":
+                client_ip = str(self.client_address[0] if self.client_address else "local")
                 try:
                     self._send_json(
                         200,
-                        hub_service.login_admin(str(body.get("passcode") or body.get("token") or "")),
+                        hub_service.claim_admin_passcode(
+                            str(body.get("passcode", "")),
+                            bootstrap_code=str(body.get("bootstrap_code") or "") or None,
+                            client_key=client_ip,
+                        ),
                     )
+                except RateLimitError as exc:
+                    self._send_json(429, {"detail": str(exc), "retry_after_sec": exc.retry_after_sec})
+                except PermissionError as exc:
+                    self._send_json(401, {"detail": str(exc)})
+                return
+
+            if path == "/api/security/login":
+                client_ip = str(self.client_address[0] if self.client_address else "local")
+                try:
+                    self._send_json(
+                        200,
+                        hub_service.login_admin(
+                            str(body.get("passcode") or body.get("token") or ""),
+                            client_key=client_ip,
+                        ),
+                    )
+                except RateLimitError as exc:
+                    self._send_json(429, {"detail": str(exc), "retry_after_sec": exc.retry_after_sec})
                 except PermissionError as exc:
                     self._send_json(401, {"detail": str(exc)})
                 return
@@ -1090,18 +1119,22 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._send_json(500, {"detail": str(exc)})
 
+    def do_PUT(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        if not self._enforce_auth("PUT", parsed.path):
+            return
+        self._send_json(405, {"detail": "Method Not Allowed"})
+
+    def do_PATCH(self) -> None:  # noqa: N802
+        parsed = urlparse(self.path)
+        if not self._enforce_auth("PATCH", parsed.path):
+            return
+        self._send_json(405, {"detail": "Method Not Allowed"})
+
     def do_DELETE(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
-        if security_manager.is_protected_request("DELETE", parsed.path):
-            if not security_manager.verify_bearer(self.headers.get("Authorization")):
-                self._send_json(
-                    401,
-                    {
-                        "detail": "Operator authentication required. Sign in with your admin passcode or ALGODESK_API_TOKEN.",
-                        "auth_required": True,
-                    },
-                )
-                return
+        if not self._enforce_auth("DELETE", parsed.path):
+            return
         parts = parsed.path.strip("/").split("/")
         try:
             if len(parts) == 4 and parts[0] == "api" and parts[1] == "streak" and parts[2] == "rules":

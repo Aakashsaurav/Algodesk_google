@@ -26,7 +26,8 @@ function readCliArg(flag: string): string | undefined {
 }
 
 const PORT = Number(readCliArg('--port') || process.env.PORT || 3000);
-const HOST = readCliArg('--host') || process.env.HOST || '0.0.0.0';
+const IS_HOSTED_ENV = Boolean(process.env.K_SERVICE || process.env.CLOUD_RUN_JOB || process.env.PORT);
+const HOST = readCliArg('--host') || process.env.HOST || (IS_HOSTED_ENV ? '0.0.0.0' : '127.0.0.1');
 const BASE_PYTHON_PORT = Number(process.env.PYTHON_HUB_PORT || 8001);
 let activePythonPort = BASE_PYTHON_PORT;
 const IS_PROD = process.env.NODE_ENV === 'production';

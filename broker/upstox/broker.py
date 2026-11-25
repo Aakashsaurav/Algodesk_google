@@ -20,15 +20,19 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from broker.base import (
     AccountBalance,
+    AmbiguousSubmissionError,
     BrokerBase,
     BrokerCapabilities,
     BrokerError,
     BrokerHealthSnapshot,
+    BrokerHttpError,
     BrokerOrder,
     BrokerPosition,
     ConnectionState,
     OrderRequest,
     OrderStatus,
+    TokenBucketRateLimiter,
+    make_broker_tag,
 )
 from broker.upstox.auth import auth_manager, current_upstox_session_bounds
 from config import config
@@ -117,6 +121,7 @@ class UpstoxBroker(BrokerBase):
         self._portfolio_api = None
         self._funds_api = None
         self._last_read_err_ts: Dict[str, float] = {}
+        self._rate_limiter = TokenBucketRateLimiter(rate_per_sec=10.0, capacity=15.0)
 
     def _probe_profile(self, token: str, timeout: float = 3.5) -> tuple[bool, int, Dict[str, Any], str]:
         """Verify token against Upstox /v2/user/profile with strict timeout."""
@@ -370,6 +375,7 @@ class UpstoxBroker(BrokerBase):
         timeout: float = 6.0,
     ) -> Dict[str, Any]:
         token = self.access_token or auth_manager.get_valid_token()
+        method_u = method.upper()
         headers = {
             "Authorization": f"Bearer {token}",
             "Accept": "application/json",
@@ -381,32 +387,79 @@ class UpstoxBroker(BrokerBase):
         # Prefer `requests` in production (matches _probe_profile and passes Upstox/Cloudflare WAF),
         # while honoring `urllib.request.urlopen` whenever patched by unit tests or when requests is absent.
         urlopen_mocked = getattr(urllib.request.urlopen, "__module__", "") != "urllib.request"
-        if requests is not None and not urlopen_mocked:
-            resp = requests.request(
-                method=method.upper(),
-                url=url,
-                headers=headers,
-                json=payload if payload is not None else None,
-                timeout=timeout,
-            )
-            if resp.status_code >= 400:
-                detail = f"HTTP {resp.status_code}"
+        max_attempts = 3 if method_u == "GET" else 1
+
+        for attempt in range(max_attempts):
+            self._rate_limiter.acquire(timeout=3.0)
+            if requests is not None and not urlopen_mocked:
+                resp = requests.request(
+                    method=method_u,
+                    url=url,
+                    headers=headers,
+                    json=payload if payload is not None else None,
+                    timeout=timeout,
+                )
+                if resp.status_code >= 400:
+                    detail = f"HTTP {resp.status_code}"
+                    try:
+                        err_body = resp.json()
+                        errs = err_body.get("errors") or []
+                        msg = err_body.get("message") or (errs[0].get("message") if errs and isinstance(errs[0], dict) else "")
+                        if msg:
+                            detail = f"HTTP {resp.status_code}: {msg}"
+                    except Exception:
+                        pass
+                    if method_u == "GET" and resp.status_code in {429, 500, 502, 503, 504} and attempt < max_attempts - 1:
+                        time.sleep(0.15 * (2 ** attempt))
+                        continue
+                    raise BrokerHttpError(resp.status_code, detail)
+                return resp.json() if resp.content else {}
+
+            data_bytes = json.dumps(payload).encode("utf-8") if payload is not None else None
+            req = urllib.request.Request(url, data=data_bytes, headers=headers, method=method_u)
+            try:
+                with urllib.request.urlopen(req, timeout=timeout) as resp:
+                    raw = resp.read().decode("utf-8")
+                    return json.loads(raw) if raw.strip() else {}
+            except urllib.error.HTTPError as exc:
+                if method_u == "GET" and exc.code in {429, 500, 502, 503, 504} and attempt < max_attempts - 1:
+                    time.sleep(0.05 * (2 ** attempt))
+                    continue
+                detail = f"HTTP {exc.code}: {exc.reason}"
                 try:
-                    err_body = resp.json()
-                    errs = err_body.get("errors") or []
-                    msg = err_body.get("message") or (errs[0].get("message") if errs and isinstance(errs[0], dict) else "")
-                    if msg:
-                        detail = f"HTTP {resp.status_code}: {msg}"
+                    raw_err = exc.read().decode("utf-8", errors="ignore")
+                    if raw_err.strip():
+                        err_body = json.loads(raw_err)
+                        errs = err_body.get("errors") or []
+                        msg = err_body.get("message") or (errs[0].get("message") if errs and isinstance(errs[0], dict) else "")
+                        if msg:
+                            detail = f"HTTP {exc.code}: {msg}"
                 except Exception:
                     pass
-                raise BrokerError(detail)
-            return resp.json() if resp.content else {}
+                raise BrokerHttpError(exc.code, detail) from exc
+        return {}
 
-        data_bytes = json.dumps(payload).encode("utf-8") if payload is not None else None
-        req = urllib.request.Request(url, data=data_bytes, headers=headers, method=method)
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            raw = resp.read().decode("utf-8")
-            return json.loads(raw) if raw.strip() else {}
+    @staticmethod
+    def _is_ambiguous_exception(exc: Exception) -> bool:
+        if isinstance(exc, AmbiguousSubmissionError):
+            return True
+        if isinstance(exc, BrokerHttpError):
+            return exc.status_code >= 500 or exc.status_code == 429
+        if isinstance(exc, (TimeoutError, ConnectionError, OSError, urllib.error.URLError)):
+            return not isinstance(exc, urllib.error.HTTPError)
+        if requests is not None and isinstance(
+            exc,
+            (
+                requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.ChunkedEncodingError,
+            ),
+        ):
+            return True
+        status_attr = getattr(exc, "status", None) or getattr(exc, "status_code", None)
+        if isinstance(status_attr, int) and (status_attr >= 500 or status_attr == 429):
+            return True
+        return False
 
     def place_order(self, order: OrderRequest) -> Optional[BrokerOrder]:
         try:
@@ -430,12 +483,15 @@ class UpstoxBroker(BrokerBase):
 
         # Canonical direction mapping: BUY/COVER -> BUY, SELL/SHORT -> SELL
         txn_type = "BUY" if order.side in {"BUY", "COVER"} else "SELL"
+        unique_tag = make_broker_tag(order.client_order_id, max_len=20) or (order.tag or "")[:20] or None
+        if unique_tag:
+            order.tag = unique_tag
         payload = {
             "quantity": int(order.quantity),
             "product": normalized_product,
             "validity": order.validity,
             "price": float(order.price or 0.0),
-            "tag": (order.tag or order.client_order_id or "")[:40] or None,
+            "tag": unique_tag,
             "slice": True,
             "instrument_token": order.instrument_key or f"{exchange}_EQ|{order.symbol}",
             "order_type": order.order_type,
@@ -446,6 +502,7 @@ class UpstoxBroker(BrokerBase):
         }
 
         if self._sdk is not None and self._order_api is not None:
+            self._rate_limiter.acquire(timeout=3.0)
             try:
                 resp = self._order_api.place_order(payload)
                 data_obj = _safe_get(resp, "data", resp)
@@ -456,11 +513,15 @@ class UpstoxBroker(BrokerBase):
                     order_id=oid,
                     request=order,
                     status=self._upstox_status(_safe_get(data_obj, "status") or "PENDING"),
-                    raw=resp if isinstance(resp, dict) else {"order_ids": order_ids or [oid], "payload": payload},
+                    raw=resp if isinstance(resp, dict) else {"order_ids": order_ids or [oid], "payload": payload, "tag": unique_tag},
                 )
                 self._orders.append(broker_order)
                 return broker_order
             except Exception as exc:
+                if self._is_ambiguous_exception(exc):
+                    raise AmbiguousSubmissionError(
+                        f"Upstox order submission uncertain for {order.client_order_id}: {exc}"
+                    ) from exc
                 return BrokerOrder(
                     order_id=order.client_order_id,
                     request=order,
@@ -479,11 +540,15 @@ class UpstoxBroker(BrokerBase):
                 order_id=oid,
                 request=order,
                 status=self._upstox_status(data_obj.get("status") or "PENDING"),
-                raw={"response": raw_resp, "payload": payload},
+                raw={"response": raw_resp, "payload": payload, "tag": unique_tag},
             )
             self._orders.append(broker_order)
             return broker_order
         except Exception as exc:
+            if self._is_ambiguous_exception(exc):
+                raise AmbiguousSubmissionError(
+                    f"Upstox order submission uncertain for {order.client_order_id}: {exc}"
+                ) from exc
             return BrokerOrder(
                 order_id=order.client_order_id,
                 request=order,

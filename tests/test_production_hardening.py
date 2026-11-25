@@ -27,14 +27,17 @@ from backtest.base import BacktestStrategy
 from backtest.engine import BacktestEngine, compute_sharpe_metrics
 from broker.base import (
     AccountBalance,
+    AmbiguousSubmissionError,
     BrokerBase,
     BrokerCapabilities,
     BrokerHealthSnapshot,
     BrokerOrder,
     BrokerPosition,
     ConnectionState,
+    ExecutionFill,
     OrderRequest,
     OrderStatus,
+    make_broker_tag,
 )
 from broker.upstox.broker import UpstoxBroker
 from broker.zerodha.broker import ZerodhaBroker
@@ -48,7 +51,7 @@ from execution.oms import OrderManagementSystem
 from notifications.telegram import TelegramNotifier
 from risk.limits import RiskLimitManager, RiskWatchdog
 from web.local_server import _StdlibBrokerHandler
-from web.security import SecurityManager, is_live_trading_enabled, validate_python_plugin_ast
+from web.security import RateLimitError, SecurityManager, is_live_trading_enabled, validate_python_plugin_ast
 
 
 class _FakeJsonResp(io.BytesIO):
@@ -1006,6 +1009,573 @@ class SafeStrat(BacktestStrategy):
 
         self.assertEqual(len(seen_kite_reqs), 1)
         self.assertEqual(k_funds["available"], 180000.0)
+
+    # ── Test 14 (C-01): Duplicate Exits Eliminated While Exit Order OPEN ──
+    def test_14_c01_duplicate_exit_eliminated_while_exit_order_open(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            audit = AuditTrail(tmp / "audit.db")
+            oms = OrderManagementSystem(db_path=tmp / "oms.db", audit=audit)
+            ks = KillSwitchController(state_file=tmp / "ks.json", audit=audit)
+            risk = RiskLimitManager(limits_file=tmp / "risk.json", kill_switch=ks, audit=audit)
+            broker = _StubBroker()
+            broker.mode = "open"  # Broker acknowledges order as OPEN (not yet filled)
+
+            mgr = DeploymentManager(
+                db_path=tmp / "dep.db",
+                oms=oms,
+                kill_switch=ks,
+                risk_mgr=risk,
+                audit=audit,
+                broker_resolver=lambda _bid: broker,
+                require_live_env_lock=False,
+            )
+            with patch.object(mgr, "_refresh_deploy_ws_scope", return_value=None):
+                dep = mgr.deploy(
+                    name="Duplicate Exit Guard",
+                    exec_mode="live_auto",
+                    strategy_id="ema_crossover",
+                    symbols=["RELIANCE"],
+                    exchange="NSE",
+                    timeframe="1day",
+                    initial_capital=100000.0,
+                    stop_loss_pct=2.0,
+                    start_worker=False,
+                )
+            did = dep["deployment"]["id"]
+            # Inject an existing live LONG position with stop-loss at 980
+            with mgr._lock:
+                rt = mgr._runtime[did]
+                rt["status"] = "RUNNING"
+                rt["positions"]["RELIANCE"] = {
+                    "qty": 10,
+                    "entry_price": 1000.0,
+                    "entry_at_ist": datetime.now(tz=IST_TZ).isoformat(timespec="seconds"),
+                    "last_price": 1000.0,
+                    "highest_price": 1000.0,
+                    "entry_charges": 0.0,
+                }
+
+            now_iso = datetime.now(tz=IST_TZ).isoformat(timespec="seconds")
+            # Fire 5 consecutive ticks below stop-loss while broker exit order stays OPEN
+            for _ in range(5):
+                mgr.process_ticks(
+                    did,
+                    {"RELIANCE": {"ltp": 970.0, "volume": 1000, "ts_ist": now_iso}},
+                )
+
+            sell_calls = [c for c in broker.place_calls if c.side.upper() == "SELL"]
+            self.assertEqual(len(sell_calls), 1, f"Expected strictly 1 SELL exit, got {len(sell_calls)}")
+            self.assertTrue(oms.has_active_order(did, "RELIANCE"))
+
+    # ── Test 15 (C-02): Ambiguous Network Failure -> SUBMITTED + Tag Recovery ─
+    def test_15_c02_ambiguous_network_failure_and_tag_recovery(self) -> None:
+        # 1) UpstoxBroker: TimeoutError raises AmbiguousSubmissionError; HTTP 400 returns REJECTED
+        ub = UpstoxBroker(access_token="tok-u")
+        ub._connected = True
+        ub._sdk = None
+        ub._order_api = None
+
+        with patch("urllib.request.urlopen", side_effect=TimeoutError("read timed out")):
+            with self.assertRaises(AmbiguousSubmissionError):
+                ub.place_order(
+                    OrderRequest(
+                        symbol="RELIANCE",
+                        exchange="NSE",
+                        side="BUY",
+                        quantity=2,
+                        client_order_id="cid-upx-ambig-001",
+                    )
+                )
+
+        def fake_http_400(req, timeout=8):
+            raise urllib.error.HTTPError(
+                req.full_url,
+                400,
+                "Bad Request",
+                hdrs=None,
+                fp=io.BytesIO(b'{"errors":[{"message":"Invalid quantity"}]}'),
+            )
+
+        with patch("urllib.request.urlopen", side_effect=fake_http_400):
+            rej_u = ub.place_order(
+                OrderRequest(symbol="RELIANCE", exchange="NSE", side="BUY", quantity=2, client_order_id="cid-upx-400")
+            )
+        self.assertEqual(rej_u.status, OrderStatus.REJECTED)
+        self.assertIn("Invalid quantity", rej_u.rejection_reason)
+
+        # 2) ZerodhaBroker: TimeoutError raises AmbiguousSubmissionError; explicit 4xx returns REJECTED
+        zb = ZerodhaBroker(access_token="tok-z")
+        zb._connected = True
+        zb._kite = None
+        with patch("urllib.request.urlopen", side_effect=TimeoutError("socket timeout")):
+            with self.assertRaises(AmbiguousSubmissionError):
+                zb.place_order(
+                    OrderRequest(symbol="TCS", exchange="NSE", side="BUY", quantity=1, client_order_id="cid-z-ambig-001")
+                )
+
+        with patch("urllib.request.urlopen", side_effect=fake_http_400):
+            rej_z = zb.place_order(
+                OrderRequest(symbol="TCS", exchange="NSE", side="BUY", quantity=1, client_order_id="cid-z-400")
+            )
+        self.assertEqual(rej_z.status, OrderStatus.REJECTED)
+
+        # 3) OMS handles AmbiguousSubmissionError -> SUBMITTED (uncertain), then recovers via broker tag!
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            audit = AuditTrail(tmp / "audit.db")
+            sent_alerts: List[str] = []
+            notifier = TelegramNotifier(
+                settings_file=tmp / "tg.json",
+                sender=lambda _tok, _cid, txt: sent_alerts.append(txt) or {"ok": True},
+            )
+            notifier.save_settings({"enabled": True, "chat_id": "999999"})
+            oms = OrderManagementSystem(db_path=tmp / "oms.db", audit=audit, notifier=notifier)
+
+            class _AmbiguousTagBroker(_StubBroker):
+                def place_order(self, order: OrderRequest) -> Optional[BrokerOrder]:
+                    self.place_calls.append(order)
+                    tag = make_broker_tag(order.client_order_id)
+                    # Broker actually executed the order under the shortened 20-char tag,
+                    # but dropped the HTTP response!
+                    self.broker_orders.append(
+                        BrokerOrder(
+                            order_id="BRK-TAG-777",
+                            request=OrderRequest(
+                                symbol=order.symbol,
+                                exchange=order.exchange,
+                                side=order.side,
+                                quantity=order.quantity,
+                                price=order.price,
+                                client_order_id=tag,
+                            ),
+                            status=OrderStatus.FILLED,
+                            filled_quantity=order.quantity,
+                            average_fill_price=1505.0,
+                            raw={"tag": tag},
+                        )
+                    )
+                    raise AmbiguousSubmissionError("Gateway 504 after dispatch")
+
+            ambig_broker = _AmbiguousTagBroker()
+            cid = "dep-long-client-order-id-20261124-0001"
+            req = OrderRequest(
+                symbol="INFY",
+                exchange="NSE",
+                side="BUY",
+                quantity=4,
+                order_type="MARKET",
+                product="MIS",
+                price=1500.0,
+                client_order_id=cid,
+            )
+            rec, delta, _ = oms.submit_order(req, ambig_broker, deployment_id="dep-c02", exec_mode="live_auto")
+            self.assertEqual(rec["status"], OrderStatus.SUBMITTED.value)
+            self.assertNotEqual(rec["status"], OrderStatus.REJECTED.value)
+            self.assertEqual(delta, 0)
+            self.assertTrue(any("ORDER_UNCERTAIN" in m for m in sent_alerts))
+
+            # Reconcile recovers the filled order using make_broker_tag matching
+            rec_res = oms.reconcile_orders(ambig_broker, deployment_id="dep-c02")
+            self.assertEqual(len(rec_res["fills_applied"]), 1)
+            self.assertEqual(rec_res["fills_applied"][0]["delta_qty"], 4)
+            stored = oms.get_order_by_client_id(cid)
+            self.assertEqual(stored["status"], OrderStatus.FILLED.value)
+            self.assertEqual(stored["broker_order_id"], "BRK-TAG-777")
+            self.assertAlmostEqual(stored["average_fill_price"], 1505.0)
+
+    # ── Test 16 (C-03): Risk Entry vs Exit Split & Fail-Closed Kill Switch ──
+    def test_16_c03_risk_entry_vs_exit_split_and_fail_closed_kill_switch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            audit = AuditTrail(tmp / "audit.db")
+            ks_file = tmp / "ks.json"
+            ks = KillSwitchController(state_file=ks_file, audit=audit)
+            risk = RiskLimitManager(limits_file=tmp / "risk.json", kill_switch=ks, audit=audit)
+            risk.save_limits({"total_capital_inr": 100000.0, "max_capital_per_trade_pct": 15.0})
+
+            # Engage kill switch AND test notional (₹50,000) way above 15% cap (₹15,000)
+            ks.engage(reason="Emergency test halt")
+            entry_chk = risk.validate_order(symbol="RELIANCE", quantity=20, price=2500.0, transaction_type="BUY")
+            self.assertFalse(entry_chk["allowed"])
+
+            exit_chk = risk.validate_order(
+                symbol="RELIANCE",
+                quantity=20,
+                price=2500.0,
+                transaction_type="SELL",
+                open_position_qty=20,
+            )
+            self.assertTrue(exit_chk["allowed"], f"Exit must never be blocked by kill switch/cap: {exit_chk}")
+
+            # Exit quantity > open position must be blocked to prevent flipping short
+            flip_chk = risk.check_exit(
+                symbol="RELIANCE",
+                quantity=25,
+                price=2500.0,
+                transaction_type="SELL",
+                open_position_qty=20,
+            )
+            self.assertFalse(flip_chk["allowed"])
+            self.assertTrue(any("flip" in r.lower() for r in flip_chk["reasons"]))
+
+            # Corrupted kill-switch JSON file MUST fail closed (engaged=True, corrupted=True)
+            ks.reset()
+            self.assertFalse(ks.is_engaged())
+            ks_file.write_text("{corrupt json not parseable", encoding="utf-8")
+            st = ks.status()
+            self.assertTrue(st["engaged"])
+            self.assertTrue(st.get("corrupted"))
+            self.assertTrue(ks.is_engaged())
+
+    # ── Test 17 (C-05/C-06): Auth-by-Default, Bootstrap Code, Lockout & AST ──
+    def test_17_c05_c06_auth_by_default_bootstrap_secret_rate_limit_and_plugin_ast(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            sec = SecurityManager(
+                auth_file=tmp / ".admin_auth.json",
+                bootstrap_file=tmp / ".bootstrap_code",
+            )
+            env_clean = {k: v for k, v in os.environ.items() if k not in {"ALGODESK_REQUIRE_AUTH", "ALGODESK_API_TOKEN"}}
+            with patch.dict(os.environ, env_clean, clear=True):
+                # Auth is enforced by default even before passcode claim
+                self.assertTrue(sec.is_auth_enforced())
+                self.assertTrue(sec.is_protected_request("GET", "/api/overview"))
+                self.assertTrue(sec.is_protected_request("POST", "/api/streak/deployments/reconcile"))
+                self.assertFalse(sec.is_protected_request("GET", "/api/health"))
+                self.assertFalse(sec.is_protected_request("GET", "/api/security/status"))
+                self.assertFalse(sec.is_protected_request("POST", "/api/security/login"))
+                self.assertFalse(sec.is_protected_request("POST", "/api/security/claim"))
+
+                # Bootstrap secret created with 0o600 and required to claim passcode
+                code = sec.ensure_bootstrap_code()
+                self.assertIsNotNone(code)
+                self.assertTrue((tmp / ".bootstrap_code").exists())
+
+                with self.assertRaises(PermissionError):
+                    sec.claim_passcode("strong-pass-2026", bootstrap_code="WRONG-CODE", client_key="10.0.0.1")
+
+                claimed = sec.claim_passcode("strong-pass-2026", bootstrap_code=code, client_key="10.0.0.1")
+                self.assertTrue(claimed["ok"])
+                self.assertFalse((tmp / ".bootstrap_code").exists())
+
+                # 5 failed logins trigger sliding-window RateLimitError (HTTP 429)
+                for _ in range(5):
+                    with self.assertRaises(PermissionError):
+                        sec.login("wrong-pass-attempt", client_key="10.0.0.2")
+                with self.assertRaises(RateLimitError):
+                    sec.login("strong-pass-2026", client_key="10.0.0.2")
+
+                # Live HTTP check: GET /api/overview -> 401 without token; GET /api/health -> 200
+                with patch("web.local_server.security_manager", sec):
+                    srv = ThreadingHTTPServer(("127.0.0.1", 0), _StdlibBrokerHandler)
+                    port = srv.server_address[1]
+                    th = threading.Thread(target=srv.serve_forever, daemon=True)
+                    th.start()
+                    try:
+                        with urllib.request.urlopen(f"http://127.0.0.1:{port}/api/health", timeout=4) as r:
+                            self.assertEqual(r.status, 200)
+                        with self.assertRaises(urllib.error.HTTPError) as ctx_401:
+                            urllib.request.urlopen(f"http://127.0.0.1:{port}/api/overview", timeout=4)
+                        self.assertEqual(ctx_401.exception.code, 401)
+                    finally:
+                        srv.shutdown()
+                        srv.server_close()
+
+        # Strengthened AST checks block getattr, allow_pickle, read_pickle, and dunder access
+        for bad_snippet in [
+            "x = getattr(obj, 'foo')",
+            "import numpy as np\narr = np.load('a.npy', allow_pickle=True)",
+            "import pandas as pd\ndf = pd.read_pickle('a.pkl')",
+            "y = x.__dict__",
+        ]:
+            viols = validate_python_plugin_ast(bad_snippet, "audit_test.py")
+            self.assertTrue(len(viols) > 0, f"Expected AST violation for: {bad_snippet}")
+
+    # ── Test 18 (H-03): Position Reconciliation Halts Live Deployment ──────
+    def test_18_h03_position_reconciliation_halts_live_deployment_on_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            audit = AuditTrail(tmp / "audit.db")
+            oms = OrderManagementSystem(db_path=tmp / "oms.db", audit=audit)
+            ks = KillSwitchController(state_file=tmp / "ks.json", audit=audit)
+            risk = RiskLimitManager(limits_file=tmp / "risk.json", kill_switch=ks, audit=audit)
+            sent_alerts: List[str] = []
+            notifier = TelegramNotifier(
+                settings_file=tmp / "tg.json",
+                sender=lambda _tok, _cid, txt: sent_alerts.append(txt) or {"ok": True},
+            )
+            notifier.save_settings({"enabled": True, "chat_id": "888888"})
+
+            broker = _StubBroker()
+            # Broker actually holds 0 shares (e.g. manual square-off or missed fill), while AlgoDesk thinks +10
+            broker.broker_positions = []
+
+            mgr = DeploymentManager(
+                db_path=tmp / "dep.db",
+                oms=oms,
+                kill_switch=ks,
+                risk_mgr=risk,
+                audit=audit,
+                broker_resolver=lambda _bid: broker,
+                require_live_env_lock=False,
+            )
+            with patch.object(mgr, "_refresh_deploy_ws_scope", return_value=None):
+                dep = mgr.deploy(
+                    name="Mismatch Halt Test",
+                    exec_mode="live_auto",
+                    strategy_id="ema_crossover",
+                    symbols=["RELIANCE"],
+                    exchange="NSE",
+                    timeframe="1day",
+                    initial_capital=100000.0,
+                    start_worker=False,
+                )
+            did = dep["deployment"]["id"]
+            with mgr._lock:
+                mgr._runtime[did]["status"] = "RUNNING"
+                mgr._runtime[did]["positions"]["RELIANCE"] = {
+                    "qty": 10,
+                    "entry_price": 2500.0,
+                    "entry_at_ist": datetime.now(tz=IST_TZ).isoformat(timespec="seconds"),
+                    "last_price": 2500.0,
+                    "highest_price": 2500.0,
+                    "entry_charges": 0.0,
+                }
+
+            rec = mgr.reconcile_positions(broker_adapter=broker, notifier=notifier)
+            self.assertTrue(rec["ok"])
+            self.assertEqual(len(rec["mismatches"]), 1)
+            self.assertIn(did, rec["halted_deployments"])
+            self.assertEqual(mgr.get_deployment(did)["deployment"]["status"], "PAUSED")
+            self.assertTrue(any("POSITION_MISMATCH" in m for m in sent_alerts))
+            self.assertTrue(audit.verify_chain()["valid"])
+
+    # ── Test 19 (H-04): OMS Monotonic State Machine & Trade Price Attribution ─
+    def test_19_h04_oms_state_machine_monotonic_and_trade_price_attribution(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            audit = AuditTrail(tmp / "audit.db")
+            oms = OrderManagementSystem(db_path=tmp / "oms.db", audit=audit)
+
+            class _TradePriceBroker(_StubBroker):
+                def __init__(self) -> None:
+                    super().__init__()
+                    self.trades: List[ExecutionFill] = []
+
+                def get_trades(self) -> List[ExecutionFill]:
+                    return list(self.trades)
+
+            broker = _TradePriceBroker()
+            broker.mode = "partial_then_full"  # Initial fill: 30 @ 200.0
+            req = OrderRequest(
+                symbol="HDFCBANK",
+                exchange="NSE",
+                side="BUY",
+                quantity=100,
+                order_type="LIMIT",
+                product="CNC",
+                price=200.0,
+                client_order_id="cid-trade-px-001",
+            )
+            rec, delta1, px1 = oms.submit_order(req, broker, deployment_id="dep-tr", exec_mode="live_auto")
+            self.assertEqual(delta1, 30)
+            self.assertAlmostEqual(px1, 200.0)
+            self.assertAlmostEqual(oms.get_pending_exposure_inr(), 70 * 200.0)
+
+            # Second tranche: 70 shares filled at 210.0 -> overall broker average is 207.0,
+            # but per-fill trade record gives exact tranche price 210.0!
+            oid = rec["broker_order_id"]
+            broker.broker_orders[0].filled_quantity = 100
+            broker.broker_orders[0].average_fill_price = 207.0
+            broker.broker_orders[0].status = OrderStatus.FILLED
+            broker.trades = [
+                ExecutionFill(fill_id="T1", order_id=oid, symbol="HDFCBANK", exchange="NSE", side="BUY", quantity=30, price=200.0),
+                ExecutionFill(fill_id="T2", order_id=oid, symbol="HDFCBANK", exchange="NSE", side="BUY", quantity=70, price=210.0),
+            ]
+            r2 = oms.reconcile_orders(broker, deployment_id="dep-tr")
+            self.assertEqual(len(r2["fills_applied"]), 1)
+            self.assertEqual(r2["fills_applied"][0]["delta_qty"], 70)
+            self.assertAlmostEqual(r2["fills_applied"][0]["fill_price"], 210.0, places=2)
+
+            # Stale broker snapshot reporting OPEN / 30 filled MUST NOT reopen terminal FILLED order
+            broker.broker_orders[0].status = OrderStatus.OPEN
+            broker.broker_orders[0].filled_quantity = 30
+            r3 = oms.reconcile_orders(broker, deployment_id="dep-tr")
+            self.assertEqual(r3["fills_applied"], [])
+            stored = oms.get_order_by_client_id("cid-trade-px-001")
+            self.assertEqual(stored["status"], OrderStatus.FILLED.value)
+            self.assertEqual(stored["filled_quantity"], 100)
+
+    # ── Test 20 (H-05): Stale Quotes Block New Entries ─────────────────────
+    def test_20_h05_stale_quote_blocks_new_entries_with_one_shot_alert(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            audit = AuditTrail(tmp / "audit.db")
+            oms = OrderManagementSystem(db_path=tmp / "oms.db", audit=audit)
+            ks = KillSwitchController(state_file=tmp / "ks.json", audit=audit)
+            risk = RiskLimitManager(limits_file=tmp / "risk.json", kill_switch=ks, audit=audit)
+            sent_alerts: List[str] = []
+            notifier = TelegramNotifier(
+                settings_file=tmp / "tg.json",
+                sender=lambda _tok, _cid, txt: sent_alerts.append(txt) or {"ok": True},
+            )
+            notifier.save_settings({"enabled": True, "chat_id": "777777"})
+
+            broker = _StubBroker()
+            broker.mode = "open"
+            mgr = DeploymentManager(
+                db_path=tmp / "dep.db",
+                oms=oms,
+                kill_switch=ks,
+                risk_mgr=risk,
+                audit=audit,
+                notifier=notifier,
+                broker_resolver=lambda _bid: broker,
+                require_live_env_lock=False,
+            )
+            with patch.object(mgr, "_refresh_deploy_ws_scope", return_value=None):
+                dep = mgr.deploy(
+                    name="Stale Quote Guard",
+                    exec_mode="live_auto",
+                    strategy_id="ema_crossover",
+                    symbols=["RELIANCE"],
+                    exchange="NSE",
+                    timeframe="1day",
+                    initial_capital=100000.0,
+                    evaluation_mode="tick",
+                    start_worker=False,
+                )
+            did = dep["deployment"]["id"]
+            # Seed 6 historical bars so strategy evaluates immediately on incoming tick
+            seed_bars = [
+                {
+                    "ts_ist": f"2026-11-1{i}T09:15:00+05:30",
+                    "open": 2500.0,
+                    "high": 2510.0,
+                    "low": 2490.0,
+                    "close": 2505.0,
+                    "volume": 1000,
+                }
+                for i in range(1, 7)
+            ]
+            with mgr._lock:
+                rt = mgr._runtime[did]
+                rt["status"] = "RUNNING"
+                rt["sym_state"]["RELIANCE"] = {
+                    "base_bars": seed_bars,
+                    "forming_bar": None,
+                    "last_ltp": 2505.0,
+                    "last_sig_key": "",
+                    "last_eval_bar_ts": "",
+                    "indicator_eval_count": 0,
+                }
+
+            class _AlwaysBuyStrategy(BacktestStrategy):
+                id = "always_buy"
+                name = "Always Buy"
+
+                def prepare(self, candles, params, toolkit) -> None:
+                    pass
+
+                def signal_at(self, index: int, bar: Dict[str, Any]):
+                    return (True, False)
+
+            stale_ts = (datetime.now(tz=IST_TZ) - timedelta(seconds=120)).isoformat(timespec="seconds")
+            with patch.object(mgr, "_build_strategy", return_value=(_AlwaysBuyStrategy(), "python")):
+                r1 = mgr.process_ticks(did, {"RELIANCE": {"ltp": 2500.0, "volume": 100, "ts_ist": stale_ts}})
+                mgr.process_ticks(did, {"RELIANCE": {"ltp": 2501.0, "volume": 100, "ts_ist": stale_ts}})
+
+            # Entry blocked despite entry_sig=True; zero broker orders placed; one-shot STALE_QUOTE alert
+            self.assertEqual(broker.place_calls, [])
+            self.assertTrue(any(a.get("kind") == "blocked" for a in r1.get("actions", [])))
+            stale_alerts = [m for m in sent_alerts if "STALE_QUOTE" in m]
+            self.assertEqual(len(stale_alerts), 1)
+
+    # ── Test 21 (H-06): Watchdog Degraded Mode Blocks New Entries ──────────
+    def test_21_h06_watchdog_degraded_mode_after_consecutive_failures_blocks_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            audit = AuditTrail(tmp / "audit.db")
+            ks = KillSwitchController(state_file=tmp / "ks.json", audit=audit)
+            risk = RiskLimitManager(limits_file=tmp / "risk.json", kill_switch=ks, audit=audit)
+            sent_alerts: List[str] = []
+            notifier = TelegramNotifier(
+                settings_file=tmp / "tg.json",
+                sender=lambda _tok, _cid, txt: sent_alerts.append(txt) or {"ok": True},
+            )
+            notifier.save_settings({"enabled": True, "chat_id": "666666"})
+
+            def failing_provider():
+                raise RuntimeError("Broker API unreachable")
+
+            wd = RiskWatchdog(
+                risk_mgr=risk,
+                interval_sec=5.0,
+                notifier=notifier,
+                state_provider=failing_provider,
+                degraded_threshold=3,
+            )
+            self.assertFalse(wd.is_degraded)
+            for _ in range(3):
+                with self.assertRaises(RuntimeError):
+                    wd.run_once()
+            self.assertTrue(wd.is_degraded)
+            self.assertTrue(any("WATCHDOG_DEGRADED" in m for m in sent_alerts))
+
+            chk = risk.check_entry(symbol="TCS", quantity=1, price=3500.0, watchdog_degraded=wd.is_degraded)
+            self.assertFalse(chk["allowed"])
+            self.assertTrue(any("degraded" in r.lower() for r in chk["reasons"]))
+
+    # ── Test 22 (M-04): Warmup Failure Refuses RUNNING Status ──────────────
+    def test_22_m04_warmup_failure_refuses_running_and_surfaces_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            audit = AuditTrail(tmp / "audit.db")
+            oms = OrderManagementSystem(db_path=tmp / "oms.db", audit=audit)
+            ks = KillSwitchController(state_file=tmp / "ks.json", audit=audit)
+            risk = RiskLimitManager(limits_file=tmp / "risk.json", kill_switch=ks, audit=audit)
+            hist = HistoricalDataManager(db_path=tmp / "hist.db", parquet_dir=tmp / "pq")
+            mgr = DeploymentManager(
+                db_path=tmp / "dep.db",
+                hist_manager=hist,
+                oms=oms,
+                kill_switch=ks,
+                risk_mgr=risk,
+                audit=audit,
+                require_live_env_lock=False,
+            )
+
+            def broken_hist_fetcher(*_args, **_kwargs):
+                raise ConnectionError("Historical upstream down")
+
+            with patch.object(mgr, "_refresh_deploy_ws_scope", return_value=None):
+                dep = mgr.deploy(
+                    name="Warmup Fail Test",
+                    exec_mode="paper",
+                    strategy_id="ema_crossover",
+                    symbols=["RELIANCE"],
+                    exchange="NSE",
+                    timeframe="1day",
+                    initial_capital=100000.0,
+                    start_worker=True,
+                    hist_fetcher=broken_hist_fetcher,
+                )
+            did = dep["deployment"]["id"]
+            # Wait briefly for warmup worker thread to transition deployment to ERROR
+            deadline = time.time() + 4.0
+            final_status = None
+            while time.time() < deadline:
+                snap = mgr.get_deployment(did)["deployment"]
+                if snap["status"] == "ERROR":
+                    final_status = snap
+                    break
+                time.sleep(0.05)
+
+            self.assertIsNotNone(final_status, "Deployment with 100% warmup failure must transition to ERROR")
+            self.assertEqual(final_status["status"], "ERROR")
+            self.assertGreaterEqual(int(final_status.get("error_count") or 0), 1)
+            self.assertTrue(bool(final_status.get("last_error")))
 
 
 if __name__ == "__main__":
