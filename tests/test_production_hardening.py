@@ -640,6 +640,12 @@ class SafeStrat(BacktestStrategy):
             self.assertAlmostEqual(res["telemetry"]["pending_order_exposure_inr"], 50000.0)
             self.assertAlmostEqual(res["telemetry"]["gross_exposure_inr"], 94000.0)
 
+            # Verify send_test() delivers a TEST alert cleanly
+            test_res = notifier.send_test()
+            self.assertTrue(test_res["ok"])
+            self.assertTrue(test_res["sent"])
+            self.assertTrue(any("[AlgoDesk | TEST]" in a["text"] for a in sent_alerts))
+
     # ── Test 9: Multi-Exchange Calendar & Preflight (NSE vs MCX & Holidays) ─
     def test_09_multi_exchange_calendar_holidays_and_segment_margins(self) -> None:
         # 20:00 IST on a regular trading Thursday (2026-09-10): NSE closed, MCX open

@@ -111,6 +111,7 @@ class TelegramNotifier:
         return self.get_status()
 
     def get_status(self) -> Dict[str, Any]:
+        config.reload_if_changed()
         prefs = self.load_settings()
         token_configured = bool(config.TELEGRAM_BOT_TOKEN)
         chat_id = str(prefs.get("chat_id") or config.TELEGRAM_ALLOWED_CHAT_ID or "").strip()
@@ -132,6 +133,7 @@ class TelegramNotifier:
         }
 
     def send_message(self, text: str, *, event_type: str = "INFO", force: bool = False) -> Dict[str, Any]:
+        config.reload_if_changed()
         prefs = self.load_settings()
         ts = datetime.now(tz=IST_TZ).isoformat(timespec="seconds")
         if not force and not prefs.get("enabled", True):
@@ -179,6 +181,15 @@ class TelegramNotifier:
         except Exception as exc:
             logger.warning("Telegram sendMessage failed: %s", exc)
             return {"ok": False, "sent": False, "reason": str(exc)}
+
+    def send_test(self) -> Dict[str, Any]:
+        ts = datetime.now(tz=IST_TZ).strftime("%Y-%m-%d %H:%M:%S IST")
+        text = (
+            f"[AlgoDesk | TEST] Telegram alert channel verified.\n"
+            f"Time: {ts}\n"
+            f"Outbound HTTPS delivery is working."
+        )
+        return self.send_message(text, event_type="TEST", force=True)
 
     def notify_event(self, event_type: str, title: str, lines: List[str]) -> Dict[str, Any]:
         prefs = self.load_settings()
