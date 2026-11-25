@@ -736,6 +736,9 @@ export function CreateStrategyView({
                   />
                 </div>
               </div>
+              <p className="text-[11px] text-slate-500">
+                Leave any field at <span className="font-mono text-slate-400">0</span> to disable it and exit only on your indicator Exit Conditions.
+              </p>
 
               {mode !== 'python' && (
                 <div className="space-y-3 border-t border-slate-800 pt-3">

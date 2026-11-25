@@ -1583,6 +1583,108 @@ class SafeStrat(BacktestStrategy):
             self.assertGreaterEqual(int(final_status.get("error_count") or 0), 1)
             self.assertTrue(bool(final_status.get("last_error")))
 
+    # ── Test 23: Zero SL / TP / TSL Preserved (Never Replaced With Defaults) ─
+    def test_23_zero_sl_tp_tsl_preserved_through_http_and_backtest(self) -> None:
+        from http.server import ThreadingHTTPServer
+        from web import local_server
+
+        captured_kwargs: Dict[str, Any] = {}
+
+        def _fake_streak_bt(**kwargs):
+            captured_kwargs.update(kwargs)
+            return {
+                "ok": True,
+                "run_id": "bt-zero-test",
+                "deploy_spec": {
+                    "stop_loss_pct": kwargs["stop_loss_pct"],
+                    "take_profit_pct": kwargs["take_profit_pct"],
+                    "trailing_sl_pct": kwargs["trailing_sl_pct"],
+                },
+                "trades": [],
+            }
+
+        server = ThreadingHTTPServer(("127.0.0.1", 0), local_server._StdlibBrokerHandler)
+        port = server.server_address[1]
+        t = threading.Thread(target=server.serve_forever, daemon=True)
+        t.start()
+        try:
+            with patch.object(local_server.hub_service, "run_streak_backtest", side_effect=_fake_streak_bt), \
+                 patch.object(local_server._StdlibBrokerHandler, "_enforce_auth", return_value=True):
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{port}/api/streak/backtest",
+                    data=json.dumps(
+                        {
+                            "mode": "portfolio",
+                            "symbols": ["RELIANCE"],
+                            "strategy": "ema_crossover",
+                            "timeframe": "1day",
+                            "stop_loss_pct": 0,
+                            "take_profit_pct": 0,
+                            "trailing_sl_pct": 0,
+                            "slippage_bps": 0,
+                        }
+                    ).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    body = json.loads(resp.read().decode("utf-8"))
+        finally:
+            server.shutdown()
+            server.server_close()
+
+        self.assertTrue(body.get("ok"))
+        self.assertEqual(captured_kwargs["stop_loss_pct"], 0.0)
+        self.assertEqual(captured_kwargs["take_profit_pct"], 0.0)
+        self.assertEqual(captured_kwargs["trailing_sl_pct"], 0.0)
+        self.assertEqual(captured_kwargs["slippage_bps"], 0.0)
+
+        # Verify actual backtest engine produces zero SL/TP/TSL exits even on +/-25% swings
+        from backtest.engine import BacktestEngine
+
+        # Build 70 bars with big swings that would definitely trip 3% SL or 7% TP
+        prices = [100.0] * 30 + [102.0, 105.0, 110.0, 128.0, 88.0, 130.0, 85.0, 125.0, 120.0, 115.0] + [90.0] * 30
+        candles = []
+        d0 = date(2025, 1, 1)
+        for i, c in enumerate(prices):
+            day = (d0 + timedelta(days=i)).isoformat()
+            candles.append(
+                {
+                    "trade_date": day,
+                    "ts_ist": f"{day}T09:15:00+05:30",
+                    "open": c,
+                    "high": c * 1.05,
+                    "low": c * 0.95,
+                    "close": c,
+                    "volume": 100000,
+                }
+            )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            hist = HistoricalDataManager(db_path=tmp / "hist.db", parquet_dir=tmp / "pq")
+            eng = BacktestEngine(hist_manager=hist)
+            res = eng.run(
+                symbol="TESTZERO",
+                exchange="NSE",
+                strategy="ema_crossover",
+                params={"fast_period": 5, "slow_period": 15},
+                timeframe="1day",
+                from_date="2025-01-01",
+                to_date="2025-03-31",
+                stop_loss_pct=0.0,
+                take_profit_pct=0.0,
+                trailing_sl_pct=0.0,
+                fetcher=lambda *a, **k: candles,
+            )
+            self.assertGreaterEqual(len(res["trades"]), 1)
+            for tr in res["trades"]:
+                reason = str(tr.get("exit_reason") or "").upper()
+                self.assertNotIn("STOP_LOSS", reason)
+                self.assertNotIn("TAKE_PROFIT", reason)
+                self.assertNotIn("TRAILING_SL", reason)
+
 
 if __name__ == "__main__":
     unittest.main()
+

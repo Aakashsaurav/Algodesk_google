@@ -773,7 +773,10 @@ export function BacktestResultsView({
               symbols={result.symbols || [chartSymbol]}
               activeSymbol={chartSymbol}
               onSelectSymbol={(sym) => setSelectedSymbol(sym)}
+              exchange={result.deploy_spec?.exchange || 'NSE'}
               timeframe={result.timeframe || '1day'}
+              fromDate={result.from_date}
+              toDate={result.to_date}
               trades={activeTrades}
               onQuickOrder={onQuickOrder}
               height={320}

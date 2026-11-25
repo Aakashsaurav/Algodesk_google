@@ -1,6 +1,15 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useId, useMemo, useRef, useState } from 'react';
 import { apiFetch } from '../../utils/authClient';
-import { RefreshCw, TrendingUp } from 'lucide-react';
+import {
+  ChevronLeft,
+  ChevronRight,
+  Maximize2,
+  RefreshCw,
+  RotateCcw,
+  TrendingUp,
+  ZoomIn,
+  ZoomOut,
+} from 'lucide-react';
 import type { BacktestTradeRow } from './types';
 import type { QuickOrderTarget } from './QuickOrderModal';
 
@@ -22,6 +31,8 @@ interface CandlestickChartPanelProps {
   timeframe: string;
   onTimeframeChange?: (tf: string) => void;
   trades?: BacktestTradeRow[];
+  fromDate?: string;
+  toDate?: string;
   onQuickOrder?: (target: QuickOrderTarget) => void;
   height?: number;
   compactHeader?: boolean;
@@ -34,6 +45,10 @@ const CHART_TFS = [
   { id: '60minute', label: '1 Hour' },
   { id: '1day', label: '1 Day' },
 ];
+
+const MAX_LOADED_BARS = 3000;
+const MIN_VISIBLE_BARS = 10;
+const DEFAULT_VISIBLE_BARS = 100;
 
 function computeEma(bars: OhlcvBar[], period: number): Array<number | null> {
   if (bars.length < period) return bars.map(() => null);
@@ -50,6 +65,10 @@ function computeEma(bars: OhlcvBar[], period: number): Array<number | null> {
   return out;
 }
 
+function normalizeTs(value: string): string {
+  return (value || '').trim().replace('T', ' ').slice(0, 16);
+}
+
 export function CandlestickChartPanel({
   symbols,
   activeSymbol,
@@ -58,6 +77,8 @@ export function CandlestickChartPanel({
   timeframe,
   onTimeframeChange,
   trades = [],
+  fromDate,
+  toDate,
   onQuickOrder,
   height = 380,
   compactHeader = false,
@@ -68,6 +89,49 @@ export function CandlestickChartPanel({
   const [showEma20, setShowEma20] = useState(true);
   const [showEma50, setShowEma50] = useState(false);
   const [hoverIdx, setHoverIdx] = useState<number | null>(null);
+  const [hoverPriceY, setHoverPriceY] = useState<number | null>(null);
+  const [isDragging, setIsDragging] = useState(false);
+  const [viewRange, setViewRange] = useState<{ start: number; end: number }>({ start: 0, end: 0 });
+
+  const clipPathId = `candle-plot-${useId().replace(/:/g, '')}`;
+  const chartWrapRef = useRef<HTMLDivElement | null>(null);
+  const svgRef = useRef<SVGSVGElement | null>(null);
+  const viewRangeRef = useRef(viewRange);
+  const barsLenRef = useRef(0);
+  const wheelPanAccumRef = useRef(0);
+  const dragRef = useRef<{
+    pointerId: number;
+    startClientX: number;
+    startViewStart: number;
+    startViewEnd: number;
+    rectWidth: number;
+  } | null>(null);
+
+  viewRangeRef.current = viewRange;
+  barsLenRef.current = bars.length;
+
+  // SVG Layout Constants
+  const svgW = 760;
+  const svgH = height;
+  const padL = 14;
+  const padR = 66;
+  const padT = 16;
+  const padB = 26;
+  const volH = 56;
+  const priceH = svgH - padT - padB - volH - 10;
+  const plotW = svgW - padL - padR;
+
+  const computeDefaultRange = useCallback(
+    (total: number) => {
+      if (total <= 0) return { start: 0, end: 0 };
+      if (fromDate && toDate && total <= 180) {
+        return { start: 0, end: total };
+      }
+      const span = Math.min(total, DEFAULT_VISIBLE_BARS);
+      return { start: Math.max(0, total - span), end: total };
+    },
+    [fromDate, toDate]
+  );
 
   const fetchBars = useCallback(
     async (sym: string, tf: string, forceDownload = false) => {
@@ -76,23 +140,38 @@ export function CandlestickChartPanel({
       setLoading(true);
       setError('');
       try {
+        const params = new URLSearchParams({
+          symbol: clean,
+          exchange,
+          timeframe: tf,
+          view: 'full',
+          limit: String(MAX_LOADED_BARS),
+        });
+        if (fromDate) params.set('from_date', fromDate);
+        if (toDate) params.set('to_date', toDate);
+
         if (!forceDownload) {
-          const recRes = await apiFetch(
-            `/api/data/records?symbol=${encodeURIComponent(clean)}&exchange=${encodeURIComponent(exchange)}&timeframe=${encodeURIComponent(tf)}&view=full`
-          );
+          const recRes = await apiFetch(`/api/data/records?${params.toString()}`);
           if (recRes.ok) {
             const recBody = await recRes.json();
-            if (Array.isArray(recBody.rows) && recBody.rows.length >= 10) {
-              setBars(recBody.rows.slice(-90));
+            if (Array.isArray(recBody.rows) && recBody.rows.length >= 5) {
+              const loaded: OhlcvBar[] =
+                recBody.rows.length > MAX_LOADED_BARS
+                  ? recBody.rows.slice(-MAX_LOADED_BARS)
+                  : recBody.rows;
+              setBars(loaded);
+              setViewRange(computeDefaultRange(loaded.length));
+              setHoverIdx(null);
               setLoading(false);
               return;
             }
           }
         }
+
         // Gap-only download if not yet cached locally
-        const toIso = new Date().toISOString().slice(0, 10);
+        const toIso = toDate || new Date().toISOString().slice(0, 10);
         const lookbackMs = tf.includes('minute') ? 35 * 86400_000 : 180 * 86400_000;
-        const fromIso = new Date(Date.now() - lookbackMs).toISOString().slice(0, 10);
+        const fromIso = fromDate || new Date(Date.now() - lookbackMs).toISOString().slice(0, 10);
         const dlRes = await apiFetch('/api/data/download', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -106,19 +185,26 @@ export function CandlestickChartPanel({
         });
         const dlBody = await dlRes.json().catch(() => ({}));
         if (!dlRes.ok) throw new Error(dlBody.detail || `Could not load ${clean} candles.`);
-        const recRes2 = await apiFetch(
-          `/api/data/records?symbol=${encodeURIComponent(clean)}&exchange=${encodeURIComponent(exchange)}&timeframe=${encodeURIComponent(tf)}&view=full`
-        );
+
+        const recRes2 = await apiFetch(`/api/data/records?${params.toString()}`);
         const recBody2 = await recRes2.json().catch(() => ({}));
-        setBars(Array.isArray(recBody2.rows) ? recBody2.rows.slice(-90) : []);
+        const loaded2: OhlcvBar[] = Array.isArray(recBody2.rows)
+          ? recBody2.rows.length > MAX_LOADED_BARS
+            ? recBody2.rows.slice(-MAX_LOADED_BARS)
+            : recBody2.rows
+          : [];
+        setBars(loaded2);
+        setViewRange(computeDefaultRange(loaded2.length));
+        setHoverIdx(null);
       } catch (err) {
         setError(err instanceof Error ? err.message : 'Unable to load chart candles.');
         setBars([]);
+        setViewRange({ start: 0, end: 0 });
       } finally {
         setLoading(false);
       }
     },
-    [exchange]
+    [exchange, fromDate, toDate, computeDefaultRange]
   );
 
   useEffect(() => {
@@ -127,29 +213,141 @@ export function CandlestickChartPanel({
     }
   }, [activeSymbol, timeframe, fetchBars]);
 
-  const ema20 = useMemo(() => (showEma20 ? computeEma(bars, 20) : []), [bars, showEma20]);
-  const ema50 = useMemo(() => (showEma50 ? computeEma(bars, 50) : []), [bars, showEma50]);
+  // Clamp viewport whenever bar count changes
+  const clampedStart = Math.max(0, Math.min(viewRange.start, Math.max(0, bars.length - 1)));
+  const clampedEnd = Math.max(clampedStart + Math.min(bars.length, 1), Math.min(viewRange.end, bars.length));
+  const visibleBars = useMemo(
+    () => (bars.length > 0 ? bars.slice(clampedStart, clampedEnd) : []),
+    [bars, clampedStart, clampedEnd]
+  );
 
-  const activeBar = hoverIdx !== null && bars[hoverIdx] ? bars[hoverIdx] : bars[bars.length - 1] || null;
+  const zoomAt = useCallback((scaleFactor: number, anchorRatio = 0.5) => {
+    const total = barsLenRef.current;
+    if (total <= 1) return;
+    const minSpan = Math.min(total, MIN_VISIBLE_BARS);
+    setViewRange((prev) => {
+      const curStart = Math.max(0, Math.min(prev.start, total - 1));
+      const curEnd = Math.max(curStart + 1, Math.min(prev.end, total));
+      const curSpan = curEnd - curStart;
+      let nextSpan = Math.round(curSpan * scaleFactor);
+      if (scaleFactor < 1 && nextSpan >= curSpan) nextSpan = curSpan - 2;
+      if (scaleFactor > 1 && nextSpan <= curSpan) nextSpan = curSpan + 2;
+      nextSpan = Math.max(minSpan, Math.min(total, nextSpan));
+      if (nextSpan === curSpan) return prev;
+      const clampedAnchor = Math.max(0, Math.min(1, anchorRatio));
+      const anchorBar = curStart + clampedAnchor * curSpan;
+      let nextStart = Math.round(anchorBar - clampedAnchor * nextSpan);
+      nextStart = Math.max(0, Math.min(total - nextSpan, nextStart));
+      return { start: nextStart, end: nextStart + nextSpan };
+    });
+  }, []);
+
+  const panByBars = useCallback((deltaBars: number) => {
+    const total = barsLenRef.current;
+    if (total <= 1 || deltaBars === 0) return;
+    setViewRange((prev) => {
+      const curStart = Math.max(0, Math.min(prev.start, total - 1));
+      const curEnd = Math.max(curStart + 1, Math.min(prev.end, total));
+      const span = curEnd - curStart;
+      const nextStart = Math.max(0, Math.min(total - span, curStart + deltaBars));
+      if (nextStart === curStart) return prev;
+      return { start: nextStart, end: nextStart + span };
+    });
+  }, []);
+
+  const fitAll = useCallback(() => {
+    const total = barsLenRef.current;
+    if (total <= 0) return;
+    setViewRange({ start: 0, end: total });
+  }, []);
+
+  const resetView = useCallback(() => {
+    const total = barsLenRef.current;
+    setViewRange(computeDefaultRange(total));
+  }, [computeDefaultRange]);
+
+  // Attach non-passive wheel listener so mouse wheel / trackpad zoom doesn't scroll the page
+  useEffect(() => {
+    const el = chartWrapRef.current;
+    if (!el) return;
+    const handleWheel = (e: WheelEvent) => {
+      if (barsLenRef.current <= 1) return;
+      e.preventDefault();
+
+      const svgEl = svgRef.current;
+      const rect = svgEl ? svgEl.getBoundingClientRect() : el.getBoundingClientRect();
+      const relSvgX = rect.width > 0 ? ((e.clientX - rect.left) / rect.width) * svgW : svgW / 2;
+      const anchorRatio = Math.max(0, Math.min(1, (relSvgX - padL) / plotW));
+
+      // Horizontal trackpad scroll -> pan
+      if (Math.abs(e.deltaX) > Math.abs(e.deltaY) && !e.ctrlKey && !e.metaKey) {
+        const { start, end } = viewRangeRef.current;
+        const span = Math.max(1, end - start);
+        const barsPerPx = span / Math.max(120, rect.width * (plotW / svgW));
+        wheelPanAccumRef.current += e.deltaX * barsPerPx;
+        const whole = wheelPanAccumRef.current > 0
+          ? Math.floor(wheelPanAccumRef.current)
+          : Math.ceil(wheelPanAccumRef.current);
+        if (whole !== 0) {
+          wheelPanAccumRef.current -= whole;
+          panByBars(whole);
+        }
+        return;
+      }
+
+      // Vertical scroll or trackpad pinch -> zoom anchored at cursor
+      const rawDelta = e.deltaY;
+      if (rawDelta === 0) return;
+      const intensity = Math.min(1, Math.max(0.25, Math.abs(rawDelta) / 100));
+      const factor = rawDelta < 0 ? 1 - 0.18 * intensity : 1 + 0.22 * intensity;
+      zoomAt(factor, anchorRatio);
+    };
+
+    el.addEventListener('wheel', handleWheel, { passive: false });
+    return () => el.removeEventListener('wheel', handleWheel);
+  }, [panByBars, plotW, svgW, zoomAt]);
+
+  // Compute EMAs on FULL history so values never shift while zooming/panning
+  const ema20Full = useMemo(() => (showEma20 ? computeEma(bars, 20) : []), [bars, showEma20]);
+  const ema50Full = useMemo(() => (showEma50 ? computeEma(bars, 50) : []), [bars, showEma50]);
+  const ema20Visible = useMemo(
+    () => (showEma20 ? ema20Full.slice(clampedStart, clampedEnd) : []),
+    [ema20Full, showEma20, clampedStart, clampedEnd]
+  );
+  const ema50Visible = useMemo(
+    () => (showEma50 ? ema50Full.slice(clampedStart, clampedEnd) : []),
+    [ema50Full, showEma50, clampedStart, clampedEnd]
+  );
+
+  const activeFullIdx =
+    hoverIdx !== null && visibleBars[hoverIdx]
+      ? clampedStart + hoverIdx
+      : bars.length > 0
+        ? clampedEnd - 1
+        : -1;
+  const activeBar = activeFullIdx >= 0 ? bars[activeFullIdx] : null;
   const prevBar =
-    hoverIdx !== null && hoverIdx > 0
-      ? bars[hoverIdx - 1]
-      : bars.length >= 2
-        ? bars[bars.length - 2]
-        : activeBar;
+    activeFullIdx > 0 ? bars[activeFullIdx - 1] : activeBar;
   const chg = activeBar && prevBar ? activeBar.close - prevBar.close : 0;
   const chgPct = activeBar && prevBar && prevBar.close > 0 ? (chg / prevBar.close) * 100 : 0;
 
-  // Map trades to bar indices for EN / TP / SL markers
+  // Map trades to full bar indices for EN / TP / SL / EX markers
   const markersByBar = useMemo(() => {
     const map = new Map<number, Array<{ kind: 'EN' | 'TP' | 'SL' | 'EX'; price: number }>>();
     if (!trades.length || !bars.length) return map;
     const symTrades = trades.filter(
       (t) => !t.symbol || t.symbol.toUpperCase() === activeSymbol.toUpperCase()
     );
+    const isIntraday = timeframe.includes('minute');
     const findIdx = (dt: string) => {
-      const target = dt.slice(0, 10);
-      return bars.findIndex((b) => (b.trade_date || b.ts_ist.slice(0, 10)) >= target);
+      if (!dt) return -1;
+      const norm = normalizeTs(dt);
+      if (isIntraday && norm.length > 10) {
+        const idx = bars.findIndex((b) => normalizeTs(b.ts_ist || b.trade_date) >= norm);
+        if (idx >= 0) return idx;
+      }
+      const targetDate = dt.slice(0, 10);
+      return bars.findIndex((b) => (b.trade_date || b.ts_ist.slice(0, 10)) >= targetDate);
     };
     for (const tr of symTrades) {
       const eIdx = findIdx(tr.entry_date);
@@ -161,53 +359,56 @@ export function CandlestickChartPanel({
       const xIdx = findIdx(tr.exit_date);
       if (xIdx >= 0) {
         const reason = (tr.exit_reason || '').toUpperCase();
-        const k = reason.includes('TARGET') || reason.includes('TP') ? 'TP' : reason.includes('STOP') || reason.includes('SL') ? 'SL' : 'EX';
+        const k =
+          reason.includes('TARGET') || reason.includes('TP')
+            ? 'TP'
+            : reason.includes('STOP') || reason.includes('SL')
+              ? 'SL'
+              : 'EX';
         const arr = map.get(xIdx) || [];
         arr.push({ kind: k, price: tr.exit_price });
         map.set(xIdx, arr);
       }
     }
     return map;
-  }, [trades, bars, activeSymbol]);
+  }, [trades, bars, activeSymbol, timeframe]);
 
-  // SVG Layout Math
-  const svgW = 760;
-  const svgH = height;
-  const padL = 14;
-  const padR = 64;
-  const padT = 16;
-  const padB = 26;
-  const volH = 56;
-  const priceH = svgH - padT - padB - volH - 10;
-
+  // Dynamic Y-axis auto-scale based on visible bars
   const { minP, maxP, maxVol } = useMemo(() => {
-    if (!bars.length) return { minP: 0, maxP: 100, maxVol: 1 };
+    if (!visibleBars.length) return { minP: 0, maxP: 100, maxVol: 1 };
     let lo = Infinity;
     let hi = -Infinity;
     let mv = 1;
-    for (const b of bars) {
+    for (const b of visibleBars) {
       if (b.low < lo) lo = b.low;
       if (b.high > hi) hi = b.high;
       if (b.volume > mv) mv = b.volume;
     }
-    const pad = (hi - lo) * 0.08 || 1;
+    const pad = (hi - lo) * 0.1 || 1;
     return { minP: lo - pad, maxP: hi + pad, maxVol: mv };
-  }, [bars]);
+  }, [visibleBars]);
 
-  const plotW = svgW - padL - padR;
-  const stepX = bars.length > 0 ? plotW / Math.max(bars.length, 1) : 10;
-  const candleW = Math.max(2, Math.min(10, stepX * 0.65));
+  const stepX = visibleBars.length > 0 ? plotW / Math.max(visibleBars.length, 1) : 10;
+  const candleW = Math.max(1.5, Math.min(18, stepX * 0.68));
 
   const yForPrice = (p: number) =>
     padT + ((maxP - p) / Math.max(0.0001, maxP - minP)) * priceH;
 
+  const priceForY = (y: number) =>
+    maxP - ((y - padT) / Math.max(1, priceH)) * (maxP - minP);
+
   const buildLinePath = (series: Array<number | null>) => {
     const pts: string[] = [];
+    let drawing = false;
     series.forEach((v, i) => {
-      if (v === null) return;
+      if (v === null) {
+        drawing = false;
+        return;
+      }
       const x = padL + i * stepX + stepX / 2;
       const y = yForPrice(v);
-      pts.push(`${pts.length === 0 ? 'M' : 'L'}${x.toFixed(1)},${y.toFixed(1)}`);
+      pts.push(`${drawing ? 'L' : 'M'}${x.toFixed(1)},${y.toFixed(1)}`);
+      drawing = true;
     });
     return pts.join(' ');
   };
@@ -220,6 +421,37 @@ export function CandlestickChartPanel({
     }
     return out;
   }, [minP, maxP]);
+
+  const spansMultiYear = useMemo(() => {
+    if (visibleBars.length < 2) return false;
+    const firstY = (visibleBars[0].trade_date || visibleBars[0].ts_ist).slice(0, 4);
+    const lastY = (
+      visibleBars[visibleBars.length - 1].trade_date ||
+      visibleBars[visibleBars.length - 1].ts_ist
+    ).slice(0, 4);
+    return firstY !== lastY;
+  }, [visibleBars]);
+
+  const formatXLabel = (b: OhlcvBar) => {
+    const isIntraday = timeframe.includes('minute');
+    if (isIntraday && visibleBars.length <= 80 && b.ts_ist) {
+      return b.ts_ist.replace('T', ' ').slice(5, 16);
+    }
+    const d = b.trade_date || b.ts_ist.slice(0, 10);
+    return spansMultiYear ? d.slice(2) : d.slice(5);
+  };
+
+  const visibleCount = visibleBars.length;
+  const minSpan = Math.min(bars.length, MIN_VISIBLE_BARS);
+  const canPanLeft = clampedStart > 0;
+  const canPanRight = clampedEnd < bars.length;
+  const canZoomIn = visibleCount > minSpan;
+  const canZoomOut = visibleCount < bars.length;
+  const latestBar = bars.length > 0 ? bars[bars.length - 1] : null;
+  const latestInViewPriceRange =
+    latestBar !== null && latestBar.close >= minP && latestBar.close <= maxP;
+
+  const panStep = Math.max(3, Math.round(visibleCount * 0.25));
 
   return (
     <div className="flex flex-col overflow-hidden rounded-xl border border-slate-800 bg-[#111827]">
@@ -267,9 +499,9 @@ export function CandlestickChartPanel({
           )}
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-1.5">
           {onQuickOrder && activeSymbol && (
-            <div className="flex items-center gap-1">
+            <div className="mr-1 flex items-center gap-1">
               <button
                 type="button"
                 onClick={() => onQuickOrder({ symbol: activeSymbol, exchange, side: 'BUY', ltp: activeBar?.close })}
@@ -297,6 +529,66 @@ export function CandlestickChartPanel({
                 <option key={t.id} value={t.id}>{t.label}</option>
               ))}
             </select>
+          )}
+
+          {/* Pan & Zoom controls */}
+          {bars.length > 0 && (
+            <div className="flex items-center rounded-md border border-slate-700 bg-[#0b1120] p-0.5">
+              <button
+                type="button"
+                onClick={() => panByBars(-panStep)}
+                disabled={!canPanLeft}
+                title="Pan left (older bars)"
+                className="flex h-6 w-6 items-center justify-center rounded text-slate-300 hover:bg-slate-800 hover:text-white disabled:opacity-30"
+              >
+                <ChevronLeft className="h-3.5 w-3.5" />
+              </button>
+              <button
+                type="button"
+                onClick={() => panByBars(panStep)}
+                disabled={!canPanRight}
+                title="Pan right (newer bars)"
+                className="flex h-6 w-6 items-center justify-center rounded text-slate-300 hover:bg-slate-800 hover:text-white disabled:opacity-30"
+              >
+                <ChevronRight className="h-3.5 w-3.5" />
+              </button>
+              <span className="mx-0.5 h-3.5 w-px bg-slate-700" />
+              <button
+                type="button"
+                onClick={() => zoomAt(0.75, 0.5)}
+                disabled={!canZoomIn}
+                title="Zoom in (or scroll up)"
+                className="flex h-6 w-6 items-center justify-center rounded text-slate-300 hover:bg-slate-800 hover:text-white disabled:opacity-30"
+              >
+                <ZoomIn className="h-3.5 w-3.5" />
+              </button>
+              <button
+                type="button"
+                onClick={() => zoomAt(1.33, 0.5)}
+                disabled={!canZoomOut}
+                title="Zoom out (or scroll down)"
+                className="flex h-6 w-6 items-center justify-center rounded text-slate-300 hover:bg-slate-800 hover:text-white disabled:opacity-30"
+              >
+                <ZoomOut className="h-3.5 w-3.5" />
+              </button>
+              <button
+                type="button"
+                onClick={fitAll}
+                disabled={!canZoomOut}
+                title="Fit all loaded bars"
+                className="flex h-6 w-6 items-center justify-center rounded text-slate-300 hover:bg-slate-800 hover:text-white disabled:opacity-30"
+              >
+                <Maximize2 className="h-3 w-3" />
+              </button>
+              <button
+                type="button"
+                onClick={resetView}
+                title="Reset chart zoom (or double-click chart)"
+                className="flex h-6 w-6 items-center justify-center rounded text-slate-300 hover:bg-slate-800 hover:text-white"
+              >
+                <RotateCcw className="h-3 w-3" />
+              </button>
+            </div>
           )}
 
           <button
@@ -330,7 +622,11 @@ export function CandlestickChartPanel({
       </div>
 
       {/* Candlestick Canvas */}
-      <div className="relative bg-[#0b1120]" style={{ minHeight: height }}>
+      <div
+        ref={chartWrapRef}
+        className="relative bg-[#0b1120]"
+        style={{ minHeight: height }}
+      >
         {loading && bars.length === 0 ? (
           <div className="flex h-full min-h-[320px] items-center justify-center text-xs text-slate-400">
             Loading {activeSymbol} ({timeframe}) candlesticks...
@@ -352,188 +648,331 @@ export function CandlestickChartPanel({
             Select an instrument to render candlestick chart.
           </div>
         ) : (
-          <svg
-            viewBox={`0 0 ${svgW} ${svgH}`}
-            className="block w-full select-none"
-            onMouseLeave={() => setHoverIdx(null)}
-            onMouseMove={(e) => {
-              const rect = e.currentTarget.getBoundingClientRect();
-              const relX = ((e.clientX - rect.left) / rect.width) * svgW;
-              const idx = Math.floor((relX - padL) / stepX);
-              if (idx >= 0 && idx < bars.length) setHoverIdx(idx);
-            }}
-          >
-            {/* Horizontal grid & right Y-axis */}
-            {priceTicks.map((pt, i) => {
-              const y = yForPrice(pt);
-              return (
-                <g key={i}>
-                  <line x1={padL} y1={y} x2={svgW - padR} y2={y} stroke="#1e293b" strokeWidth="1" />
+          <>
+            <svg
+              ref={svgRef}
+              viewBox={`0 0 ${svgW} ${svgH}`}
+              className={`block w-full select-none touch-none ${
+                isDragging ? 'cursor-grabbing' : 'cursor-grab'
+              }`}
+              onDoubleClick={resetView}
+              onPointerDown={(e) => {
+                if (e.button !== 0 && e.pointerType === 'mouse') return;
+                const rect = e.currentTarget.getBoundingClientRect();
+                e.currentTarget.setPointerCapture(e.pointerId);
+                dragRef.current = {
+                  pointerId: e.pointerId,
+                  startClientX: e.clientX,
+                  startViewStart: clampedStart,
+                  startViewEnd: clampedEnd,
+                  rectWidth: Math.max(1, rect.width),
+                };
+                setIsDragging(true);
+                setHoverIdx(null);
+                setHoverPriceY(null);
+              }}
+              onPointerMove={(e) => {
+                const rect = e.currentTarget.getBoundingClientRect();
+                if (dragRef.current) {
+                  const d = dragRef.current;
+                  const dxPx = e.clientX - d.startClientX;
+                  const dxSvg = (dxPx / d.rectWidth) * svgW;
+                  const span = Math.max(1, d.startViewEnd - d.startViewStart);
+                  const barStepSvg = plotW / span;
+                  const barDelta = Math.round(-dxSvg / Math.max(0.5, barStepSvg));
+                  const nextStart = Math.max(
+                    0,
+                    Math.min(bars.length - span, d.startViewStart + barDelta)
+                  );
+                  setViewRange((prev) =>
+                    prev.start === nextStart && prev.end === nextStart + span
+                      ? prev
+                      : { start: nextStart, end: nextStart + span }
+                  );
+                  return;
+                }
+                const relX = ((e.clientX - rect.left) / Math.max(1, rect.width)) * svgW;
+                const relY = ((e.clientY - rect.top) / Math.max(1, rect.height)) * svgH;
+                const idx = Math.floor((relX - padL) / stepX);
+                if (idx >= 0 && idx < visibleBars.length) {
+                  setHoverIdx(idx);
+                } else {
+                  setHoverIdx(null);
+                }
+                if (relY >= padT && relY <= padT + priceH) {
+                  setHoverPriceY(relY);
+                } else {
+                  setHoverPriceY(null);
+                }
+              }}
+              onPointerUp={(e) => {
+                if (dragRef.current && dragRef.current.pointerId === e.pointerId) {
+                  try {
+                    e.currentTarget.releasePointerCapture(e.pointerId);
+                  } catch {
+                    // ignore if capture already released
+                  }
+                  dragRef.current = null;
+                  setIsDragging(false);
+                }
+              }}
+              onPointerCancel={() => {
+                dragRef.current = null;
+                setIsDragging(false);
+              }}
+              onPointerLeave={() => {
+                if (!dragRef.current) {
+                  setHoverIdx(null);
+                  setHoverPriceY(null);
+                }
+              }}
+            >
+              <defs>
+                <clipPath id={clipPathId}>
+                  <rect x={padL} y={padT} width={plotW} height={priceH} />
+                </clipPath>
+              </defs>
+
+              {/* Horizontal grid & right Y-axis */}
+              {priceTicks.map((pt, i) => {
+                const y = yForPrice(pt);
+                return (
+                  <g key={i}>
+                    <line x1={padL} y1={y} x2={svgW - padR} y2={y} stroke="#1e293b" strokeWidth="1" />
+                    <text
+                      x={svgW - padR + 6}
+                      y={y + 3}
+                      fill="#64748b"
+                      fontSize="10"
+                      fontFamily="IBM Plex Mono, monospace"
+                    >
+                      {pt.toFixed(1)}
+                    </text>
+                  </g>
+                );
+              })}
+
+              {/* Volume bars */}
+              {visibleBars.map((b, i) => {
+                const x = padL + i * stepX + (stepX - candleW) / 2;
+                const vh = (b.volume / Math.max(1, maxVol)) * volH;
+                const y = svgH - padB - vh;
+                const up = b.close >= b.open;
+                return (
+                  <rect
+                    key={`v-${clampedStart + i}`}
+                    x={x}
+                    y={y}
+                    width={candleW}
+                    height={Math.max(1, vh)}
+                    fill={up ? 'rgba(16, 185, 129, 0.25)' : 'rgba(239, 68, 68, 0.25)'}
+                  />
+                );
+              })}
+
+              {/* Candlesticks & Trade Markers */}
+              <g clipPath={`url(#${clipPathId})`}>
+                {visibleBars.map((b, i) => {
+                  const fullIdx = clampedStart + i;
+                  const cx = padL + i * stepX + stepX / 2;
+                  const x = cx - candleW / 2;
+                  const yHigh = yForPrice(b.high);
+                  const yLow = yForPrice(b.low);
+                  const yOpen = yForPrice(b.open);
+                  const yClose = yForPrice(b.close);
+                  const bodyTop = Math.min(yOpen, yClose);
+                  const bodyH = Math.max(1.5, Math.abs(yClose - yOpen));
+                  const up = b.close >= b.open;
+                  const color = up ? '#10b981' : '#ef4444';
+                  const barMarkers = markersByBar.get(fullIdx);
+                  return (
+                    <g key={`c-${fullIdx}`}>
+                      <line x1={cx} y1={yHigh} x2={cx} y2={yLow} stroke={color} strokeWidth="1.1" />
+                      <rect x={x} y={bodyTop} width={candleW} height={bodyH} fill={color} rx="0.5" />
+                      {barMarkers?.map((m, mi) => {
+                        const my = m.kind === 'EN' ? yLow + 12 + mi * 12 : yHigh - 8 - mi * 12;
+                        const fill =
+                          m.kind === 'EN' ? '#38bdf8' : m.kind === 'TP' ? '#10b981' : '#ef4444';
+                        return (
+                          <text
+                            key={`m-${mi}`}
+                            x={cx}
+                            y={Math.max(padT + 10, Math.min(padT + priceH - 4, my))}
+                            textAnchor="middle"
+                            fill={fill}
+                            fontSize="9"
+                            fontWeight="700"
+                            fontFamily="IBM Plex Mono, monospace"
+                          >
+                            {m.kind}
+                          </text>
+                        );
+                      })}
+                    </g>
+                  );
+                })}
+
+                {/* EMA Overlays */}
+                {showEma20 && ema20Visible.length > 0 && (
+                  <path
+                    d={buildLinePath(ema20Visible)}
+                    fill="none"
+                    stroke="#38bdf8"
+                    strokeWidth="1.4"
+                    opacity="0.9"
+                  />
+                )}
+                {showEma50 && ema50Visible.length > 0 && (
+                  <path
+                    d={buildLinePath(ema50Visible)}
+                    fill="none"
+                    stroke="#f59e0b"
+                    strokeWidth="1.4"
+                    opacity="0.85"
+                  />
+                )}
+              </g>
+
+              {/* Latest close horizontal dashed guide (only if in visible price range) */}
+              {latestBar && latestInViewPriceRange && (
+                <g>
+                  <line
+                    x1={padL}
+                    y1={yForPrice(latestBar.close)}
+                    x2={svgW - padR}
+                    y2={yForPrice(latestBar.close)}
+                    stroke="#38bdf8"
+                    strokeDasharray="3 3"
+                    strokeWidth="1"
+                    opacity="0.6"
+                  />
+                  <rect
+                    x={svgW - padR + 2}
+                    y={yForPrice(latestBar.close) - 9}
+                    width={60}
+                    height={18}
+                    rx="3"
+                    fill="#0284c7"
+                  />
                   <text
                     x={svgW - padR + 6}
-                    y={y + 3}
-                    fill="#64748b"
+                    y={yForPrice(latestBar.close) + 3}
+                    fill="#f8fafc"
                     fontSize="10"
+                    fontWeight="600"
                     fontFamily="IBM Plex Mono, monospace"
                   >
-                    {pt.toFixed(1)}
+                    {latestBar.close.toFixed(1)}
                   </text>
                 </g>
-              );
-            })}
+              )}
 
-            {/* Volume bars */}
-            {bars.map((b, i) => {
-              const x = padL + i * stepX + (stepX - candleW) / 2;
-              const vh = (b.volume / Math.max(1, maxVol)) * volH;
-              const y = svgH - padB - vh;
-              const up = b.close >= b.open;
-              return (
-                <rect
-                  key={`v-${i}`}
-                  x={x}
-                  y={y}
-                  width={candleW}
-                  height={Math.max(1, vh)}
-                  fill={up ? 'rgba(16, 185, 129, 0.25)' : 'rgba(239, 68, 68, 0.25)'}
-                />
-              );
-            })}
-
-            {/* Candlesticks */}
-            {bars.map((b, i) => {
-              const cx = padL + i * stepX + stepX / 2;
-              const x = cx - candleW / 2;
-              const yHigh = yForPrice(b.high);
-              const yLow = yForPrice(b.low);
-              const yOpen = yForPrice(b.open);
-              const yClose = yForPrice(b.close);
-              const bodyTop = Math.min(yOpen, yClose);
-              const bodyH = Math.max(1.5, Math.abs(yClose - yOpen));
-              const up = b.close >= b.open;
-              const color = up ? '#10b981' : '#ef4444';
-              const barMarkers = markersByBar.get(i);
-              return (
-                <g key={`c-${i}`}>
-                  <line x1={cx} y1={yHigh} x2={cx} y2={yLow} stroke={color} strokeWidth="1.1" />
-                  <rect x={x} y={bodyTop} width={candleW} height={bodyH} fill={color} rx="0.5" />
-                  {barMarkers?.map((m, mi) => {
-                    const my = m.kind === 'EN' ? yLow + 12 + mi * 12 : yHigh - 8 - mi * 12;
-                    const fill = m.kind === 'EN' ? '#38bdf8' : m.kind === 'TP' ? '#10b981' : '#ef4444';
-                    return (
+              {/* Hover crosshair (vertical + horizontal price guide) */}
+              {!isDragging && hoverIdx !== null && visibleBars[hoverIdx] && (
+                <g pointerEvents="none">
+                  <line
+                    x1={padL + hoverIdx * stepX + stepX / 2}
+                    y1={padT}
+                    x2={padL + hoverIdx * stepX + stepX / 2}
+                    y2={svgH - padB}
+                    stroke="#64748b"
+                    strokeDasharray="3 3"
+                    strokeWidth="1"
+                  />
+                  {hoverPriceY !== null && (
+                    <>
+                      <line
+                        x1={padL}
+                        y1={hoverPriceY}
+                        x2={svgW - padR}
+                        y2={hoverPriceY}
+                        stroke="#64748b"
+                        strokeDasharray="3 3"
+                        strokeWidth="1"
+                      />
+                      <rect
+                        x={svgW - padR + 2}
+                        y={hoverPriceY - 9}
+                        width={60}
+                        height={18}
+                        rx="3"
+                        fill="#1e293b"
+                        stroke="#475569"
+                        strokeWidth="0.7"
+                      />
                       <text
-                        key={`m-${mi}`}
-                        x={cx}
-                        y={Math.max(12, Math.min(padT + priceH - 4, my))}
-                        textAnchor="middle"
-                        fill={fill}
-                        fontSize="9"
-                        fontWeight="700"
+                        x={svgW - padR + 6}
+                        y={hoverPriceY + 3}
+                        fill="#e2e8f0"
+                        fontSize="9.5"
                         fontFamily="IBM Plex Mono, monospace"
                       >
-                        {m.kind}
+                        {priceForY(hoverPriceY).toFixed(1)}
                       </text>
-                    );
-                  })}
+                    </>
+                  )}
+                  <rect
+                    x={Math.min(svgW - padR - 110, Math.max(padL, padL + hoverIdx * stepX - 50))}
+                    y={svgH - padB + 4}
+                    width={106}
+                    height={18}
+                    rx="3"
+                    fill="#1e293b"
+                  />
+                  <text
+                    x={Math.min(svgW - padR - 57, Math.max(padL + 53, padL + hoverIdx * stepX + 3))}
+                    y={svgH - padB + 16}
+                    textAnchor="middle"
+                    fill="#e2e8f0"
+                    fontSize="9.5"
+                    fontFamily="IBM Plex Mono, monospace"
+                  >
+                    {(visibleBars[hoverIdx].ts_ist || visibleBars[hoverIdx].trade_date)
+                      .slice(0, 16)
+                      .replace('T', ' ')}
+                  </text>
                 </g>
-              );
-            })}
+              )}
 
-            {/* EMA Overlays */}
-            {showEma20 && ema20.length > 0 && (
-              <path d={buildLinePath(ema20)} fill="none" stroke="#38bdf8" strokeWidth="1.4" opacity="0.9" />
-            )}
-            {showEma50 && ema50.length > 0 && (
-              <path d={buildLinePath(ema50)} fill="none" stroke="#f59e0b" strokeWidth="1.4" opacity="0.85" />
-            )}
+              {/* Bottom X-axis labels */}
+              {visibleBars.map((b, i) => {
+                const stride = Math.max(1, Math.floor(visibleBars.length / 6));
+                if (i % stride !== 0 && i !== visibleBars.length - 1) return null;
+                const x = padL + i * stepX + stepX / 2;
+                return (
+                  <text
+                    key={`x-${clampedStart + i}`}
+                    x={x}
+                    y={svgH - 8}
+                    textAnchor="middle"
+                    fill="#64748b"
+                    fontSize="9.5"
+                    fontFamily="IBM Plex Mono, monospace"
+                  >
+                    {formatXLabel(b)}
+                  </text>
+                );
+              })}
+            </svg>
 
-            {/* Latest close horizontal dashed guide */}
-            {bars.length > 0 && (
-              <g>
-                <line
-                  x1={padL}
-                  y1={yForPrice(bars[bars.length - 1].close)}
-                  x2={svgW - padR}
-                  y2={yForPrice(bars[bars.length - 1].close)}
-                  stroke="#38bdf8"
-                  strokeDasharray="3 3"
-                  strokeWidth="1"
-                  opacity="0.6"
-                />
-                <rect
-                  x={svgW - padR + 2}
-                  y={yForPrice(bars[bars.length - 1].close) - 9}
-                  width={58}
-                  height={18}
-                  rx="3"
-                  fill="#0284c7"
-                />
-                <text
-                  x={svgW - padR + 6}
-                  y={yForPrice(bars[bars.length - 1].close) + 3}
-                  fill="#f8fafc"
-                  fontSize="10"
-                  fontWeight="600"
-                  fontFamily="IBM Plex Mono, monospace"
-                >
-                  {bars[bars.length - 1].close.toFixed(1)}
-                </text>
-              </g>
-            )}
-
-            {/* Hover crosshair */}
-            {hoverIdx !== null && bars[hoverIdx] && (
-              <g>
-                <line
-                  x1={padL + hoverIdx * stepX + stepX / 2}
-                  y1={padT}
-                  x2={padL + hoverIdx * stepX + stepX / 2}
-                  y2={svgH - padB}
-                  stroke="#64748b"
-                  strokeDasharray="3 3"
-                  strokeWidth="1"
-                />
-                <rect
-                  x={Math.min(svgW - padR - 110, Math.max(padL, padL + hoverIdx * stepX - 50))}
-                  y={svgH - padB + 4}
-                  width={106}
-                  height={18}
-                  rx="3"
-                  fill="#1e293b"
-                />
-                <text
-                  x={Math.min(svgW - padR - 57, Math.max(padL + 53, padL + hoverIdx * stepX + 3))}
-                  y={svgH - padB + 16}
-                  textAnchor="middle"
-                  fill="#e2e8f0"
-                  fontSize="9.5"
-                  fontFamily="IBM Plex Mono, monospace"
-                >
-                  {(bars[hoverIdx].ts_ist || bars[hoverIdx].trade_date).slice(0, 16).replace('T', ' ')}
-                </text>
-              </g>
-            )}
-
-            {/* Bottom X-axis labels */}
-            {bars.map((b, i) => {
-              const stride = Math.max(1, Math.floor(bars.length / 6));
-              if (i % stride !== 0 && i !== bars.length - 1) return null;
-              const x = padL + i * stepX + stepX / 2;
-              return (
-                <text
-                  key={`x-${i}`}
-                  x={x}
-                  y={svgH - 8}
-                  textAnchor="middle"
-                  fill="#64748b"
-                  fontSize="9.5"
-                  fontFamily="IBM Plex Mono, monospace"
-                >
-                  {(b.trade_date || b.ts_ist.slice(0, 10)).slice(5)}
-                </text>
-              );
-            })}
-          </svg>
+            {/* Compact interactive status footer */}
+            <div className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-800/80 bg-[#0b1120] px-3 py-1.5 font-mono text-[10px] text-slate-500">
+              <span>
+                Bars {clampedStart + 1}–{clampedEnd} of {bars.length}
+                {visibleBars.length > 0 && (
+                  <>
+                    {' · '}
+                    {(visibleBars[0].trade_date || visibleBars[0].ts_ist.slice(0, 10))} →{' '}
+                    {(visibleBars[visibleBars.length - 1].trade_date ||
+                      visibleBars[visibleBars.length - 1].ts_ist.slice(0, 10))}
+                  </>
+                )}
+              </span>
+              <span className="font-sans">
+                Scroll to zoom · Drag to pan · Double-click to reset
+              </span>
+            </div>
+          </>
         )}
       </div>
     </div>
