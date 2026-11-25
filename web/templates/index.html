@@ -583,7 +583,10 @@
         <a href="#analytics-console">Analytics</a>
         <a href="/terminal" style="color: var(--accent); font-weight: 600;">Live Terminal</a>
       </nav>
-      <button id="refreshBtn" class="btn btn-primary" type="button">Refresh Status</button>
+      <div style="display:flex; align-items:center; gap:8px;">
+        <button id="authUnlockBtn" class="btn" type="button">Unlock Session</button>
+        <button id="refreshBtn" class="btn btn-primary" type="button">Refresh Status</button>
+      </div>
     </div>
   </header>
 
@@ -1197,7 +1200,213 @@
     </div>
   </div>
 
+  <!-- Operator Authentication Modal (Fallback UI, in-memory Bearer token only) -->
+  <div id="operatorAuthBackdrop" class="modal-backdrop" role="dialog" aria-modal="true" aria-labelledby="operatorAuthTitle" style="z-index:200;">
+    <div class="modal" style="max-width:440px;">
+      <div class="modal-header">
+        <h3 id="operatorAuthTitle">Operator Session &amp; Safety Lock</h3>
+        <button id="operatorAuthCloseBtn" class="btn" type="button" style="padding:6px 10px;">Close</button>
+      </div>
+      <form id="operatorAuthForm" class="stack" style="margin-top:12px;">
+        <p id="operatorAuthDesc" class="hint" style="font-size:13px; color:#cbd5e1;">
+          Sign in with your admin passcode or ALGODESK_API_TOKEN to load broker and market connectivity.
+        </p>
+        <div id="operatorBootstrapWrap" class="field" style="display:none;">
+          <label for="operatorBootstrapInput">Server Bootstrap Code</label>
+          <input id="operatorBootstrapInput" type="text" placeholder="From server logs or data/.bootstrap_code" autocomplete="off" />
+        </div>
+        <div class="field">
+          <label id="operatorPassLabel" for="operatorPassInput">Operator Passcode or API Token</label>
+          <input id="operatorPassInput" type="password" placeholder="Enter passcode or token" autocomplete="off" />
+        </div>
+        <div id="operatorConfirmWrap" class="field" style="display:none;">
+          <label for="operatorConfirmInput">Confirm Passcode</label>
+          <input id="operatorConfirmInput" type="password" placeholder="Re-enter passcode" autocomplete="off" />
+        </div>
+        <div id="operatorAuthFeedback" class="feedback" role="status" aria-live="polite"></div>
+        <div style="display:flex; justify-content:space-between; align-items:center; gap:8px;">
+          <span class="hint">Token stays in browser memory only</span>
+          <button id="operatorAuthSubmitBtn" class="btn btn-primary" type="submit">Unlock</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
   <script>
+    (function installFallbackAuth() {
+      const nativeFetch = window.fetch.bind(window);
+      let sessionToken = null;
+      let secStatus = null;
+
+      const backdrop = document.getElementById('operatorAuthBackdrop');
+      const titleEl = document.getElementById('operatorAuthTitle');
+      const descEl = document.getElementById('operatorAuthDesc');
+      const bootWrap = document.getElementById('operatorBootstrapWrap');
+      const bootInput = document.getElementById('operatorBootstrapInput');
+      const passLabel = document.getElementById('operatorPassLabel');
+      const passInput = document.getElementById('operatorPassInput');
+      const confirmWrap = document.getElementById('operatorConfirmWrap');
+      const confirmInput = document.getElementById('operatorConfirmInput');
+      const fbEl = document.getElementById('operatorAuthFeedback');
+      const submitBtn = document.getElementById('operatorAuthSubmitBtn');
+      const unlockBtn = document.getElementById('authUnlockBtn');
+      const closeBtn = document.getElementById('operatorAuthCloseBtn');
+      const formEl = document.getElementById('operatorAuthForm');
+
+      function updateAuthUi() {
+        const needsClaim = Boolean(secStatus && secStatus.needs_claim);
+        const bootReq = Boolean(needsClaim && secStatus && secStatus.bootstrap_required);
+        titleEl.textContent = needsClaim ? 'Set Operator Admin Passcode' : 'Operator Session & Safety Lock';
+        descEl.textContent = needsClaim
+          ? 'Claim this AlgoDesk server by setting a local operator passcode (minimum 6 characters).'
+          : 'Sign in with your admin passcode or ALGODESK_API_TOKEN to load broker and market connectivity.';
+        bootWrap.style.display = bootReq ? 'flex' : 'none';
+        confirmWrap.style.display = needsClaim ? 'flex' : 'none';
+        passLabel.textContent = needsClaim
+          ? 'New Operator Passcode'
+          : (secStatus && secStatus.has_env_token ? 'API Token or Passcode' : 'Operator Passcode');
+        submitBtn.textContent = needsClaim ? 'Claim & Unlock' : 'Unlock';
+        if (unlockBtn) {
+          unlockBtn.textContent = sessionToken ? 'Session Unlocked' : 'Unlock Session';
+        }
+      }
+
+      async function refreshSecStatus() {
+        try {
+          const res = await nativeFetch('/api/security/status');
+          if (res.ok) {
+            secStatus = await res.json();
+            updateAuthUi();
+          }
+        } catch (_) {}
+        return secStatus;
+      }
+
+      function openAuthModal(reason) {
+        if (reason) {
+          fbEl.className = 'feedback err';
+          fbEl.textContent = reason;
+        } else {
+          fbEl.className = 'feedback';
+          fbEl.textContent = '';
+        }
+        backdrop.classList.add('open');
+        void refreshSecStatus();
+        setTimeout(() => {
+          if (bootWrap.style.display !== 'none') bootInput.focus();
+          else passInput.focus();
+        }, 40);
+      }
+
+      function closeAuthModal() {
+        backdrop.classList.remove('open');
+      }
+
+      window.__algodeskOpenAuthModal = openAuthModal;
+      window.__algodeskHasToken = () => Boolean(sessionToken);
+
+      if (unlockBtn) unlockBtn.addEventListener('click', () => openAuthModal(''));
+      if (closeBtn) closeBtn.addEventListener('click', closeAuthModal);
+
+      formEl.addEventListener('submit', async (ev) => {
+        ev.preventDefault();
+        fbEl.className = 'feedback';
+        fbEl.textContent = '';
+        const needsClaim = Boolean(secStatus && secStatus.needs_claim);
+        const bootReq = Boolean(needsClaim && secStatus && secStatus.bootstrap_required);
+        const pass = passInput.value;
+        if (needsClaim) {
+          if (bootReq && !bootInput.value.trim()) {
+            fbEl.className = 'feedback err';
+            fbEl.textContent = 'Enter the server bootstrap code from logs or data/.bootstrap_code.';
+            return;
+          }
+          if (pass.trim().length < 6) {
+            fbEl.className = 'feedback err';
+            fbEl.textContent = 'Passcode must be at least 6 characters.';
+            return;
+          }
+          if (pass !== confirmInput.value) {
+            fbEl.className = 'feedback err';
+            fbEl.textContent = 'Passcodes do not match.';
+            return;
+          }
+        } else if (!pass.trim()) {
+          fbEl.className = 'feedback err';
+          fbEl.textContent = 'Enter your admin passcode or API token.';
+          return;
+        }
+
+        submitBtn.disabled = true;
+        try {
+          const url = needsClaim ? '/api/security/claim' : '/api/security/login';
+          const payload = needsClaim
+            ? { passcode: pass, ...(bootInput.value.trim() ? { bootstrap_code: bootInput.value.trim() } : {}) }
+            : { passcode: pass };
+          const res = await nativeFetch(url, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+          });
+          const body = await res.json().catch(() => ({}));
+          if (!res.ok) {
+            fbEl.className = 'feedback err';
+            fbEl.textContent = body.detail || 'Authentication failed.';
+            return;
+          }
+          if (body.token) sessionToken = String(body.token).trim();
+          if (body.status) secStatus = body.status;
+          passInput.value = '';
+          confirmInput.value = '';
+          bootInput.value = '';
+          updateAuthUi();
+          fbEl.className = 'feedback ok';
+          fbEl.textContent = 'Session unlocked. Loading brokers...';
+          setTimeout(() => {
+            closeAuthModal();
+            if (typeof loadOverview === 'function') void loadOverview(true);
+            if (typeof loadLiveStatus === 'function') void loadLiveStatus();
+            if (typeof loadAnalyticsMetaP5 === 'function') void loadAnalyticsMetaP5(false);
+            if (typeof loadRiskStatusP5 === 'function') void loadRiskStatusP5();
+          }, 250);
+        } catch (err) {
+          fbEl.className = 'feedback err';
+          fbEl.textContent = err && err.message ? err.message : 'Unable to reach server.';
+        } finally {
+          submitBtn.disabled = false;
+        }
+      });
+
+      window.fetch = async function patchedFetch(input, init) {
+        const raw = typeof input === 'string' ? input : (input && input.url ? input.url : '');
+        const isApi = raw.startsWith('/api/') || raw.startsWith(window.location.origin + '/api/');
+        let nextInit = init;
+        if (isApi && sessionToken) {
+          const headers = new Headers((init && init.headers) || undefined);
+          if (!headers.has('Authorization')) {
+            headers.set('Authorization', 'Bearer ' + sessionToken);
+          }
+          nextInit = Object.assign({}, init || {}, { headers });
+        }
+        const res = await nativeFetch(input, nextInit);
+        if (isApi && res.status === 401 && !raw.includes('/api/security/')) {
+          let detail = 'Operator authentication required. Sign in with your admin passcode or ALGODESK_API_TOKEN.';
+          try {
+            const body = await res.clone().json();
+            if (body && body.detail) detail = body.detail;
+          } catch (_) {}
+          openAuthModal(detail);
+        }
+        return res;
+      };
+
+      void refreshSecStatus().then((st) => {
+        if (st && st.auth_enforced && !sessionToken) {
+          openAuthModal('');
+        }
+      });
+    })();
+
     const state = {
       overview: null,
       activeBrokerModal: 'upstox',
@@ -1378,7 +1587,13 @@
       els.refreshBtn.textContent = 'Refreshing...';
       try {
         const res = await fetch(`/api/overview?refresh=${refresh}`);
-        state.overview = await res.json();
+        const payload = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          throw new Error(payload.detail || `Server error (${res.status})`);
+        }
+        state.overview = payload;
+        els.routingFeedback.className = 'feedback';
+        els.routingFeedback.textContent = '';
         renderOverview();
       } catch (err) {
         els.routingFeedback.className = 'feedback err';

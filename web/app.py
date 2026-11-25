@@ -23,7 +23,7 @@ from pydantic import BaseModel
 
 from web.security import RateLimitError, security_manager
 from web.service import hub_service
-from web.spa import has_spa_bundle, render_spa_html, resolve_spa_asset
+from web.spa import ensure_spa_bundle, has_spa_bundle, render_spa_html, resolve_spa_asset
 
 _SHUTDOWN_EVENT = threading.Event()
 
@@ -202,6 +202,7 @@ def create_app() -> FastAPI:
     @asynccontextmanager
     async def _lifespan(_app: FastAPI):
         reset_shutdown()
+        ensure_spa_bundle(auto_build=True)
         hub_service.start_background_services()
         try:
             yield

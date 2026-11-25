@@ -640,8 +640,14 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    void refreshSecurityStatus().then((st) => {
-      if (st?.auth_enforced && !hasSessionToken()) {
+    let cancelled = false;
+    const initSecurity = async () => {
+      let st = await refreshSecurityStatus();
+      if (!st && !cancelled) {
+        await new Promise((r) => window.setTimeout(r, 500));
+        if (!cancelled) st = await refreshSecurityStatus();
+      }
+      if (!cancelled && st?.auth_enforced && !hasSessionToken()) {
         setAuthPromptReason(
           st.needs_claim
             ? 'Set your operator admin passcode to unlock AlgoDesk.'
@@ -649,7 +655,8 @@ export default function App() {
         );
         setAuthModalOpen(true);
       }
-    });
+    };
+    void initSecurity();
     const unsubReq = subscribeAuthRequired((detail) => {
       setAuthPromptReason(detail || 'Unlock your operator session to continue.');
       void refreshSecurityStatus();
@@ -659,6 +666,7 @@ export default function App() {
       setHasAuthSession(active);
     });
     return () => {
+      cancelled = true;
       unsubReq();
       unsubTok();
     };
@@ -671,7 +679,13 @@ export default function App() {
       const res = await apiFetch(`/api/overview?refresh=${refresh}`);
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
-        throw new Error(body.detail || `Server error (${res.status})`);
+        const detail = body.detail || `Server error (${res.status})`;
+        if (res.status === 401) {
+          setAuthPromptReason(detail);
+          void refreshSecurityStatus();
+          setAuthModalOpen(true);
+        }
+        throw new Error(detail);
       }
       const data: OverviewPayload = await res.json();
       setOverview(data);
@@ -685,7 +699,7 @@ export default function App() {
       setLoading(false);
       setRefreshing(false);
     }
-  }, []);
+  }, [refreshSecurityStatus]);
 
   const instrSearchSeq = useRef(0);
 
@@ -1818,16 +1832,20 @@ export default function App() {
                 </div>
 
         {loadError && (
-          <div className="flex items-center justify-between gap-4 rounded-xl border border-red-900/70 bg-red-950/40 px-5 py-4 text-sm text-red-200">
+          <div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-red-900/70 bg-red-950/40 px-5 py-4 text-sm text-red-200">
             <div className="flex items-center gap-2.5">
               <AlertCircle className="h-4 w-4 shrink-0 text-red-400" />
               <span>{loadError}</span>
             </div>
             <div className="flex items-center gap-2">
-              {securityStatus?.auth_enforced && !hasAuthSession && (
+              {((securityStatus?.auth_enforced && !hasAuthSession) ||
+                (!hasAuthSession && /auth|passcode|token|401/i.test(loadError))) && (
                 <button
                   type="button"
-                  onClick={() => setAuthModalOpen(true)}
+                  onClick={() => {
+                    void refreshSecurityStatus();
+                    setAuthModalOpen(true);
+                  }}
                   className="shrink-0 whitespace-nowrap rounded-lg bg-sky-400 px-3 py-1.5 text-xs font-semibold text-sky-950 hover:bg-sky-300"
                 >
                   Unlock Session
@@ -1835,7 +1853,18 @@ export default function App() {
               )}
               <button
                 type="button"
-                onClick={() => void fetchOverview(true)}
+                onClick={() => {
+                  if (
+                    !hasAuthSession &&
+                    (securityStatus?.auth_enforced || /auth|passcode|token|401/i.test(loadError))
+                  ) {
+                    setAuthPromptReason(loadError);
+                    void refreshSecurityStatus();
+                    setAuthModalOpen(true);
+                    return;
+                  }
+                  void fetchOverview(true);
+                }}
                 className="shrink-0 whitespace-nowrap rounded-lg border border-red-700/60 px-3 py-1.5 text-xs font-semibold text-red-100 hover:bg-red-900/40"
               >
                 Retry

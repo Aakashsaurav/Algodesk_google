@@ -130,7 +130,7 @@ export function AdminAuthModal({
   const handleSignOut = () => {
     clearSessionToken();
     setSuccess('Session token cleared from browser memory.');
-    onAuthenticated(securityStatus);
+    onAuthenticated(effectiveStatus);
   };
 
   return (
@@ -198,7 +198,7 @@ export function AdminAuthModal({
             </p>
           ) : (
             <p className="text-slate-400">
-              {securityStatus?.has_env_token
+              {effectiveStatus?.has_env_token
                 ? 'Enter your configured ALGODESK_API_TOKEN (or operator passcode) to unlock protected trading, risk, and plugin controls.'
                 : 'Enter your operator passcode to unlock protected trading, risk, and plugin controls.'}
             </p>
@@ -221,7 +221,7 @@ export function AdminAuthModal({
 
           <div>
             <label className="mb-1.5 block font-semibold text-slate-300">
-              {needsClaim ? 'New Operator Passcode' : securityStatus?.has_env_token ? 'API Token or Passcode' : 'Operator Passcode'}
+              {needsClaim ? 'New Operator Passcode' : effectiveStatus?.has_env_token ? 'API Token or Passcode' : 'Operator Passcode'}
             </label>
             <input
               type="password"

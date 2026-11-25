@@ -1684,7 +1684,76 @@ class SafeStrat(BacktestStrategy):
                 self.assertNotIn("TAKE_PROFIT", reason)
                 self.assertNotIn("TRAILING_SL", reason)
 
+    # ── Test 24: SPA Bundle Staleness Detection & Fallback Auth Modal ────
+    def test_24_spa_bundle_staleness_triggers_rebuild_and_fallback_auth(self) -> None:
+        import os
+        from types import SimpleNamespace
+        import web.spa as spa_mod
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "package.json").write_text('{"name":"test"}', encoding="utf-8")
+            src_dir = root / "src"
+            src_dir.mkdir()
+            app_tsx = src_dir / "App.tsx"
+            app_tsx.write_text("export default function App() { return null; }\n", encoding="utf-8")
+
+            dist_dir = root / "dist"
+            assets_dir = dist_dir / "assets"
+            assets_dir.mkdir(parents=True)
+            (assets_dir / "index-abc.js").write_text("console.log('ok');", encoding="utf-8")
+            dist_index = dist_dir / "index.html"
+            dist_index.write_text(
+                '<!doctype html><html><body><script src="/assets/index-abc.js"></script></body></html>',
+                encoding="utf-8",
+            )
+            (root / "node_modules").mkdir()
+
+            # Make dist/index.html older than src/App.tsx by 60 seconds
+            now = time.time()
+            os.utime(dist_index, (now - 60, now - 60))
+            os.utime(app_tsx, (now, now))
+
+            self.assertTrue(spa_mod.is_complete_spa_bundle(dist_dir))
+            self.assertFalse(spa_mod.is_spa_bundle_fresh(dist_dir, repo_root=root))
+
+            build_calls = []
+
+            def fake_run(cmd, cwd=None, check=False, timeout=None):
+                build_calls.append(cmd)
+                # Simulate npm run build touching dist/index.html to current mtime
+                os.utime(dist_index, (now + 5, now + 5))
+                return SimpleNamespace(returncode=0)
+
+            with (
+                patch.object(spa_mod, "REPO_ROOT", root),
+                patch.object(spa_mod, "DIST_DIR", dist_dir),
+                patch.object(spa_mod, "STATIC_SPA_DIR", root / "web" / "static_spa"),
+                patch("web.spa.shutil.which", return_value="/usr/bin/npm"),
+                patch("web.spa.subprocess.run", side_effect=fake_run),
+            ):
+                resolved = spa_mod.ensure_spa_bundle(auto_build=True)
+                self.assertEqual(resolved, dist_dir)
+                self.assertEqual(len(build_calls), 1)
+                self.assertEqual(build_calls[0][-2:], ["run", "build"])
+                self.assertTrue(spa_mod.is_spa_bundle_fresh(dist_dir, repo_root=root))
+
+                # Second call must be a fast no-op without rebuilding
+                resolved2 = spa_mod.ensure_spa_bundle(auto_build=True)
+                self.assertEqual(resolved2, dist_dir)
+                self.assertEqual(len(build_calls), 1)
+
+        # Verify fallback template has inline operator auth modal & login endpoints
+        fallback_html = (Path(__file__).resolve().parent.parent / "web" / "templates" / "index.html").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("operatorAuthBackdrop", fallback_html)
+        self.assertIn("/api/security/login", fallback_html)
+        self.assertIn("/api/security/claim", fallback_html)
+        self.assertNotIn("localStorage", fallback_html.split("installFallbackAuth")[1].split("const state =")[0])
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
