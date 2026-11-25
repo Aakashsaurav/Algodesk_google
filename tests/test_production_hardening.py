@@ -1877,9 +1877,65 @@ class SafeStrat(BacktestStrategy):
                 server.shutdown()
                 server.server_close()
 
+    # ── Test 26: Token Log Redaction & WS Subprotocol Header Auth ─────────
+    def test_26_ws_subprotocol_auth_and_log_token_redaction(self) -> None:
+        import logging
+        from types import SimpleNamespace
+        from config import SensitiveTokenRedactionFilter, redact_sensitive_text
+        from core.ws_protocol import perform_handshake
+
+        sample_tok = "adk_6TIwR59uTqq7hCWcLM8_3l8OEOB4TGqvPGOwSsMrhsQ"
+        redacted_url = redact_sensitive_text(f'WebSocket /ws/live?token={sample_tok} [accepted]')
+        self.assertNotIn(sample_tok, redacted_url)
+        self.assertIn("token=[REDACTED]", redacted_url)
+
+        redacted_bearer = redact_sensitive_text(f"Authorization: Bearer {sample_tok}")
+        self.assertNotIn(sample_tok, redacted_bearer)
+        self.assertIn("Bearer [REDACTED]", redacted_bearer)
+
+        # Verify uvicorn-style tuple args redaction in SensitiveTokenRedactionFilter
+        filt = SensitiveTokenRedactionFilter()
+        rec = logging.LogRecord(
+            name="uvicorn.access",
+            level=logging.INFO,
+            pathname=__file__,
+            lineno=1,
+            msg='%s - "%s %s HTTP/%s" %d',
+            args=("127.0.0.1:56815", "GET", f"/ws/live?token={sample_tok}", "1.1", 101),
+            exc_info=None,
+        )
+        self.assertTrue(filt.filter(rec))
+        formatted = rec.getMessage()
+        self.assertNotIn(sample_tok, formatted)
+        self.assertIn("token=[REDACTED]", formatted)
+
+        # Verify stdlib RFC 6455 handshake echoes algodesk.v1 (never bearer.<token>)
+        written = bytearray()
+
+        class _FakeWFile:
+            def write(self, data: bytes) -> None:
+                written.extend(data)
+
+            def flush(self) -> None:
+                pass
+
+        fake_handler = SimpleNamespace(
+            headers={
+                "Sec-WebSocket-Key": "dGhlIHNhbXBsZSBub25jZQ==",
+                "Upgrade": "websocket",
+                "Sec-WebSocket-Protocol": f"algodesk.v1, bearer.{sample_tok}",
+            },
+            wfile=_FakeWFile(),
+        )
+        self.assertTrue(perform_handshake(fake_handler))
+        resp_text = written.decode("ascii")
+        self.assertIn("Sec-WebSocket-Protocol: algodesk.v1\r\n", resp_text)
+        self.assertNotIn(sample_tok, resp_text)
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 
 

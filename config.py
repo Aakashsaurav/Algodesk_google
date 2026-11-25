@@ -19,6 +19,7 @@ import json
 import logging
 import os
 import platform
+import re
 import stat
 import subprocess
 from datetime import datetime, timedelta, timezone
@@ -540,6 +541,55 @@ class AppConfig:
                 pass
 
 
+_TOKEN_QUERY_RE = re.compile(r"([?&](?:token|access_token|api_key|api_secret)=)[^&\s\"']+", re.IGNORECASE)
+_ADK_TOKEN_RE = re.compile(r"\badk_[A-Za-z0-9_-]{8,}\b")
+_BEARER_TOKEN_RE = re.compile(r"(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}", re.IGNORECASE)
+
+
+def redact_sensitive_text(text: str) -> str:
+    """Mask query-string tokens, Bearer headers, and adk_ session tokens in logs."""
+    if not text:
+        return text
+    masked = _TOKEN_QUERY_RE.sub(r"\1[REDACTED]", text)
+    masked = _BEARER_TOKEN_RE.sub(r"\1[REDACTED]", masked)
+    masked = _ADK_TOKEN_RE.sub("adk_[REDACTED]", masked)
+    return masked
+
+
+class SensitiveTokenRedactionFilter(logging.Filter):
+    """Logging filter that strips sensitive auth tokens from log messages and format args."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            if isinstance(record.msg, str):
+                record.msg = redact_sensitive_text(record.msg)
+            if isinstance(record.args, tuple):
+                record.args = tuple(
+                    redact_sensitive_text(a) if isinstance(a, str) else a
+                    for a in record.args
+                )
+            elif isinstance(record.args, dict):
+                record.args = {
+                    k: (redact_sensitive_text(v) if isinstance(v, str) else v)
+                    for k, v in record.args.items()
+                }
+        except Exception:
+            pass
+        return True
+
+
+def install_log_redaction(*logger_names: str) -> None:
+    """Idempotently attach SensitiveTokenRedactionFilter to specified loggers and their handlers."""
+    targets = logger_names or ("", "uvicorn", "uvicorn.access", "uvicorn.error")
+    for name in targets:
+        lg = logging.getLogger(name)
+        if not any(isinstance(f, SensitiveTokenRedactionFilter) for f in lg.filters):
+            lg.addFilter(SensitiveTokenRedactionFilter())
+        for handler in lg.handlers:
+            if not any(isinstance(f, SensitiveTokenRedactionFilter) for f in handler.filters):
+                handler.addFilter(SensitiveTokenRedactionFilter())
+
+
 def setup_logging(level_override: Optional[str] = None) -> logging.Logger:
     """Configure application-wide console logging cleanly without duplicate handlers."""
     level_name = (level_override or os.getenv("LOG_LEVEL", "INFO")).upper()
@@ -555,6 +605,7 @@ def setup_logging(level_override: Optional[str] = None) -> logging.Logger:
             )
         )
         root.addHandler(handler)
+    install_log_redaction("", "uvicorn", "uvicorn.access", "uvicorn.error")
     return root
 
 
@@ -581,12 +632,15 @@ __all__: List[str] = [
     "AppConfig",
     "IST",
     "IST_TZ",
+    "SensitiveTokenRedactionFilter",
     "config",
     "current_ist",
+    "install_log_redaction",
     "is_keychain_enabled",
     "is_live_trading_enabled",
     "keychain_delete",
     "keychain_get",
     "keychain_set",
+    "redact_sensitive_text",
     "setup_logging",
 ]

@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 from urllib.parse import parse_qs, urlparse
 
-from config import setup_logging
+from config import install_log_redaction, setup_logging
 from core.ws_protocol import (
     OPCODE_CLOSE,
     OPCODE_PING,
@@ -84,6 +84,14 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
             return True
         if security_manager.verify_bearer(self.headers.get("Authorization")):
             return True
+        if is_ws:
+            raw_proto = self.headers.get("Sec-WebSocket-Protocol") or ""
+            for item in raw_proto.split(","):
+                part = item.strip()
+                if part.startswith("bearer."):
+                    tok = part[7:].strip()
+                    if tok and security_manager.verify_raw_token(tok):
+                        return True
         if (is_ws or path == "/api/live/stream") and query:
             raw_tok = (query.get("token") or [""])[0]
             if raw_tok and security_manager.verify_raw_token(raw_tok):
@@ -1207,6 +1215,8 @@ def run_server(host: str = "127.0.0.1", port: int = 8000, open_browser: bool = T
             log_level="info",
             timeout_graceful_shutdown=2,
         )
+        config.configure_logging()
+        install_log_redaction("", "uvicorn", "uvicorn.access", "uvicorn.error")
         server = _GracefulUvicornServer(config)
         try:
             server.run()

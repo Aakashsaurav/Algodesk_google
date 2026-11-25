@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { apiFetch, withAuthTokenQuery } from '../../utils/authClient';
+import { apiFetch, createAuthenticatedWebSocket } from '../../utils/authClient';
 import {
   Bell,
   CheckCircle2,
@@ -84,7 +84,7 @@ export function DeploymentsConsole({ onGoToStrategies, onGoToRisk }: Props) {
   useEffect(() => {
     void fetchDeployments();
     const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const ws = new WebSocket(withAuthTokenQuery(`${proto}//${window.location.host}/ws/deployments`));
+    const ws = createAuthenticatedWebSocket(`${proto}//${window.location.host}/ws/deployments`);
     wsRef.current = ws;
     ws.onmessage = (ev) => {
       try {

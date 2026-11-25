@@ -42,6 +42,10 @@ export function AdminAuthModal({
     if (!open) return;
     setError('');
     setSuccess('');
+    if (securityStatus) {
+      setLocalStatus(securityStatus);
+      return;
+    }
     let cancelled = false;
     void fetchSecurityStatus().then((fresh) => {
       if (!cancelled && fresh) {
@@ -51,7 +55,7 @@ export function AdminAuthModal({
     return () => {
       cancelled = true;
     };
-  }, [open]);
+  }, [open, securityStatus]);
 
   if (!open) return null;
 

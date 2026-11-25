@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { apiFetch, withAuthTokenQuery } from '../../utils/authClient';
+import { apiFetch, createAuthenticatedWebSocket } from '../../utils/authClient';
 import {
   Bell,
   Code2,
@@ -317,7 +317,7 @@ export function DiscoverScannersView({
       if (Array.isArray(body.columns)) setColumns(body.columns);
 
       const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const ws = new WebSocket(withAuthTokenQuery(`${proto}//${window.location.host}/ws/live-screener`));
+      const ws = createAuthenticatedWebSocket(`${proto}//${window.location.host}/ws/live-screener`);
       wsRef.current = ws;
       ws.onmessage = (evt) => {
         try {

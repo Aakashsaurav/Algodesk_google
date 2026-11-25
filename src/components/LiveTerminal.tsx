@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { apiFetch, withAuthTokenQuery } from '../utils/authClient';
+import { apiFetch, createAuthenticatedWebSocket, withAuthTokenQuery } from '../utils/authClient';
 import {
   Activity,
   AlertCircle,
@@ -290,8 +290,7 @@ export function LiveTerminal({ onNavigateHome }: LiveTerminalProps) {
 
     try {
       const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = withAuthTokenQuery(`${proto}//${window.location.host}/ws/live`);
-      const ws = new WebSocket(wsUrl);
+      const ws = createAuthenticatedWebSocket(`${proto}//${window.location.host}/ws/live`);
       wsRef.current = ws;
       let openedOnce = false;
 

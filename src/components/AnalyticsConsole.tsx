@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { apiFetch, withAuthTokenQuery } from '../utils/authClient';
+import { apiFetch, createAuthenticatedWebSocket } from '../utils/authClient';
 import {
   Activity,
   AlertCircle,
@@ -679,9 +679,8 @@ export function AnalyticsConsole({
     const connectWs = () => {
       if (cancelled) return;
       const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const url = withAuthTokenQuery(`${proto}//${window.location.host}/ws/live-screener`);
       setLsWsStatus('connecting');
-      const ws = new WebSocket(url);
+      const ws = createAuthenticatedWebSocket(`${proto}//${window.location.host}/ws/live-screener`);
       lsWsRef.current = ws;
 
       ws.onopen = () => {

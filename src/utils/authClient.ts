@@ -55,6 +55,21 @@ export function withAuthTokenQuery(url: string): string {
   return `${url}${sep}token=${encodeURIComponent(_sessionToken)}`;
 }
 
+/**
+ * Open a WebSocket authenticating via Sec-WebSocket-Protocol (`algodesk.v1`, `bearer.<token>`)
+ * so the session token never appears in URLs, proxy logs, or server access logs.
+ * Falls back cleanly to query-string auth only if a custom env token contains non-RFC6455 token characters.
+ */
+export function createAuthenticatedWebSocket(url: string): WebSocket {
+  if (!_sessionToken) {
+    return new WebSocket(url);
+  }
+  if (/^[A-Za-z0-9._~-]+$/.test(_sessionToken)) {
+    return new WebSocket(url, ['algodesk.v1', `bearer.${_sessionToken}`]);
+  }
+  return new WebSocket(withAuthTokenQuery(url));
+}
+
 export function subscribeAuthRequired(fn: AuthRequiredListener): () => void {
   _authRequiredListeners.add(fn);
   return () => {

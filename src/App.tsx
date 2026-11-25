@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react';
 import {
   RefreshCw,
   ExternalLink,
@@ -28,20 +28,43 @@ import {
   Lock,
   Unlock,
 } from 'lucide-react';
-import { LiveTerminal } from './components/LiveTerminal';
 import { PlatformDashboard } from './components/streak/PlatformDashboard';
-import { BasketsView } from './components/streak/DiscoverAndBasketsView';
-import { DiscoverScannersView } from './components/streak/DiscoverScannersView';
-import { CreateScannerView } from './components/streak/CreateScannerView';
-import { ScannerAlertsView } from './components/streak/ScannerAlertsView';
-import { DiscoverStrategiesView } from './components/streak/DiscoverStrategiesView';
-import { CreateStrategyView } from './components/streak/CreateStrategyView';
-import { RiskLimitsView } from './components/streak/RiskLimitsView';
 import { QuickOrderModal, type QuickOrderTarget } from './components/streak/QuickOrderModal';
 import { AdminAuthModal } from './components/streak/AdminAuthModal';
-import { OptionsStudio } from './components/streak/OptionsStudio';
-import { TechnicalsView } from './components/streak/TechnicalsView';
-import { DeploymentsConsole } from './components/streak/DeploymentsConsole';
+
+const LiveTerminal = lazy(() =>
+  import('./components/LiveTerminal').then((m) => ({ default: m.LiveTerminal }))
+);
+const BasketsView = lazy(() =>
+  import('./components/streak/DiscoverAndBasketsView').then((m) => ({ default: m.BasketsView }))
+);
+const DiscoverScannersView = lazy(() =>
+  import('./components/streak/DiscoverScannersView').then((m) => ({ default: m.DiscoverScannersView }))
+);
+const CreateScannerView = lazy(() =>
+  import('./components/streak/CreateScannerView').then((m) => ({ default: m.CreateScannerView }))
+);
+const ScannerAlertsView = lazy(() =>
+  import('./components/streak/ScannerAlertsView').then((m) => ({ default: m.ScannerAlertsView }))
+);
+const DiscoverStrategiesView = lazy(() =>
+  import('./components/streak/DiscoverStrategiesView').then((m) => ({ default: m.DiscoverStrategiesView }))
+);
+const CreateStrategyView = lazy(() =>
+  import('./components/streak/CreateStrategyView').then((m) => ({ default: m.CreateStrategyView }))
+);
+const RiskLimitsView = lazy(() =>
+  import('./components/streak/RiskLimitsView').then((m) => ({ default: m.RiskLimitsView }))
+);
+const OptionsStudio = lazy(() =>
+  import('./components/streak/OptionsStudio').then((m) => ({ default: m.OptionsStudio }))
+);
+const TechnicalsView = lazy(() =>
+  import('./components/streak/TechnicalsView').then((m) => ({ default: m.TechnicalsView }))
+);
+const DeploymentsConsole = lazy(() =>
+  import('./components/streak/DeploymentsConsole').then((m) => ({ default: m.DeploymentsConsole }))
+);
 import {
   apiFetch,
   fetchSecurityStatus,
@@ -1472,7 +1495,17 @@ export default function App() {
     (modalBrokerId === 'zerodha' ? 'Zerodha Kite' : 'Upstox');
 
   if (routePath === '/terminal') {
-    return <LiveTerminal onNavigateHome={() => navigateTo('/')} />;
+    return (
+      <Suspense
+        fallback={
+          <div className="flex min-h-screen items-center justify-center bg-[#0b1120] text-xs text-slate-400">
+            Loading Live Terminal...
+          </div>
+        }
+      >
+        <LiveTerminal onNavigateHome={() => navigateTo('/')} />
+      </Suspense>
+    );
   }
 
   const renderNavIcon = (id: PlatformNavId) => {
@@ -1708,10 +1741,25 @@ export default function App() {
 
         {activeNav === 'terminal' ? (
           <div className="flex-1">
-            <LiveTerminal onNavigateHome={() => setActiveNav('dashboard')} />
+            <Suspense
+              fallback={
+                <div className="flex min-h-[320px] items-center justify-center text-xs text-slate-400">
+                  Loading Live Terminal...
+                </div>
+              }
+            >
+              <LiveTerminal onNavigateHome={() => setActiveNav('dashboard')} />
+            </Suspense>
           </div>
         ) : (
           <main className="mx-auto flex w-full max-w-[1320px] flex-1 flex-col gap-8 px-6 py-7 pb-16">
+            <Suspense
+              fallback={
+                <div className="flex min-h-[260px] items-center justify-center text-xs text-slate-400">
+                  Loading workspace...
+                </div>
+              }
+            >
             {activeNav === 'dashboard' && (
               <PlatformDashboard
                 meta={streakMeta}
@@ -1812,6 +1860,7 @@ export default function App() {
             )}
 
             {activeNav === 'risk' && <RiskLimitsView />}
+            </Suspense>
 
             {activeNav === 'connections' && (
               <>
@@ -3431,6 +3480,9 @@ export default function App() {
         promptReason={authPromptReason}
         onClose={() => setAuthModalOpen(false)}
         onAuthenticated={(next) => {
+          const wasUnlocked = hasAuthSession;
+          const hadProtectedAccess =
+            authReady && (!securityStatus?.auth_enforced || wasUnlocked);
           if (next) {
             setSecurityStatus(next);
           } else {
@@ -3441,11 +3493,15 @@ export default function App() {
           if (unlockedNow) {
             setAuthPromptReason('');
             setLoadError(null);
-            void fetchOverview(true);
-            void fetchStreakMeta();
-            void searchInstruments('', 'ALL');
-            void fetchCatalog();
-            void fetchLiveStatus();
+            // Only trigger manual reload if canQueryProtectedApi was ALREADY true
+            // (otherwise the canQueryProtectedApi transition effect loads all 5 endpoints once).
+            if (hadProtectedAccess && !overview) {
+              void fetchOverview(true);
+              void fetchStreakMeta();
+              void searchInstruments('', 'ALL');
+              void fetchCatalog();
+              void fetchLiveStatus();
+            }
           }
         }}
       />

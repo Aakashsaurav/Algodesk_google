@@ -21,6 +21,7 @@ from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocket
 from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingResponse
 from pydantic import BaseModel
 
+from config import install_log_redaction
 from web.security import RateLimitError, security_manager
 from web.service import hub_service
 from web.spa import ensure_spa_bundle, has_spa_bundle, render_spa_html, resolve_spa_asset
@@ -202,6 +203,7 @@ def create_app() -> FastAPI:
     @asynccontextmanager
     async def _lifespan(_app: FastAPI):
         reset_shutdown()
+        install_log_redaction("", "uvicorn", "uvicorn.access", "uvicorn.error")
         ensure_spa_bundle(auto_build=True)
         hub_service.start_background_services()
         try:
@@ -217,12 +219,24 @@ def create_app() -> FastAPI:
         lifespan=_lifespan,
     )
 
+    def _ws_subprotocol(websocket: WebSocket) -> Optional[str]:
+        raw_proto = websocket.headers.get("sec-websocket-protocol") or ""
+        protos = [p.strip() for p in raw_proto.split(",") if p.strip()]
+        return "algodesk.v1" if "algodesk.v1" in protos else None
+
     def _ws_authorized(websocket: WebSocket) -> bool:
         if not security_manager.is_auth_enforced():
             return True
         auth_hdr = websocket.headers.get("authorization")
         if auth_hdr and security_manager.verify_bearer(auth_hdr):
             return True
+        raw_proto = websocket.headers.get("sec-websocket-protocol") or ""
+        for item in raw_proto.split(","):
+            part = item.strip()
+            if part.startswith("bearer."):
+                tok = part[7:].strip()
+                if tok and security_manager.verify_raw_token(tok):
+                    return True
         q_tok = websocket.query_params.get("token")
         return bool(q_tok and security_manager.verify_raw_token(q_tok))
 
@@ -601,7 +615,7 @@ def create_app() -> FastAPI:
         if not _ws_authorized(websocket):
             await websocket.close(code=4401)
             return
-        await websocket.accept()
+        await websocket.accept(subprotocol=_ws_subprotocol(websocket))
         listener_q = hub_service.register_live_listener()
 
         async def _sender() -> None:
@@ -691,7 +705,7 @@ def create_app() -> FastAPI:
         if not _ws_authorized(websocket):
             await websocket.close(code=4401)
             return
-        await websocket.accept()
+        await websocket.accept(subprotocol=_ws_subprotocol(websocket))
         listener_q = hub_service.register_live_screener_listener()
 
         async def _sender() -> None:
@@ -1245,7 +1259,7 @@ def create_app() -> FastAPI:
         if not _ws_authorized(websocket):
             await websocket.close(code=4401)
             return
-        await websocket.accept()
+        await websocket.accept(subprotocol=_ws_subprotocol(websocket))
         listener_q = hub_service.register_deployments_listener()
 
         async def _sender() -> None:

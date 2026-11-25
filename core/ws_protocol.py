@@ -37,11 +37,15 @@ def perform_handshake(handler: AnySocketHandler) -> bool:
         return False
 
     accept = compute_accept_key(key)
+    proto_hdr = handler.headers.get("Sec-WebSocket-Protocol") or ""
+    requested_protos = [p.strip() for p in proto_hdr.split(",") if p.strip()]
+    proto_line = "Sec-WebSocket-Protocol: algodesk.v1\r\n" if "algodesk.v1" in requested_protos else ""
     response = (
         "HTTP/1.1 101 Switching Protocols\r\n"
         "Upgrade: websocket\r\n"
         "Connection: Upgrade\r\n"
         f"Sec-WebSocket-Accept: {accept}\r\n"
+        f"{proto_line}"
         "Cache-Control: no-store\r\n"
         "\r\n"
     ).encode("ascii")
