@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { apiFetch } from '../../utils/authClient';
 import { Plus, Trash2, Save, Code2, Check, Copy } from 'lucide-react';
 import type { VisualCondition, VisualOperandSpec, VisualRuleDef } from './types';
 
@@ -221,7 +222,7 @@ export function VisualRuleBuilder({ rule, onChange, operands, operators, onSaved
     setSaving(true);
     setFeedback(null);
     try {
-      const res = await fetch('/api/streak/rules', {
+      const res = await apiFetch('/api/streak/rules', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(rule),
@@ -242,7 +243,7 @@ export function VisualRuleBuilder({ rule, onChange, operands, operators, onSaved
     setExporting(true);
     setFeedback(null);
     try {
-      const res = await fetch('/api/streak/rules/export-python', {
+      const res = await apiFetch('/api/streak/rules/export-python', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ rule_def: rule, save_to_disk: saveToDisk }),

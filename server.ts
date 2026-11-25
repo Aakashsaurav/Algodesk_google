@@ -166,6 +166,19 @@ async function proxyToPython(req: Request, res: Response): Promise<void> {
     if (req.headers['content-type']) {
       headers['content-type'] = String(req.headers['content-type']);
     }
+    if (req.headers['authorization']) {
+      headers['authorization'] = String(req.headers['authorization']);
+    }
+    if (req.headers['accept']) {
+      headers['accept'] = String(req.headers['accept']);
+    }
+    if (req.headers['cookie']) {
+      headers['cookie'] = String(req.headers['cookie']);
+    }
+    const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
+    if (clientIp) {
+      headers['x-forwarded-for'] = String(clientIp);
+    }
 
     const method = req.method.toUpperCase();
     const hasBody = !['GET', 'HEAD'].includes(method);
@@ -187,6 +200,11 @@ async function proxyToPython(req: Request, res: Response): Promise<void> {
         ? undefined
         : AbortSignal.timeout(isLongRoute ? 60000 : 15000),
     });
+
+    const retryAfter = upstream.headers.get('retry-after');
+    if (retryAfter) {
+      res.setHeader('Retry-After', retryAfter);
+    }
 
     const contentType = upstream.headers.get('content-type') || 'application/json';
     if (contentType.includes('text/event-stream') && upstream.body) {

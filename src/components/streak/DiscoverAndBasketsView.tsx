@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { apiFetch } from '../../utils/authClient';
 import { Plus, Trash2, ArrowUpRight, Search, FolderKanban } from 'lucide-react';
 import type { BasketItem, DiscoverItem, StreakMetaPayload } from './types';
 
@@ -129,7 +130,7 @@ export function BasketsView({ meta, onRefreshMeta, onBacktestBasket }: BasketsPr
     setSaving(true);
     setFeedback(null);
     try {
-      const res = await fetch('/api/streak/baskets', {
+      const res = await apiFetch('/api/streak/baskets', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ name: name.trim(), description: description.trim(), exchange: 'NSE', symbols: syms }),
@@ -148,7 +149,7 @@ export function BasketsView({ meta, onRefreshMeta, onBacktestBasket }: BasketsPr
   };
 
   const handleDelete = async (id: string) => {
-    await fetch(`/api/streak/baskets/${id}`, { method: 'DELETE' });
+    await apiFetch(`/api/streak/baskets/${id}`, { method: 'DELETE' });
     onRefreshMeta();
   };
 

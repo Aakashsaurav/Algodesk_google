@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { apiFetch } from '../../utils/authClient';
 import { Play, Rocket, Layers, Code2, Blocks, X, Check } from 'lucide-react';
 import { VisualRuleBuilder } from './VisualRuleBuilder';
 import type {
@@ -169,7 +170,7 @@ export function StrategyBacktestStudio({ meta, initialPreset, onRefreshMeta, onD
         payload.symbols = parsedSyms;
       }
 
-      const res = await fetch('/api/streak/backtest', {
+      const res = await apiFetch('/api/streak/backtest', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
@@ -198,7 +199,7 @@ export function StrategyBacktestStudio({ meta, initialPreset, onRefreshMeta, onD
     setDeploying(true);
     setDeployMsg(null);
     try {
-      const res = await fetch('/api/streak/deployments/start', {
+      const res = await apiFetch('/api/streak/deployments/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

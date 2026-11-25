@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { apiFetch, withAuthTokenQuery } from '../../utils/authClient';
 import {
   Bell,
   Calendar,
@@ -158,7 +159,7 @@ export function CreateScannerView({
     if (liveSessionId) {
       setLiveSessionId(null);
       setLiveStatusText('');
-      await fetch('/api/analytics/live-screener/stop', {
+      await apiFetch('/api/analytics/live-screener/stop', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({}),
@@ -235,7 +236,7 @@ export function CreateScannerView({
       } else {
         payload.rule_def = buildVisualRuleDef();
       }
-      const res = await fetch('/api/analytics/screener', {
+      const res = await apiFetch('/api/analytics/screener', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
@@ -269,7 +270,7 @@ export function CreateScannerView({
     setLiveStatusText('Starting live WebSocket scanner...');
     try {
       const target = buildScanTarget();
-      const res = await fetch('/api/analytics/live-screener/start', {
+      const res = await apiFetch('/api/analytics/live-screener/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -293,7 +294,7 @@ export function CreateScannerView({
       if (Array.isArray(body.columns)) setColumns(body.columns);
 
       const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const ws = new WebSocket(`${proto}//${window.location.host}/ws/live-screener`);
+      const ws = new WebSocket(withAuthTokenQuery(`${proto}//${window.location.host}/ws/live-screener`));
       wsRef.current = ws;
       ws.onmessage = (evt) => {
         try {
@@ -343,7 +344,7 @@ export function CreateScannerView({
     setNotice('');
     try {
       const ruleDef = buildVisualRuleDef();
-      const res = await fetch('/api/streak/rules', {
+      const res = await apiFetch('/api/streak/rules', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(ruleDef),
@@ -369,7 +370,7 @@ export function CreateScannerView({
     try {
       const saved = await handleSaveScanner();
       if (!saved?.id) return;
-      const res = await fetch('/api/streak/rules/export-python', {
+      const res = await apiFetch('/api/streak/rules/export-python', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ rule_def: saved, save_to_disk: true }),
@@ -390,7 +391,7 @@ export function CreateScannerView({
     setNotice('');
     try {
       const target = buildScanTarget();
-      const res = await fetch('/api/streak/scanners/alerts', {
+      const res = await apiFetch('/api/streak/scanners/alerts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -421,7 +422,7 @@ export function CreateScannerView({
   const handleSyncNse = async () => {
     setSyncingNse(true);
     try {
-      await fetch('/api/analytics/universes/sync', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+      await apiFetch('/api/analytics/universes/sync', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
       onRefreshMeta();
       setNotice('Synced NSE Index constituents.');
     } finally {
@@ -775,7 +776,7 @@ export function CreateScannerView({
                       <button
                         type="button"
                         onClick={async () => {
-                          await fetch(`/api/streak/rules/${encodeURIComponent(r.id!)}`, { method: 'DELETE' });
+                          await apiFetch(`/api/streak/rules/${encodeURIComponent(r.id!)}`, { method: 'DELETE' });
                           onRefreshMeta();
                         }}
                         className="rounded-lg border border-slate-700 p-1.5 text-slate-400 hover:border-red-700 hover:text-red-400"

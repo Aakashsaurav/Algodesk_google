@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
+import { apiFetch } from '../../utils/authClient';
 import { Plus, Trash2, RefreshCw } from 'lucide-react';
 import type { ChargeBreakdown } from './types';
 
@@ -64,7 +65,7 @@ export function OptionsStudio({ templates, initialTemplate }: Props) {
       setLoading(true);
       setError('');
       try {
-        const res = await fetch('/api/streak/options/template', {
+        const res = await apiFetch('/api/streak/options/template', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -97,7 +98,7 @@ export function OptionsStudio({ templates, initialTemplate }: Props) {
       setLoading(true);
       setError('');
       try {
-        const res = await fetch('/api/streak/options/analyze', {
+        const res = await apiFetch('/api/streak/options/analyze', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({

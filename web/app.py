@@ -229,7 +229,11 @@ def create_app() -> FastAPI:
     async def _bearer_auth_middleware(request: Request, call_next):
         if security_manager.is_protected_request(request.method, request.url.path):
             auth_hdr = request.headers.get("authorization")
-            if not security_manager.verify_bearer(auth_hdr):
+            ok = security_manager.verify_bearer(auth_hdr)
+            if not ok and request.url.path == "/api/live/stream":
+                q_tok = request.query_params.get("token")
+                ok = bool(q_tok and security_manager.verify_raw_token(q_tok))
+            if not ok:
                 return JSONResponse(
                     status_code=401,
                     content={

@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
+import { apiFetch } from '../../utils/authClient';
 import {
   ArrowLeft,
   Bell,
@@ -244,7 +245,7 @@ export function BacktestResultsView({
     setDeployBusy(true);
     setDeployMsg(null);
     try {
-      const res = await fetch('/api/streak/deployments/start', {
+      const res = await apiFetch('/api/streak/deployments/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -277,7 +278,7 @@ export function BacktestResultsView({
     setOhlcvError('');
     try {
       const symParam = scope === 'all' || selectedSymbol === 'COMBINED' ? 'ALL' : selectedSymbol;
-      const res = await fetch(
+      const res = await apiFetch(
         `/api/streak/backtest/${encodeURIComponent(result.run_id)}/ohlcv.csv?symbol=${encodeURIComponent(symParam)}`
       );
       if (!res.ok) {

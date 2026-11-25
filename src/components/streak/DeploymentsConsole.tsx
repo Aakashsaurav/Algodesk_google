@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { apiFetch, withAuthTokenQuery } from '../../utils/authClient';
 import {
   Bell,
   CheckCircle2,
@@ -34,7 +35,7 @@ export function DeploymentsConsole({ onGoToStrategies, onGoToRisk }: Props) {
 
   const fetchOmsOrders = useCallback(async () => {
     try {
-      const res = await fetch('/api/streak/oms/orders?limit=100');
+      const res = await apiFetch('/api/streak/oms/orders?limit=100');
       if (res.ok) {
         const body = await res.json();
         setOmsOrders(Array.isArray(body.orders) ? (body.orders as OmsOrderRecord[]) : []);
@@ -46,7 +47,7 @@ export function DeploymentsConsole({ onGoToStrategies, onGoToRisk }: Props) {
 
   const fetchDeployments = useCallback(async () => {
     try {
-      const res = await fetch('/api/streak/deployments');
+      const res = await apiFetch('/api/streak/deployments');
       if (res.ok) {
         setData((await res.json()) as DeploymentsPayload);
       }
@@ -60,7 +61,7 @@ export function DeploymentsConsole({ onGoToStrategies, onGoToRisk }: Props) {
     setReconciling(true);
     setFeedback(null);
     try {
-      const res = await fetch('/api/streak/deployments/reconcile', {
+      const res = await apiFetch('/api/streak/deployments/reconcile', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: '{}',
@@ -83,7 +84,7 @@ export function DeploymentsConsole({ onGoToStrategies, onGoToRisk }: Props) {
   useEffect(() => {
     void fetchDeployments();
     const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const ws = new WebSocket(`${proto}//${window.location.host}/ws/deployments`);
+    const ws = new WebSocket(withAuthTokenQuery(`${proto}//${window.location.host}/ws/deployments`));
     wsRef.current = ws;
     ws.onmessage = (ev) => {
       try {
@@ -110,8 +111,8 @@ export function DeploymentsConsole({ onGoToStrategies, onGoToRisk }: Props) {
     try {
       const res =
         action === 'delete'
-          ? await fetch(`/api/streak/deployments/${encodeURIComponent(id)}`, { method: 'DELETE' })
-          : await fetch(`/api/streak/deployments/${encodeURIComponent(id)}/action`, {
+          ? await apiFetch(`/api/streak/deployments/${encodeURIComponent(id)}`, { method: 'DELETE' })
+          : await apiFetch(`/api/streak/deployments/${encodeURIComponent(id)}/action`, {
               method: 'POST',
               headers: { 'Content-Type': 'application/json' },
               body: JSON.stringify({ action }),
@@ -131,7 +132,7 @@ export function DeploymentsConsole({ onGoToStrategies, onGoToRisk }: Props) {
     setBusyId(alertId);
     setFeedback(null);
     try {
-      const res = await fetch(`/api/streak/deployments/alerts/${encodeURIComponent(alertId)}/action`, {
+      const res = await apiFetch(`/api/streak/deployments/alerts/${encodeURIComponent(alertId)}/action`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action }),

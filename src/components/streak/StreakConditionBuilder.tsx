@@ -1,4 +1,5 @@
 import { useState } from 'react';
+import { apiFetch } from '../../utils/authClient';
 import {
   AlertCircle,
   Check,
@@ -386,7 +387,7 @@ export function StreakConditionBuilder({
     }
     setFormulaStatus((prev) => ({ ...prev, [key]: { checking: true } }));
     try {
-      const res = await fetch('/api/streak/formula/validate', {
+      const res = await apiFetch('/api/streak/formula/validate', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ expression: trimmed, expect_boolean: expectBoolean }),
@@ -510,7 +511,7 @@ export function StreakConditionBuilder({
     setPyBusy(true);
     setPyFeedback(null);
     try {
-      const res = await fetch(
+      const res = await apiFetch(
         `/api/streak/plugins/source?kind=${encodeURIComponent(kind)}&id=${encodeURIComponent(selectedPythonId)}`
       );
       const body = await res.json();
@@ -529,7 +530,7 @@ export function StreakConditionBuilder({
     setPyBusy(true);
     setPyFeedback(null);
     try {
-      const res = await fetch('/api/streak/plugins/python', {
+      const res = await apiFetch('/api/streak/plugins/python', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ kind, filename: pyFilename, code: pyCode }),

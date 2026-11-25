@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import { apiFetch } from '../../utils/authClient';
 import { RefreshCw, TrendingUp } from 'lucide-react';
 import type { BacktestTradeRow } from './types';
 import type { QuickOrderTarget } from './QuickOrderModal';
@@ -76,7 +77,7 @@ export function CandlestickChartPanel({
       setError('');
       try {
         if (!forceDownload) {
-          const recRes = await fetch(
+          const recRes = await apiFetch(
             `/api/data/records?symbol=${encodeURIComponent(clean)}&exchange=${encodeURIComponent(exchange)}&timeframe=${encodeURIComponent(tf)}&view=full`
           );
           if (recRes.ok) {
@@ -92,7 +93,7 @@ export function CandlestickChartPanel({
         const toIso = new Date().toISOString().slice(0, 10);
         const lookbackMs = tf.includes('minute') ? 35 * 86400_000 : 180 * 86400_000;
         const fromIso = new Date(Date.now() - lookbackMs).toISOString().slice(0, 10);
-        const dlRes = await fetch('/api/data/download', {
+        const dlRes = await apiFetch('/api/data/download', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
@@ -105,7 +106,7 @@ export function CandlestickChartPanel({
         });
         const dlBody = await dlRes.json().catch(() => ({}));
         if (!dlRes.ok) throw new Error(dlBody.detail || `Could not load ${clean} candles.`);
-        const recRes2 = await fetch(
+        const recRes2 = await apiFetch(
           `/api/data/records?symbol=${encodeURIComponent(clean)}&exchange=${encodeURIComponent(exchange)}&timeframe=${encodeURIComponent(tf)}&view=full`
         );
         const recBody2 = await recRes2.json().catch(() => ({}));

@@ -43,6 +43,7 @@ import { OptionsStudio } from './components/streak/OptionsStudio';
 import { TechnicalsView } from './components/streak/TechnicalsView';
 import { DeploymentsConsole } from './components/streak/DeploymentsConsole';
 import {
+  apiFetch,
   fetchSecurityStatus,
   hasSessionToken,
   subscribeAuthRequired,
@@ -448,7 +449,7 @@ export default function App() {
 
   const fetchStreakMeta = useCallback(async () => {
     try {
-      const res = await fetch('/api/streak/meta');
+      const res = await apiFetch('/api/streak/meta');
       if (res.ok) {
         const data = (await res.json()) as StreakMetaPayload;
         setStreakMeta(data);
@@ -457,10 +458,6 @@ export default function App() {
       // keep existing snapshot
     }
   }, []);
-
-  useEffect(() => {
-    void fetchStreakMeta();
-  }, [fetchStreakMeta]);
 
   const handleOpenInCreateScanner = useCallback((draft: ScannerDraftPreset) => {
     setScannerDraft({ ...draft });
@@ -630,17 +627,29 @@ export default function App() {
 
   // Production security status & inline in-memory Bearer auth modal
   const [securityStatus, setSecurityStatus] = useState<SecurityStatus | null>(null);
+  const [authReady, setAuthReady] = useState(false);
   const [authModalOpen, setAuthModalOpen] = useState(false);
   const [authPromptReason, setAuthPromptReason] = useState('');
   const [hasAuthSession, setHasAuthSession] = useState(() => hasSessionToken());
 
-  const refreshSecurityStatus = useCallback(async () => {
+  const refreshSecurityStatus = useCallback(async (): Promise<SecurityStatus | null> => {
     const st = await fetchSecurityStatus();
     if (st) setSecurityStatus(st);
+    setAuthReady(true);
+    return st;
   }, []);
 
   useEffect(() => {
-    void refreshSecurityStatus();
+    void refreshSecurityStatus().then((st) => {
+      if (st?.auth_enforced && !hasSessionToken()) {
+        setAuthPromptReason(
+          st.needs_claim
+            ? 'Set your operator admin passcode to unlock AlgoDesk.'
+            : 'Sign in with your admin passcode or ALGODESK_API_TOKEN to load broker & market data.'
+        );
+        setAuthModalOpen(true);
+      }
+    });
     const unsubReq = subscribeAuthRequired((detail) => {
       setAuthPromptReason(detail || 'Unlock your operator session to continue.');
       void refreshSecurityStatus();
@@ -659,7 +668,7 @@ export default function App() {
     setRefreshing(true);
     setLoadError(null);
     try {
-      const res = await fetch(`/api/overview?refresh=${refresh}`);
+      const res = await apiFetch(`/api/overview?refresh=${refresh}`);
       if (!res.ok) {
         const body = await res.json().catch(() => ({}));
         throw new Error(body.detail || `Server error (${res.status})`);
@@ -687,7 +696,7 @@ export default function App() {
       if (instType && instType !== 'ALL') {
         params.set('instrument_type', instType);
       }
-      const res = await fetch(`/api/instruments/search?${params.toString()}`);
+      const res = await apiFetch(`/api/instruments/search?${params.toString()}`);
       if (seq !== instrSearchSeq.current) return;
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
@@ -745,7 +754,7 @@ export default function App() {
         });
         if (exp) params.set('expiry', exp);
         if (stk && !Number.isNaN(Number(stk))) params.set('strike', stk);
-        const res = await fetch(`/api/instruments/fno?${params.toString()}`);
+        const res = await apiFetch(`/api/instruments/fno?${params.toString()}`);
         if (seq !== fnoFetchSeq.current || !res.ok) return;
         const payload: FnoContractsPayload = await res.json();
         if (seq !== fnoFetchSeq.current) return;
@@ -794,7 +803,7 @@ export default function App() {
 
   const fetchCatalog = useCallback(async () => {
     try {
-      const res = await fetch('/api/data/catalog');
+      const res = await apiFetch('/api/data/catalog');
       if (!res.ok) return;
       const body = await res.json();
       setCatalog(body.datasets || []);
@@ -823,7 +832,7 @@ export default function App() {
         });
         if (fromD) params.set('from_date', fromD);
         if (toD) params.set('to_date', toD);
-        const res = await fetch(`/api/data/records?${params.toString()}`);
+        const res = await apiFetch(`/api/data/records?${params.toString()}`);
         if (!res.ok) {
           const err = await res.json().catch(() => ({}));
           throw new Error(err.detail || 'Could not load stored records.');
@@ -844,7 +853,7 @@ export default function App() {
 
   const fetchLiveStatus = useCallback(async () => {
     try {
-      const res = await fetch('/api/live/status');
+      const res = await apiFetch('/api/live/status');
       if (!res.ok) return;
       const body: LiveStatusPayload = await res.json();
       setLiveStatus(body);
@@ -853,18 +862,35 @@ export default function App() {
     }
   }, []);
 
+  const canQueryProtectedApi =
+    authReady && (!securityStatus?.auth_enforced || hasAuthSession);
+
   useEffect(() => {
+    if (!canQueryProtectedApi) {
+      if (authReady) setLoading(false);
+      return;
+    }
+    setLoadError(null);
     void fetchOverview(true);
+    void fetchStreakMeta();
     void searchInstruments('', 'ALL');
     void fetchCatalog();
     void fetchLiveStatus();
-  }, [fetchOverview, searchInstruments, fetchCatalog, fetchLiveStatus]);
+  }, [
+    authReady,
+    canQueryProtectedApi,
+    fetchOverview,
+    fetchStreakMeta,
+    searchInstruments,
+    fetchCatalog,
+    fetchLiveStatus,
+  ]);
 
   const handlePollFeeds = async () => {
     setFeedActionLoading(true);
     setFeedFeedback(null);
     try {
-      const res = await fetch('/api/live/feeds/poll', {
+      const res = await apiFetch('/api/live/feeds/poll', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({}),
@@ -890,7 +916,7 @@ export default function App() {
     setFeedActionLoading(true);
     setFeedFeedback(null);
     try {
-      const res = await fetch('/api/live/feeds/failover', {
+      const res = await apiFetch('/api/live/feeds/failover', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ reason: 'Operator hot-standby failover drill from dashboard' }),
@@ -916,7 +942,7 @@ export default function App() {
     setFeedActionLoading(true);
     setFeedFeedback(null);
     try {
-      const res = await fetch('/api/live/feeds/recover', { method: 'POST' });
+      const res = await apiFetch('/api/live/feeds/recover', { method: 'POST' });
       const body = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(body.detail || 'Primary recovery failed.');
       setLiveStatus((prev) => ({
@@ -937,7 +963,7 @@ export default function App() {
   const handleRunPreflight = async () => {
     setRunningPreflight(true);
     try {
-      const res = await fetch('/api/live/preflight', {
+      const res = await apiFetch('/api/live/preflight', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ symbols: [histSymbol.trim().toUpperCase() || 'RELIANCE', 'NIFTY'] }),
@@ -965,7 +991,7 @@ export default function App() {
   const handleToggleKillSwitch = async (engage: boolean) => {
     setKillBusy(true);
     try {
-      const res = await fetch('/api/live/kill-switch', {
+      const res = await apiFetch('/api/live/kill-switch', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -992,7 +1018,7 @@ export default function App() {
   const handleVerifyAuditChain = async () => {
     setVerifyingAudit(true);
     try {
-      const res = await fetch('/api/audit/verify?limit=20');
+      const res = await apiFetch('/api/audit/verify?limit=20');
       const body = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(body.detail || 'Audit verification failed.');
       setLiveStatus((prev) =>
@@ -1013,7 +1039,7 @@ export default function App() {
     setSyncingMaster(brokerId);
     setInstrFeedback(null);
     try {
-      const res = await fetch('/api/instruments/sync', {
+      const res = await apiFetch('/api/instruments/sync', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ broker_id: brokerId }),
@@ -1091,7 +1117,7 @@ export default function App() {
     setDownloadingHist(true);
     setDataFeedback(null);
     try {
-      const res = await fetch('/api/data/download', {
+      const res = await apiFetch('/api/data/download', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1140,7 +1166,7 @@ export default function App() {
   const handleProbeBroker = async (brokerId: string) => {
     setProbingIds((prev) => ({ ...prev, [brokerId]: true }));
     try {
-      const res = await fetch(`/api/brokers/${brokerId}/probe`, { method: 'POST' });
+      const res = await apiFetch(`/api/brokers/${brokerId}/probe`, { method: 'POST' });
       const data = await res.json();
       if (data.broker) {
         setOverview((prev) =>
@@ -1160,7 +1186,7 @@ export default function App() {
   const handleDisconnectBroker = async (brokerId: string) => {
     setProbingIds((prev) => ({ ...prev, [brokerId]: true }));
     try {
-      const res = await fetch(`/api/brokers/${brokerId}/disconnect`, { method: 'POST' });
+      const res = await apiFetch(`/api/brokers/${brokerId}/disconnect`, { method: 'POST' });
       const data = await res.json();
       if (data.broker) {
         setOverview((prev) =>
@@ -1181,7 +1207,7 @@ export default function App() {
     setSavingRouting(true);
     setRoutingFeedback(null);
     try {
-      const res = await fetch('/api/selection', {
+      const res = await apiFetch('/api/selection', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1209,7 +1235,7 @@ export default function App() {
 
   const closeReconnectModal = useCallback(() => {
     if (captureActive && modalBrokerId) {
-      void fetch(`/api/brokers/${modalBrokerId}/reconnect-cancel`, {
+      void apiFetch(`/api/brokers/${modalBrokerId}/reconnect-cancel`, {
         method: 'POST',
         keepalive: true,
       }).catch(() => {});
@@ -1221,7 +1247,7 @@ export default function App() {
   const pollCaptureStatus = useCallback(async () => {
     if (!modalBrokerId || !captureActive) return;
     try {
-      const res = await fetch(`/api/brokers/${modalBrokerId}/reconnect-status`);
+      const res = await apiFetch(`/api/brokers/${modalBrokerId}/reconnect-status`);
       if (!res.ok) return;
       const st = await res.json();
       const label =
@@ -1302,7 +1328,7 @@ export default function App() {
       (modalBrokerId === 'zerodha' ? 'Zerodha Kite' : 'Upstox');
     setModalFeedback(null);
     try {
-      const res = await fetch(`/api/brokers/${modalBrokerId}/credentials`, {
+      const res = await apiFetch(`/api/brokers/${modalBrokerId}/credentials`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1332,7 +1358,7 @@ export default function App() {
     setModalFeedback(null);
 
     if (apiKey.trim() && apiSecret.trim()) {
-      const saveRes = await fetch(`/api/brokers/${modalBrokerId}/credentials`, {
+      const saveRes = await apiFetch(`/api/brokers/${modalBrokerId}/credentials`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1350,7 +1376,7 @@ export default function App() {
     }
 
     try {
-      const res = await fetch(`/api/brokers/${modalBrokerId}/reconnect`, {
+      const res = await apiFetch(`/api/brokers/${modalBrokerId}/reconnect`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ redirect_uri: redirectUri.trim() || null }),
@@ -1400,7 +1426,7 @@ export default function App() {
     setExchanging(true);
     setModalFeedback(null);
     try {
-      const res = await fetch(`/api/brokers/${modalBrokerId}/callback-exchange`, {
+      const res = await apiFetch(`/api/brokers/${modalBrokerId}/callback-exchange`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1797,13 +1823,24 @@ export default function App() {
               <AlertCircle className="h-4 w-4 shrink-0 text-red-400" />
               <span>{loadError}</span>
             </div>
-            <button
-              type="button"
-              onClick={() => void fetchOverview(true)}
-              className="shrink-0 whitespace-nowrap rounded-lg border border-red-700/60 px-3 py-1.5 text-xs font-semibold text-red-100 hover:bg-red-900/40"
-            >
-              Retry
-            </button>
+            <div className="flex items-center gap-2">
+              {securityStatus?.auth_enforced && !hasAuthSession && (
+                <button
+                  type="button"
+                  onClick={() => setAuthModalOpen(true)}
+                  className="shrink-0 whitespace-nowrap rounded-lg bg-sky-400 px-3 py-1.5 text-xs font-semibold text-sky-950 hover:bg-sky-300"
+                >
+                  Unlock Session
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={() => void fetchOverview(true)}
+                className="shrink-0 whitespace-nowrap rounded-lg border border-red-700/60 px-3 py-1.5 text-xs font-semibold text-red-100 hover:bg-red-900/40"
+              >
+                Retry
+              </button>
+            </div>
           </div>
         )}
 
@@ -3370,7 +3407,17 @@ export default function App() {
           } else {
             void refreshSecurityStatus();
           }
-          setHasAuthSession(hasSessionToken());
+          const unlockedNow = hasSessionToken();
+          setHasAuthSession(unlockedNow);
+          if (unlockedNow) {
+            setAuthPromptReason('');
+            setLoadError(null);
+            void fetchOverview(true);
+            void fetchStreakMeta();
+            void searchInstruments('', 'ALL');
+            void fetchCatalog();
+            void fetchLiveStatus();
+          }
         }}
       />
     </div>

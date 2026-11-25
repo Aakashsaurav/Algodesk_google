@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { apiFetch, withAuthTokenQuery } from '../../utils/authClient';
 import {
   Bell,
   Code2,
@@ -200,7 +201,7 @@ export function DiscoverScannersView({
     if (liveSessionId) {
       setLiveSessionId(null);
       setLiveStatusText('');
-      await fetch('/api/analytics/live-screener/stop', {
+      await apiFetch('/api/analytics/live-screener/stop', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({}),
@@ -246,7 +247,7 @@ export function DiscoverScannersView({
         if (item.engine !== 'python' && item.rule) {
           payload.rule_def = item.rule;
         }
-        const res = await fetch('/api/analytics/screener', {
+        const res = await apiFetch('/api/analytics/screener', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload),
@@ -294,7 +295,7 @@ export function DiscoverScannersView({
     setLiveStatusText('Connecting to WebSocket market feed...');
     try {
       const target = parseScanTarget();
-      const res = await fetch('/api/analytics/live-screener/start', {
+      const res = await apiFetch('/api/analytics/live-screener/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -316,7 +317,7 @@ export function DiscoverScannersView({
       if (Array.isArray(body.columns)) setColumns(body.columns);
 
       const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const ws = new WebSocket(`${proto}//${window.location.host}/ws/live-screener`);
+      const ws = new WebSocket(withAuthTokenQuery(`${proto}//${window.location.host}/ws/live-screener`));
       wsRef.current = ws;
       ws.onmessage = (evt) => {
         try {
@@ -380,7 +381,7 @@ export function DiscoverScannersView({
     setAlertFeedback('');
     try {
       const target = parseScanTarget();
-      const res = await fetch('/api/streak/scanners/alerts', {
+      const res = await apiFetch('/api/streak/scanners/alerts', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -413,7 +414,7 @@ export function DiscoverScannersView({
   };
 
   const handleDeleteSaved = async (ruleId: string) => {
-    await fetch(`/api/streak/rules/${encodeURIComponent(ruleId)}`, { method: 'DELETE' }).catch(() => {});
+    await apiFetch(`/api/streak/rules/${encodeURIComponent(ruleId)}`, { method: 'DELETE' }).catch(() => {});
     onRefreshMeta();
   };
 

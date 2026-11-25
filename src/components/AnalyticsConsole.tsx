@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { apiFetch, withAuthTokenQuery } from '../utils/authClient';
 import {
   Activity,
   AlertCircle,
@@ -599,7 +600,7 @@ export function AnalyticsConsole({
   const fetchAnalyticsMeta = useCallback(async (forceReload = false) => {
     setMetaLoading(true);
     try {
-      const res = await fetch(forceReload ? '/api/analytics/reload' : '/api/analytics/meta', {
+      const res = await apiFetch(forceReload ? '/api/analytics/reload' : '/api/analytics/meta', {
         method: forceReload ? 'POST' : 'GET',
       });
       if (!res.ok) return;
@@ -678,7 +679,7 @@ export function AnalyticsConsole({
     const connectWs = () => {
       if (cancelled) return;
       const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const url = `${proto}//${window.location.host}/ws/live-screener`;
+      const url = withAuthTokenQuery(`${proto}//${window.location.host}/ws/live-screener`);
       setLsWsStatus('connecting');
       const ws = new WebSocket(url);
       lsWsRef.current = ws;
@@ -803,7 +804,7 @@ export function AnalyticsConsole({
     setSyncingCsv(true);
     setCsvSyncBanner(null);
     try {
-      const res = await fetch('/api/analytics/universes/sync', {
+      const res = await apiFetch('/api/analytics/universes/sync', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({}),
@@ -848,7 +849,7 @@ export function AnalyticsConsole({
     setLsBusy(true);
     setLsError('');
     try {
-      const res = await fetch('/api/analytics/live-screener/start', {
+      const res = await apiFetch('/api/analytics/live-screener/start', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -880,7 +881,7 @@ export function AnalyticsConsole({
     setLsBusy(true);
     setLsError('');
     try {
-      const res = await fetch('/api/analytics/live-screener/stop', { method: 'POST' });
+      const res = await apiFetch('/api/analytics/live-screener/stop', { method: 'POST' });
       const body = (await res.json().catch(() => ({}))) as LiveScreenerStatePayload & { detail?: string };
       if (res.ok) {
         setLsState(body);
@@ -895,7 +896,7 @@ export function AnalyticsConsole({
   const loadRiskStatus = useCallback(async () => {
     setRiskBusy(true);
     try {
-      const res = await fetch('/api/analytics/risk');
+      const res = await apiFetch('/api/analytics/risk');
       if (!res.ok) return;
       const body = (await res.json()) as RiskEvaluationPayload;
       setRiskData(body);
@@ -923,7 +924,7 @@ export function AnalyticsConsole({
     onProgress: (job: AsyncJobStatus) => void
   ): Promise<AsyncJobStatus> {
     for (let attempt = 0; attempt < 1500; attempt += 1) {
-      const res = await fetch(`/api/analytics/jobs/${encodeURIComponent(jobId)}`);
+      const res = await apiFetch(`/api/analytics/jobs/${encodeURIComponent(jobId)}`);
       const body = (await res.json().catch(() => ({}))) as { job?: AsyncJobStatus; detail?: string };
       if (!res.ok || !body.job) {
         throw new Error(body.detail || 'Could not query background job status.');
@@ -939,7 +940,7 @@ export function AnalyticsConsole({
 
   async function handleCancelJob(jobId: string) {
     try {
-      await fetch(`/api/analytics/jobs/${encodeURIComponent(jobId)}/cancel`, { method: 'POST' });
+      await apiFetch(`/api/analytics/jobs/${encodeURIComponent(jobId)}/cancel`, { method: 'POST' });
     } catch {
       // ignore cancel errors
     }
@@ -958,7 +959,7 @@ export function AnalyticsConsole({
     setScBusy(true);
     setScError('');
     try {
-      const res = await fetch('/api/analytics/screener', {
+      const res = await apiFetch('/api/analytics/screener', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1010,7 +1011,7 @@ export function AnalyticsConsole({
     setBtBusy(true);
     setBtError('');
     try {
-      const res = await fetch('/api/analytics/backtest', {
+      const res = await apiFetch('/api/analytics/backtest', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1057,7 +1058,7 @@ export function AnalyticsConsole({
     setRiskBusy(true);
     setRiskFeedback(null);
     try {
-      const res = await fetch('/api/analytics/risk', {
+      const res = await apiFetch('/api/analytics/risk', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

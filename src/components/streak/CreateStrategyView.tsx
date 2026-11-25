@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
+import { apiFetch } from '../../utils/authClient';
 import {
   ChevronDown,
   ChevronUp,
@@ -259,7 +260,7 @@ export function CreateStrategyView({
     setError('');
     setNotice('');
     try {
-      const res = await fetch('/api/streak/rules', {
+      const res = await apiFetch('/api/streak/rules', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(buildRuleDef()),
@@ -285,7 +286,7 @@ export function CreateStrategyView({
     try {
       const saved = await handleSaveStrategy();
       if (!saved?.id) return;
-      const res = await fetch('/api/streak/rules/export-python', {
+      const res = await apiFetch('/api/streak/rules/export-python', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ rule_def: saved, save_to_disk: true }),
@@ -321,7 +322,7 @@ export function CreateStrategyView({
     setError('');
     setNotice('');
     try {
-      const res = await fetch(`/api/streak/rules/${encodeURIComponent(targetId)}`, { method: 'DELETE' });
+      const res = await apiFetch(`/api/streak/rules/${encodeURIComponent(targetId)}`, { method: 'DELETE' });
       const body = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(body.detail || 'Could not delete strategy.');
       setConfirmDeleteId(null);
@@ -399,7 +400,7 @@ export function CreateStrategyView({
         charges_profile: chargesProfile,
         segment: effSegment,
       };
-      const res = await fetch('/api/streak/backtest', {
+      const res = await apiFetch('/api/streak/backtest', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),

@@ -1,8 +1,9 @@
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import { Lock, ShieldCheck, ShieldAlert, Unlock, X } from 'lucide-react';
 import {
   claimAdminPasscode,
   clearSessionToken,
+  fetchSecurityStatus,
   hasSessionToken,
   loginAdmin,
   type SecurityStatus,
@@ -23,6 +24,7 @@ export function AdminAuthModal({
   onClose,
   onAuthenticated,
 }: AdminAuthModalProps) {
+  const [localStatus, setLocalStatus] = useState<SecurityStatus | null>(securityStatus);
   const [passcode, setPasscode] = useState('');
   const [confirmPasscode, setConfirmPasscode] = useState('');
   const [bootstrapCode, setBootstrapCode] = useState('');
@@ -30,12 +32,34 @@ export function AdminAuthModal({
   const [error, setError] = useState('');
   const [success, setSuccess] = useState('');
 
+  useEffect(() => {
+    if (securityStatus) {
+      setLocalStatus(securityStatus);
+    }
+  }, [securityStatus]);
+
+  useEffect(() => {
+    if (!open) return;
+    setError('');
+    setSuccess('');
+    let cancelled = false;
+    void fetchSecurityStatus().then((fresh) => {
+      if (!cancelled && fresh) {
+        setLocalStatus(fresh);
+      }
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [open]);
+
   if (!open) return null;
 
-  const needsClaim = Boolean(securityStatus?.needs_claim);
-  const bootstrapRequired = Boolean(needsClaim && securityStatus?.bootstrap_required);
+  const effectiveStatus = localStatus ?? securityStatus;
+  const needsClaim = Boolean(effectiveStatus?.needs_claim);
+  const bootstrapRequired = Boolean(needsClaim && effectiveStatus?.bootstrap_required);
   const unlocked = hasSessionToken();
-  const liveEnabled = Boolean(securityStatus?.live_trading_enabled);
+  const liveEnabled = Boolean(effectiveStatus?.live_trading_enabled);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -65,12 +89,13 @@ export function AdminAuthModal({
         setPasscode('');
         setConfirmPasscode('');
         setBootstrapCode('');
+        if (res.status) setLocalStatus(res.status);
         setSuccess('Admin passcode saved on server and session unlocked.');
         onAuthenticated(res.status || null);
         window.setTimeout(() => {
           setSuccess('');
           onClose();
-        }, 650);
+        }, 450);
       } finally {
         setBusy(false);
       }
@@ -90,12 +115,13 @@ export function AdminAuthModal({
         return;
       }
       setPasscode('');
+      if (res.status) setLocalStatus(res.status);
       setSuccess('Session unlocked in memory.');
       onAuthenticated(res.status || null);
       window.setTimeout(() => {
         setSuccess('');
         onClose();
-      }, 500);
+      }, 350);
     } finally {
       setBusy(false);
     }

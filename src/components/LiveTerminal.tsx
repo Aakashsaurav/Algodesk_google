@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { apiFetch, withAuthTokenQuery } from '../utils/authClient';
 import {
   Activity,
   AlertCircle,
@@ -223,7 +224,7 @@ export function LiveTerminal({ onNavigateHome }: LiveTerminalProps) {
 
   const fetchInitialSnapshot = useCallback(async () => {
     try {
-      const res = await fetch('/api/live/status');
+      const res = await apiFetch('/api/live/status');
       const data = await res.json();
       if (res.ok && data.feeds) {
         applyFeedPayload(data.feeds);
@@ -260,7 +261,7 @@ export function LiveTerminal({ onNavigateHome }: LiveTerminalProps) {
     const startSseFallback = () => {
       if (unmountedRef.current || paused) return;
       try {
-        const es = new EventSource('/api/live/stream');
+        const es = new EventSource(withAuthTokenQuery('/api/live/stream'));
         sseRef.current = es;
         es.onopen = () => {
           if (!unmountedRef.current) setWsStatus('sse_open');
@@ -289,7 +290,7 @@ export function LiveTerminal({ onNavigateHome }: LiveTerminalProps) {
 
     try {
       const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-      const wsUrl = `${proto}//${window.location.host}/ws/live`;
+      const wsUrl = withAuthTokenQuery(`${proto}//${window.location.host}/ws/live`);
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
       let openedOnce = false;
@@ -357,7 +358,7 @@ export function LiveTerminal({ onNavigateHome }: LiveTerminalProps) {
       if (instType && instType !== 'ALL') {
         params.set('instrument_type', instType);
       }
-      const res = await fetch(`/api/instruments/search?${params.toString()}`);
+      const res = await apiFetch(`/api/instruments/search?${params.toString()}`);
       if (seq !== instrSearchSeqRef.current) return;
       if (!res.ok) {
         const err = await res.json().catch(() => ({}));
@@ -412,7 +413,7 @@ export function LiveTerminal({ onNavigateHome }: LiveTerminalProps) {
         });
         if (exp) params.set('expiry', exp);
         if (stk && !Number.isNaN(Number(stk))) params.set('strike', stk);
-        const res = await fetch(`/api/instruments/fno?${params.toString()}`);
+        const res = await apiFetch(`/api/instruments/fno?${params.toString()}`);
         if (seq !== fnoFetchSeqRef.current || !res.ok) return;
         const payload: FnoContractsPayload = await res.json();
         if (seq !== fnoFetchSeqRef.current) return;
@@ -480,7 +481,7 @@ export function LiveTerminal({ onNavigateHome }: LiveTerminalProps) {
     setSyncingMaster(brokerId);
     setInstrFeedback(null);
     try {
-      const res = await fetch('/api/instruments/sync', {
+      const res = await apiFetch('/api/instruments/sync', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ broker_id: brokerId }),
@@ -555,7 +556,7 @@ export function LiveTerminal({ onNavigateHome }: LiveTerminalProps) {
     setFeedback(null);
 
     try {
-      const res = await fetch('/api/live/subscribe', {
+      const res = await apiFetch('/api/live/subscribe', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -588,7 +589,7 @@ export function LiveTerminal({ onNavigateHome }: LiveTerminalProps) {
   const unsubscribeAsset = async (symbol: string, exchange: string) => {
     setFeedback(null);
     try {
-      const res = await fetch('/api/live/unsubscribe', {
+      const res = await apiFetch('/api/live/unsubscribe', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ symbol, exchange }),
@@ -608,7 +609,7 @@ export function LiveTerminal({ onNavigateHome }: LiveTerminalProps) {
   const handleManualPoll = async () => {
     setPolling(true);
     try {
-      const res = await fetch('/api/live/feeds/poll', {
+      const res = await apiFetch('/api/live/feeds/poll', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({}),
@@ -627,7 +628,7 @@ export function LiveTerminal({ onNavigateHome }: LiveTerminalProps) {
   const handleFailoverToggle = async () => {
     const endpoint = feedState?.in_failover ? '/api/live/feeds/recover' : '/api/live/feeds/failover';
     try {
-      const res = await fetch(endpoint, { method: 'POST' });
+      const res = await apiFetch(endpoint, { method: 'POST' });
       const data = await res.json();
       if (!res.ok) throw new Error(data.detail || 'Feed switch failed.');
       applyFeedPayload(data);

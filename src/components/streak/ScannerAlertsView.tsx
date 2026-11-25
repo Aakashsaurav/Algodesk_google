@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import { apiFetch } from '../../utils/authClient';
 import {
   BarChart2,
   Bell,
@@ -40,7 +41,7 @@ export function ScannerAlertsView({
     setLoading(true);
     setError('');
     try {
-      const res = await fetch('/api/streak/scanners/alerts');
+      const res = await apiFetch('/api/streak/scanners/alerts');
       const body = await res.json().catch(() => ({}));
       if (!res.ok) throw new Error(body.detail || 'Could not load scanner alerts.');
       setSubscriptions(Array.isArray(body.subscriptions) ? body.subscriptions : []);
@@ -89,7 +90,7 @@ export function ScannerAlertsView({
     setBusyId(subId);
     setError('');
     try {
-      const res = await fetch(`/api/streak/scanners/alerts/${encodeURIComponent(subId)}/action`, {
+      const res = await apiFetch(`/api/streak/scanners/alerts/${encodeURIComponent(subId)}/action`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ action }),
@@ -107,7 +108,7 @@ export function ScannerAlertsView({
   const handleDelete = async (subId: string) => {
     setBusyId(subId);
     try {
-      await fetch(`/api/streak/scanners/alerts/${encodeURIComponent(subId)}`, { method: 'DELETE' });
+      await apiFetch(`/api/streak/scanners/alerts/${encodeURIComponent(subId)}`, { method: 'DELETE' });
       if (selectedId === subId) setSelectedId('');
       await loadAlerts();
     } finally {

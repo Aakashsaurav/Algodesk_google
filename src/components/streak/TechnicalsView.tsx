@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { apiFetch } from '../../utils/authClient';
 import { Search, RefreshCw } from 'lucide-react';
 
 interface TechnicalsViewProps {
@@ -67,7 +68,7 @@ export function TechnicalsView({ initialSymbol }: TechnicalsViewProps = {}) {
     setLoading(true);
     setError('');
     try {
-      const res = await fetch('/api/streak/technicals', {
+      const res = await apiFetch('/api/streak/technicals', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ symbol: clean, exchange, timeframe: tf }),

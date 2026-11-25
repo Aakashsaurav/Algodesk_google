@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import { apiFetch } from '../../utils/authClient';
 import {
   ArrowRight,
   Bell,
@@ -166,7 +167,7 @@ export function DiscoverStrategiesView({
         charges_profile: 'zerodha',
         segment: item.segment,
       };
-      const res = await fetch('/api/streak/backtest', {
+      const res = await apiFetch('/api/streak/backtest', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
@@ -211,7 +212,7 @@ export function DiscoverStrategiesView({
     setDeletingId(ruleIdToDelete);
     setError('');
     try {
-      const res = await fetch(`/api/streak/rules/${encodeURIComponent(ruleIdToDelete)}`, {
+      const res = await apiFetch(`/api/streak/rules/${encodeURIComponent(ruleIdToDelete)}`, {
         method: 'DELETE',
       });
       const body = await res.json().catch(() => ({}));

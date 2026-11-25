@@ -318,8 +318,9 @@ class SecurityManager:
             if existing:
                 if not self._bootstrap_logged:
                     self._bootstrap_logged = True
-                    logger.info(
-                        "AlgoDesk first-run bootstrap code loaded from %s (passcode not yet claimed).",
+                    logger.warning(
+                        "AlgoDesk first-run bootstrap code: %s (loaded from %s; required to claim admin passcode)",
+                        existing,
                         self.bootstrap_file,
                     )
                 return existing
@@ -353,6 +354,8 @@ class SecurityManager:
         enforced = self.is_auth_enforced()
         needs_claim = (not env_tok and not has_passcode)
         bootstrap_required = bool(needs_claim and (self.bootstrap_file.exists() or self._require_auth_flag()))
+        if bootstrap_required and not self.bootstrap_file.exists():
+            self.ensure_bootstrap_code()
         with self._lock:
             now = datetime.now(tz=IST_TZ)
             self._sessions = {k: v for k, v in self._sessions.items() if v > now}

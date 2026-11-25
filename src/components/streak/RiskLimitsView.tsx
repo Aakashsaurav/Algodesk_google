@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
+import { apiFetch } from '../../utils/authClient';
 import {
   Activity,
   AlertTriangle,
@@ -126,9 +127,9 @@ export function RiskLimitsView() {
     setLoading(true);
     try {
       const [riskRes, ksRes, tgRes] = await Promise.all([
-        fetch('/api/analytics/risk'),
-        fetch('/api/live/status'),
-        fetch('/api/notifications/telegram'),
+        apiFetch('/api/analytics/risk'),
+        apiFetch('/api/live/status'),
+        apiFetch('/api/notifications/telegram'),
       ]);
       const riskBody = (await riskRes.json().catch(() => ({}))) as RiskApiPayload;
       const ksBody = await ksRes.json().catch(() => ({}));
@@ -181,7 +182,7 @@ export function RiskLimitsView() {
       if (tgChatIdInput.trim()) {
         payload.chat_id = tgChatIdInput.trim();
       }
-      const res = await fetch('/api/notifications/telegram', {
+      const res = await apiFetch('/api/notifications/telegram', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
@@ -202,7 +203,7 @@ export function RiskLimitsView() {
     setTgBusy(true);
     setTgFeedback(null);
     try {
-      const res = await fetch('/api/notifications/telegram/test', {
+      const res = await apiFetch('/api/notifications/telegram/test', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: '{}',
@@ -223,7 +224,7 @@ export function RiskLimitsView() {
     setSaving(true);
     setFeedback(null);
     try {
-      const res = await fetch('/api/analytics/risk', {
+      const res = await apiFetch('/api/analytics/risk', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(limits),
@@ -243,7 +244,7 @@ export function RiskLimitsView() {
     setKillBusy(true);
     setFeedback(null);
     try {
-      const res = await fetch('/api/live/kill-switch', {
+      const res = await apiFetch('/api/live/kill-switch', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ engaged: engage, reason: engage ? killReason : 'Operator resumed trading' }),
@@ -266,7 +267,7 @@ export function RiskLimitsView() {
     setPfBusy(true);
     setPfResult(null);
     try {
-      const res = await fetch('/api/live/preflight', {
+      const res = await apiFetch('/api/live/preflight', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

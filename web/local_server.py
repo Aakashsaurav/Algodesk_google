@@ -75,12 +75,19 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
         raw = self.rfile.read(length).decode("utf-8")
         return json.loads(raw) if raw.strip() else {}
 
-    def _enforce_auth(self, method: str, path: str) -> bool:
-        """Enforce deny-by-default Bearer auth across all HTTP verbs."""
-        if not security_manager.is_protected_request(method, path):
+    def _enforce_auth(self, method: str, path: str, query: Optional[Dict[str, List[str]]] = None) -> bool:
+        """Enforce deny-by-default Bearer auth across all HTTP verbs and WebSocket/SSE routes."""
+        is_ws = path.startswith("/ws/")
+        if not is_ws and not security_manager.is_protected_request(method, path):
+            return True
+        if is_ws and not security_manager.is_auth_enforced():
             return True
         if security_manager.verify_bearer(self.headers.get("Authorization")):
             return True
+        if (is_ws or path == "/api/live/stream") and query:
+            raw_tok = (query.get("token") or [""])[0]
+            if raw_tok and security_manager.verify_raw_token(raw_tok):
+                return True
         self._send_json(
             401,
             {
@@ -95,7 +102,7 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
         path = parsed.path
         query = parse_qs(parsed.query)
 
-        if not self._enforce_auth("GET", path):
+        if not self._enforce_auth("GET", path, query=query):
             return
 
         if path in {"/", "/terminal", "/terminal/"}:

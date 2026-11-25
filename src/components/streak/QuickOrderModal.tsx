@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { apiFetch } from '../../utils/authClient';
 import { AlertCircle, CheckCircle2, ShieldCheck, X } from 'lucide-react';
 
 export interface QuickOrderTarget {
@@ -43,7 +44,7 @@ export function QuickOrderModal({ target, tradingBroker, onClose }: QuickOrderMo
     setSubmitting(true);
     setResult(null);
     try {
-      const res = await fetch('/api/streak/orders/quick', {
+      const res = await apiFetch('/api/streak/orders/quick', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

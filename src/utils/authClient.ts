@@ -49,6 +49,12 @@ export function clearSessionToken(): void {
   setSessionToken(null);
 }
 
+export function withAuthTokenQuery(url: string): string {
+  if (!_sessionToken) return url;
+  const sep = url.includes('?') ? '&' : '?';
+  return `${url}${sep}token=${encodeURIComponent(_sessionToken)}`;
+}
+
 export function subscribeAuthRequired(fn: AuthRequiredListener): () => void {
   _authRequiredListeners.add(fn);
   return () => {
