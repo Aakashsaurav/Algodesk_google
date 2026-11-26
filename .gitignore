@@ -16,6 +16,7 @@ token.json
 .env*
 !.env.example
 Algodesk/
+artifacts/
 __pycache__/
 *.py[cod]
 .pytest_cache/
