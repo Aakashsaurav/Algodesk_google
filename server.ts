@@ -25,13 +25,23 @@ function readCliArg(flag: string): string | undefined {
   return undefined;
 }
 
-const PORT = Number(readCliArg('--port') || process.env.PORT || 3000);
+const IS_AISTUDIO_PREVIEW = Boolean(
+  process.env.APPLET_ID || process.env.NGINX_PORT || process.env.DEFAULT_APP_PORT
+);
+const PORT =
+  Number(
+    readCliArg('--port') ||
+      process.env.ALGODESK_PORT ||
+      (IS_AISTUDIO_PREVIEW
+        ? process.env.DEFAULT_APP_PORT || '3000'
+        : process.env.PORT || '3000')
+  ) || 3000;
 const IS_CLOUD_RUNTIME = Boolean(
-  process.env.K_SERVICE ||
+  IS_AISTUDIO_PREVIEW ||
+    process.env.K_SERVICE ||
     process.env.CLOUD_RUN_JOB ||
     process.env.RENDER ||
-    process.env.FLY_APP_NAME ||
-    process.env.PORT
+    process.env.FLY_APP_NAME
 );
 const ALLOW_REMOTE = ['1', 'true', 'yes', 'on'].includes(
   String(process.env.ALGODESK_ALLOW_REMOTE || '').trim().toLowerCase()
