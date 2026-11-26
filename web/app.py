@@ -22,7 +22,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response, StreamingRes
 from pydantic import BaseModel
 
 from config import install_log_redaction
-from web.security import RateLimitError, security_manager
+from web.security import RateLimitError, security_manager, validate_oauth_redirect_origin
 from web.service import hub_service
 from web.spa import ensure_spa_bundle, has_spa_bundle, render_spa_html, resolve_spa_asset
 
@@ -172,16 +172,25 @@ class RiskLimitsUpdateRequest(BaseModel):
     auto_engage_kill_switch: Optional[bool] = None
 
 
-def _render_callback_page(title: str, detail: str, broker_id: str, success: bool) -> str:
+def _render_callback_page(
+    title: str,
+    detail: str,
+    broker_id: str,
+    success: bool,
+    target_origin: Optional[str] = None,
+) -> str:
     safe_title = html.escape(title)
     safe_detail = html.escape(detail)
     js_broker = json.dumps(broker_id)
+    validated_origin = validate_oauth_redirect_origin(target_origin)
+    js_origin = json.dumps(validated_origin)
     script = ""
     if success:
         script = (
             "<script>"
             "try {"
-            f"  if (window.opener) {{ window.opener.postMessage({{type: 'algodesk-oauth-captured', brokerId: {js_broker}}}, '*'); }}"
+            f"  const targetOrigin = (window.location && window.location.origin && window.location.origin !== 'null') ? window.location.origin : {js_origin};"
+            f"  if (window.opener) {{ window.opener.postMessage({{type: 'algodesk-oauth-captured', brokerId: {js_broker}}}, targetOrigin); }}"
             "} catch (e) {}"
             "setTimeout(() => {"
             "  if (window.opener) { window.close(); }"
@@ -1184,6 +1193,106 @@ def create_app() -> FastAPI:
         limit: int = Query(default=100),
     ) -> dict:
         return hub_service.list_oms_orders(deployment_id=deployment_id, limit=limit)
+
+    @app.get("/api/streak/oms/events")
+    def api_streak_oms_events(
+        client_order_id: Optional[str] = Query(default=None),
+        limit: int = Query(default=200),
+    ) -> dict:
+        return hub_service.list_oms_events(client_order_id=client_order_id, limit=limit)
+
+    @app.post("/api/streak/oms/resolve")
+    def api_streak_oms_resolve(payload: Dict[str, Any]) -> dict:
+        try:
+            return hub_service.resolve_manual_oms_order(payload)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/live/depth")
+    def api_live_depth(
+        symbol: str = Query(...),
+        exchange: str = Query(default="NSE"),
+        levels: int = Query(default=5),
+        broker: Optional[str] = Query(default=None),
+    ) -> dict:
+        try:
+            return hub_service.get_market_depth(
+                symbol=symbol,
+                exchange=exchange,
+                levels=levels,
+                broker_id=broker,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/live/depth/mode")
+    def api_live_depth_mode(payload: Dict[str, Any]) -> dict:
+        try:
+            return hub_service.set_market_depth_mode(
+                levels=int(payload.get("levels", 5) or 5),
+                broker_id=payload.get("broker_id") or payload.get("broker"),
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/data/quality")
+    def api_data_quality(
+        symbol: str = Query(...),
+        exchange: str = Query(default="NSE"),
+        timeframe: str = Query(default="1day"),
+        from_date: Optional[str] = Query(default=None),
+        to_date: Optional[str] = Query(default=None),
+        provider: Optional[str] = Query(default=None),
+        adjustment_mode: Optional[str] = Query(default=None),
+    ) -> dict:
+        try:
+            return hub_service.get_data_quality(
+                symbol=symbol,
+                exchange=exchange,
+                timeframe=timeframe,
+                from_date=from_date,
+                to_date=to_date,
+                provider=provider,
+                adjustment_mode=adjustment_mode,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/universes/snapshots")
+    def api_universes_snapshots_list(universe_id: Optional[str] = Query(default=None)) -> dict:
+        return hub_service.list_universe_snapshots(universe_id=universe_id)
+
+    @app.post("/api/universes/snapshots")
+    def api_universes_snapshots_save(payload: Dict[str, Any]) -> dict:
+        try:
+            return hub_service.save_universe_snapshot(payload)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.get("/api/admin/backups")
+    def api_admin_backups_list() -> dict:
+        return hub_service.list_db_backups()
+
+    @app.post("/api/admin/backup")
+    def api_admin_backup_create(payload: Optional[Dict[str, Any]] = None) -> dict:
+        try:
+            body = payload or {}
+            return hub_service.create_db_backup(
+                label=str(body.get("label") or ""),
+                include=body.get("include") if isinstance(body.get("include"), list) else None,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/admin/restore")
+    def api_admin_backup_restore(payload: Dict[str, Any]) -> dict:
+        try:
+            return hub_service.restore_db_backup(
+                snapshot_id=str(payload.get("snapshot_id") or ""),
+                targets=payload.get("targets") if isinstance(payload.get("targets"), list) else None,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.get("/api/data/history")
     def api_data_history(

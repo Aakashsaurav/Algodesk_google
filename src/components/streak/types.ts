@@ -340,7 +340,13 @@ export interface BacktestFullResult extends BacktestRunSummary {
   end_time?: string | null;
   indicator_columns?: string[];
   has_ohlcv_export?: boolean;
-  cagr_pct: number;
+  cagr_pct: number | null;
+  annualized_return_pct?: number | null;
+  duration_days?: number;
+  cagr_methodology?: string;
+  sample_warning?: string | null;
+  reproducibility_manifest?: Record<string, unknown>;
+  warnings?: string[];
   sharpe_ratio: number;
   daily_sharpe_ratio?: number;
   bar_sharpe_ratio?: number;
@@ -406,6 +412,7 @@ export interface OmsOrderRecord {
   limit_price?: number | null;
   status: string;
   rejection_reason?: string;
+  error_class?: string;
   created_at_ist: string;
   updated_at_ist: string;
 }

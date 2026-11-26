@@ -22,6 +22,7 @@ import json
 import logging
 import os
 import stat
+import tempfile
 import threading
 import urllib.error
 import urllib.parse
@@ -275,9 +276,29 @@ class AuthManager:
                 if keychain_set(KEYRING_SERVICE, KEYRING_USERNAME, access_token):
                     disk_token_data.pop("access_token", None)
 
-            with open(self.token_file, "w", encoding="utf-8") as fh:
-                json.dump(disk_token_data, fh, indent=2)
-            os.chmod(self.token_file, stat.S_IRUSR | stat.S_IWUSR)
+            self.token_file.parent.mkdir(parents=True, exist_ok=True)
+            fd, tmp_name = tempfile.mkstemp(
+                prefix=f".{self.token_file.name}.",
+                suffix=".tmp",
+                dir=str(self.token_file.parent),
+            )
+            tmp_path = Path(tmp_name)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                    json.dump(disk_token_data, fh, indent=2)
+                    fh.flush()
+                    try:
+                        os.fsync(fh.fileno())
+                    except OSError:
+                        pass
+                os.chmod(tmp_path, stat.S_IRUSR | stat.S_IWUSR)
+                os.replace(tmp_path, self.token_file)
+            except Exception:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+                raise
         except Exception as exc:
             logger.warning("Could not persist token metadata: %s", exc)
 
@@ -335,6 +356,46 @@ class AuthManager:
                     "user_name": data.get("user_name", ""),
                 }
         return {"status": "not_authenticated"}
+
+    def get_token_expiry_status(
+        self,
+        *,
+        warn_within_minutes: int = 60,
+        now: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """Compute remaining session lifetime before Upstox 03:30 AM IST reset boundary."""
+        ref = now.astimezone(IST_TZ) if now else datetime.now(tz=IST_TZ)
+        info = self.get_token_info()
+        if info.get("status") != "valid":
+            _, next_expiry = current_upstox_session_bounds(ref)
+            return {
+                "broker": "upstox",
+                "authenticated": False,
+                "expires_at_ist": next_expiry.isoformat(timespec="seconds"),
+                "minutes_remaining": 0.0,
+                "expiring_soon": False,
+                "expired": True,
+            }
+
+        exp_raw = str(info.get("expires_at_ist") or "").strip()
+        try:
+            exp_dt = datetime.fromisoformat(exp_raw)
+            if exp_dt.tzinfo is None:
+                exp_dt = exp_dt.replace(tzinfo=IST_TZ)
+        except ValueError:
+            _, exp_dt = current_upstox_session_bounds(ref)
+
+        remaining_min = (exp_dt - ref).total_seconds() / 60.0
+        expired = remaining_min <= 0.0
+        expiring_soon = (not expired) and remaining_min <= max(1, int(warn_within_minutes))
+        return {
+            "broker": "upstox",
+            "authenticated": not expired,
+            "expires_at_ist": exp_dt.isoformat(timespec="seconds"),
+            "minutes_remaining": round(max(0.0, remaining_min), 1),
+            "expiring_soon": expiring_soon,
+            "expired": expired,
+        }
 
     def invalidate_local(self) -> None:
         """Clear local in-memory, disk, and optional Keychain token state."""

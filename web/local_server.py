@@ -1,11 +1,13 @@
 """
 web/local_server.py
 ===================
-Single-command local Python runner for MacBook Air M2 (8GB RAM).
+Single-command local Python launcher for MacBook Air M2 (8GB RAM).
 
-Uses FastAPI + Uvicorn when installed (recommended for macOS local dev), and
-transparently falls back to Python stdlib ThreadingHTTPServer with the exact
-same REST + OAuth + HTML routes when running in a minimal Python environment.
+Canonical Runtime:
+- Launches the canonical FastAPI + Uvicorn application (`web/app.py`) whenever
+  `fastapi` and `uvicorn` are installed (recommended & required for production).
+- `_StdlibBrokerHandler` below is a minimal stdlib compatibility fallback ONLY
+  for bare-Python environments without FastAPI/Uvicorn installed.
 """
 
 from __future__ import annotations
@@ -599,6 +601,53 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
             self._send_json(200, hub_service.list_oms_orders(deployment_id=dep_id, limit=limit))
             return
 
+        if path == "/api/streak/oms/events":
+            cid = query.get("client_order_id", [None])[0]
+            limit = int(query.get("limit", ["200"])[0] or 200)
+            self._send_json(200, hub_service.list_oms_events(client_order_id=cid, limit=limit))
+            return
+
+        if path == "/api/live/depth":
+            try:
+                sym = query.get("symbol", [""])[0]
+                exch = query.get("exchange", ["NSE"])[0]
+                levels = int(query.get("levels", ["5"])[0] or 5)
+                broker = query.get("broker", [None])[0]
+                self._send_json(
+                    200,
+                    hub_service.get_market_depth(symbol=sym, exchange=exch, levels=levels, broker_id=broker),
+                )
+            except Exception as exc:
+                self._send_json(400, {"detail": str(exc)})
+            return
+
+        if path == "/api/data/quality":
+            try:
+                self._send_json(
+                    200,
+                    hub_service.get_data_quality(
+                        symbol=query.get("symbol", [""])[0],
+                        exchange=query.get("exchange", ["NSE"])[0],
+                        timeframe=query.get("timeframe", ["1day"])[0],
+                        from_date=query.get("from_date", [None])[0],
+                        to_date=query.get("to_date", [None])[0],
+                        provider=query.get("provider", [None])[0],
+                        adjustment_mode=query.get("adjustment_mode", [None])[0],
+                    ),
+                )
+            except Exception as exc:
+                self._send_json(400, {"detail": str(exc)})
+            return
+
+        if path == "/api/universes/snapshots":
+            uid = query.get("universe_id", [None])[0]
+            self._send_json(200, hub_service.list_universe_snapshots(universe_id=uid))
+            return
+
+        if path == "/api/admin/backups":
+            self._send_json(200, hub_service.list_db_backups())
+            return
+
         if path == "/api/data/history":
             sym = query.get("symbol", [None])[0]
             exch = query.get("exchange", [None])[0]
@@ -653,7 +702,7 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
                     f"<p style='color:#94a3b8'>Session token captured automatically and saved securely. Returning to AlgoDesk...</p>"
                     f"<a href='/' style='color:#38bdf8'>Return to AlgoDesk</a>"
                     f"<script>"
-                    f"try {{ if (window.opener) {{ window.opener.postMessage({{type: 'algodesk-oauth-captured', brokerId: {js_broker}}}, '*'); }} }} catch (e) {{}}"
+                    f"try {{ const targetOrigin = (window.location && window.location.origin && window.location.origin !== 'null') ? window.location.origin : 'http://127.0.0.1:8000'; if (window.opener) {{ window.opener.postMessage({{type: 'algodesk-oauth-captured', brokerId: {js_broker}}}, targetOrigin); }} }} catch (e) {{}}"
                     f"setTimeout(() => {{ if (window.opener) {{ window.close(); }} else {{ window.location.href = '/'; }} }}, 900);"
                     f"</script></body></html>",
                 )
@@ -1099,6 +1148,44 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
             if path == "/api/streak/deployments/reconcile":
                 dep_id = body.get("deployment_id") if isinstance(body, dict) else None
                 self._send_json(200, hub_service.reconcile_deployments(deployment_id=dep_id))
+                return
+
+            if path == "/api/streak/oms/resolve":
+                self._send_json(200, hub_service.resolve_manual_oms_order(body))
+                return
+
+            if path == "/api/live/depth/mode":
+                self._send_json(
+                    200,
+                    hub_service.set_market_depth_mode(
+                        levels=int(body.get("levels", 5) or 5),
+                        broker_id=body.get("broker_id") or body.get("broker"),
+                    ),
+                )
+                return
+
+            if path == "/api/universes/snapshots":
+                self._send_json(200, hub_service.save_universe_snapshot(body))
+                return
+
+            if path == "/api/admin/backup":
+                self._send_json(
+                    200,
+                    hub_service.create_db_backup(
+                        label=str(body.get("label") or ""),
+                        include=body.get("include") if isinstance(body.get("include"), list) else None,
+                    ),
+                )
+                return
+
+            if path == "/api/admin/restore":
+                self._send_json(
+                    200,
+                    hub_service.restore_db_backup(
+                        snapshot_id=str(body.get("snapshot_id") or ""),
+                        targets=body.get("targets") if isinstance(body.get("targets"), list) else None,
+                    ),
+                )
                 return
 
             if path == "/api/security/claim":

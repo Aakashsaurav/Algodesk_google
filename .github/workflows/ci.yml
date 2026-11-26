@@ -1,0 +1,55 @@
+name: AlgoDesk CI Quality Gates
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  python-quality-gates:
+    name: Python Bytecode & Safety Test Suite
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies (optional runtime stack)
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Compile all Python packages
+        run: |
+          python -m compileall -q broker core risk execution deploy backtest screener strategies web config.py
+
+      - name: Run full unit & audit-gate test suite
+        run: |
+          python -m unittest discover -s tests -v
+
+  frontend-quality-gates:
+    name: TypeScript Lint & Production SPA Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install npm dependencies
+        run: npm ci
+
+      - name: TypeScript typecheck & lint
+        run: npm run lint
+
+      - name: Production Vite bundle build
+        run: npm run build

@@ -1025,7 +1025,7 @@ class BrokerHubService:
     # ── Security, Telegram, OMS Reconciliation & Data History Catalog ─────
 
     def get_security_status(self) -> Dict[str, Any]:
-        return {"ok": True, **security_manager.status()}
+        return {"ok": True, **security_manager.status(), "vault": config.vault_status()}
 
     def claim_admin_passcode(
         self,
@@ -1080,13 +1080,37 @@ class BrokerHubService:
 
         def _periodic_reconcile() -> None:
             try:
-                deployment_manager.reconcile_orders()
+                oms_res = deployment_manager.reconcile_orders()
+                risk_watchdog.report_dimension(
+                    "oms_reconciliation",
+                    True,
+                    f"OMS orders reconciled ({oms_res.get('checked', 0)} checked)",
+                )
             except Exception as exc:
                 logger.warning("Periodic OMS order reconciliation note: %s", exc)
+                risk_watchdog.report_dimension("oms_reconciliation", False, f"OMS reconciliation error: {exc}")
             try:
-                deployment_manager.reconcile_positions()
+                pos_res = deployment_manager.reconcile_positions()
+                mismatches = pos_res.get("mismatches") or []
+                if mismatches:
+                    risk_watchdog.report_dimension(
+                        "position_reconciliation",
+                        False,
+                        f"{len(mismatches)} position mismatch(es) detected during periodic reconciliation.",
+                    )
+                else:
+                    risk_watchdog.report_dimension(
+                        "position_reconciliation",
+                        True,
+                        "Positions aligned with broker.",
+                    )
             except Exception as exc:
                 logger.warning("Periodic position reconciliation note: %s", exc)
+                risk_watchdog.report_dimension(
+                    "position_reconciliation",
+                    False,
+                    f"Position reconciliation error: {exc}",
+                )
 
         try:
             risk_watchdog.set_reconcile_callback(_periodic_reconcile)
@@ -1444,6 +1468,122 @@ class BrokerHubService:
             "orders": oms_manager.list_orders(deployment_id=deployment_id, limit=limit),
         }
 
+    def list_oms_events(
+        self,
+        client_order_id: Optional[str] = None,
+        limit: int = 200,
+    ) -> Dict[str, Any]:
+        return {
+            "ok": True,
+            "events": oms_manager.list_order_events(client_order_id=client_order_id, limit=limit),
+        }
+
+    def resolve_manual_oms_order(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        cid = str(payload.get("client_order_id") or "").strip()
+        final_status = str(payload.get("final_status") or "").strip().upper()
+        if not cid or not final_status:
+            raise ValueError("client_order_id and final_status are required.")
+        rec = oms_manager.resolve_manual_order(
+            cid,
+            final_status=final_status,
+            filled_qty=int(payload["filled_qty"]) if payload.get("filled_qty") is not None else None,
+            average_price=float(payload["average_price"]) if payload.get("average_price") is not None else None,
+            broker_order_id=str(payload.get("broker_order_id") or "").strip() or None,
+            note=str(payload.get("note") or ""),
+            actor="operator",
+        )
+        return {"ok": True, "order": rec}
+
+    # ── Market Depth (L5 / L30), Data Quality, Universe Snapshots, Backups ─
+
+    def get_market_depth(
+        self,
+        *,
+        symbol: str,
+        exchange: str = "NSE",
+        levels: int = 5,
+        broker_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        clean_sym = (symbol or "").strip().upper()
+        if not clean_sym:
+            raise ValueError("symbol is required.")
+        sel = self._store.load()
+        eff_broker = (broker_id or sel.get("data_connection") or sel.get("trading_broker") or "upstox").strip().lower()
+        return feed_manager.get_market_depth(
+            clean_sym,
+            exchange=exchange,
+            levels=int(levels or 5),
+            broker_id=eff_broker,
+        )
+
+    def set_market_depth_mode(
+        self,
+        *,
+        levels: int = 5,
+        broker_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        sel = self._store.load()
+        eff_broker = (broker_id or sel.get("data_connection") or "upstox").strip().lower()
+        return feed_manager.set_depth_levels(int(levels or 5), broker_id=eff_broker)
+
+    def get_data_quality(
+        self,
+        *,
+        symbol: str,
+        exchange: str = "NSE",
+        timeframe: str = "1day",
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None,
+        provider: Optional[str] = None,
+        adjustment_mode: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        return historical_data_manager.get_data_quality(
+            symbol=symbol,
+            exchange=exchange,
+            timeframe=timeframe,
+            from_date=from_date,
+            to_date=to_date,
+            provider=provider,
+            adjustment_mode=adjustment_mode,
+        )
+
+    def list_universe_snapshots(self, universe_id: Optional[str] = None) -> Dict[str, Any]:
+        return {
+            "ok": True,
+            "snapshots": universe_resolver.list_universe_snapshots(universe_id=universe_id),
+        }
+
+    def save_universe_snapshot(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        syms = payload.get("symbols") or []
+        if isinstance(syms, str):
+            syms = [s.strip() for s in syms.replace("\n", ",").split(",") if s.strip()]
+        delisted = payload.get("delisted_symbols") or []
+        if isinstance(delisted, str):
+            delisted = [s.strip() for s in delisted.replace("\n", ",").split(",") if s.strip()]
+        return universe_resolver.save_universe_snapshot(
+            universe_id=str(payload.get("universe_id") or ""),
+            effective_date=str(payload.get("effective_date") or ""),
+            symbols=list(syms),
+            delisted_symbols=list(delisted),
+            source=str(payload.get("source") or "manual"),
+            notes=str(payload.get("notes") or ""),
+        )
+
+    def create_db_backup(self, *, label: str = "", include: Optional[List[str]] = None) -> Dict[str, Any]:
+        from core.backup import backup_manager
+
+        return backup_manager.create_backup(label=label, include=include)
+
+    def list_db_backups(self) -> Dict[str, Any]:
+        from core.backup import backup_manager
+
+        return {"ok": True, "backups": backup_manager.list_backups()}
+
+    def restore_db_backup(self, *, snapshot_id: str, targets: Optional[List[str]] = None) -> Dict[str, Any]:
+        from core.backup import backup_manager
+
+        return backup_manager.restore_backup(snapshot_id=snapshot_id, targets=targets)
+
     def control_deployment(self, deployment_id: str, action: str) -> Dict[str, Any]:
         return deployment_manager.control(deployment_id, action)
 
@@ -1650,6 +1790,11 @@ class BrokerHubService:
             algo_tag="ALGODESK-QUICK",
             client_order_id=cid,
         )
+        contract = None
+        try:
+            contract = instrument_index.get_contract(symbol, exchange=exchange)
+        except Exception:
+            contract = None
         oms_rec, _delta_qty, _fill_px = oms_manager.submit_order(
             req,
             adapter,
@@ -1657,6 +1802,7 @@ class BrokerHubService:
             exec_mode="live_auto",
             reason="quick_order",
             reference_price=price,
+            contract=contract,
         )
         oms_status = str(oms_rec.get("status") or "")
         if oms_status == OrderStatus.REJECTED.value:

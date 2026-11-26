@@ -144,8 +144,12 @@ def _fetch_one_yahoo_quote(sub: Dict[str, str], timeout: float = 4.0) -> Optiona
             "ask": None,
             "source": "yfinance",
             "transport": "unsupported_fno",
+            "execution_grade": False,
+            "feed_quality": "unsupported",
+            "source_timestamp_ist": None,
+            "received_at_ist": now_ist,
             "note": "Indian F&O live feed requires Upstox or Zerodha Kite session.",
-            "ts_ist": now_ist,
+            "ts_ist": None,
         }
 
     if sym in _YAHOO_LIVE_MAP:
@@ -172,6 +176,7 @@ def _fetch_one_yahoo_quote(sub: Dict[str, str], timeout: float = 4.0) -> Optiona
         return None
     meta = results[0].get("meta") or {}
     quote_ind = ((results[0].get("indicators") or {}).get("quote") or [{}])[0]
+    timestamps = results[0].get("timestamp") or []
 
     def _last_valid(arr: Any) -> Optional[float]:
         if not isinstance(arr, list):
@@ -202,6 +207,20 @@ def _fetch_one_yahoo_quote(sub: Dict[str, str], timeout: float = 4.0) -> Optiona
     day_low = meta.get("regularMarketDayLow") or _last_valid(quote_ind.get("low"))
     vol = meta.get("regularMarketVolume") or _last_valid(quote_ind.get("volume")) or 0
 
+    # C-03 / Finding 4: NEVER fabricate `now_ist` as source timestamp!
+    # Use Yahoo's genuine `regularMarketTime` or latest candle epoch; None if unavailable.
+    raw_epoch = meta.get("regularMarketTime")
+    if raw_epoch is None and isinstance(timestamps, list) and timestamps:
+        raw_epoch = timestamps[-1]
+    source_ts_ist: Optional[str] = None
+    if raw_epoch is not None:
+        try:
+            ep = float(raw_epoch)
+            if ep > 1_000_000_000:
+                source_ts_ist = datetime.fromtimestamp(ep, tz=timezone.utc).astimezone(IST_TZ).isoformat(timespec="seconds")
+        except Exception:
+            source_ts_ist = None
+
     return {
         "symbol": sym,
         "exchange": exch,
@@ -218,9 +237,13 @@ def _fetch_one_yahoo_quote(sub: Dict[str, str], timeout: float = 4.0) -> Optiona
         "bid": None,
         "ask": None,
         "source": "yfinance",
-        "transport": "live_chart_poll",
-        "note": "",
-        "ts_ist": now_ist,
+        "transport": "delayed_daily_chart",
+        "execution_grade": False,
+        "feed_quality": "delayed_daily",
+        "source_timestamp_ist": source_ts_ist,
+        "received_at_ist": now_ist,
+        "note": "Delayed daily reference feed (not execution-grade for live automated orders).",
+        "ts_ist": source_ts_ist,
     }
 
 
@@ -540,19 +563,53 @@ def _fetch_live_quotes_upstox(symbols: List[Any], timeout: float = 4.5) -> Dict[
             else 0.0
         )
 
-        ts_ms = live_ohlc.get("ts")
-        ts_str = now_ist
+        ts_ms = live_ohlc.get("ts") or item.get("timestamp")
+        source_ts: Optional[str] = None
         if ts_ms:
             try:
-                ts_str = datetime.fromtimestamp(float(ts_ms) / 1000.0, tz=timezone.utc).astimezone(IST_TZ).isoformat(timespec="seconds")
+                v_ts = float(ts_ms)
+                ep = v_ts / 1000.0 if v_ts > 1_000_000_000_000 else v_ts
+                if ep > 1_000_000_000:
+                    source_ts = datetime.fromtimestamp(ep, tz=timezone.utc).astimezone(IST_TZ).isoformat(timespec="seconds")
             except Exception:
-                ts_str = now_ist
+                try:
+                    source_ts = str(ts_ms)
+                except Exception:
+                    source_ts = None
 
         depth = item.get("depth") or {}
         buys = depth.get("buy") or []
         sells = depth.get("sell") or []
-        bid_val = round(float(buys[0]["price"]), 2) if buys and buys[0].get("price") else None
-        ask_val = round(float(sells[0]["price"]), 2) if sells and sells[0].get("price") else None
+        bids_norm = [
+            {"price": round(float(r.get("price") or 0.0), 4), "quantity": int(r.get("quantity") or 0), "orders": int(r.get("orders") or 0)}
+            for r in buys
+            if isinstance(r, dict) and (float(r.get("price") or 0.0) > 0 or int(r.get("quantity") or 0) > 0)
+        ]
+        asks_norm = [
+            {"price": round(float(r.get("price") or 0.0), 4), "quantity": int(r.get("quantity") or 0), "orders": int(r.get("orders") or 0)}
+            for r in sells
+            if isinstance(r, dict) and (float(r.get("price") or 0.0) > 0 or int(r.get("quantity") or 0) > 0)
+        ]
+        bid_val = round(bids_norm[0]["price"], 2) if (bids_norm and bids_norm[0]["price"] > 0) else None
+        ask_val = round(asks_norm[0]["price"], 2) if (asks_norm and asks_norm[0]["price"] > 0) else None
+        depth_payload = (
+            {
+                "symbol": sym,
+                "exchange": meta.get("exchange", "NSE"),
+                "depth_levels": max(len(bids_norm), len(asks_norm)),
+                "bids": bids_norm,
+                "asks": asks_norm,
+                "best_bid": bid_val,
+                "best_ask": ask_val,
+                "total_buy_qty": int(item.get("total_buy_quantity") or sum(b["quantity"] for b in bids_norm)),
+                "total_sell_qty": int(item.get("total_sell_quantity") or sum(a["quantity"] for a in asks_norm)),
+                "source": "upstox",
+                "transport": transport_used,
+                "ts_ist": source_ts or now_ist,
+            }
+            if (bids_norm or asks_norm)
+            else None
+        )
 
         quotes[sym] = {
             "symbol": sym,
@@ -569,10 +626,16 @@ def _fetch_live_quotes_upstox(symbols: List[Any], timeout: float = 4.5) -> Dict[
             "oi": int(item.get("oi") or 0),
             "bid": bid_val,
             "ask": ask_val,
+            "depth": depth_payload,
+            "depth_levels": depth_payload["depth_levels"] if depth_payload else 0,
             "source": "upstox",
             "transport": transport_used,
+            "execution_grade": True,
+            "feed_quality": "exchange_realtime",
+            "source_timestamp_ist": source_ts,
+            "received_at_ist": now_ist,
             "note": "",
-            "ts_ist": ts_str,
+            "ts_ist": source_ts or now_ist,
         }
 
     # If any instrument lacked prev_ohlc, pull cp/ltp once per trading day and cache it
@@ -695,8 +758,38 @@ def _fetch_live_quotes_zerodha(symbols: List[Any], timeout: float = 4.5) -> Dict
         depth = item.get("depth") or {}
         buys = depth.get("buy") or []
         sells = depth.get("sell") or []
-        bid = round(float(buys[0].get("price")), 2) if buys and buys[0].get("price") else None
-        ask = round(float(sells[0].get("price")), 2) if sells and sells[0].get("price") else None
+        bids_norm = [
+            {"price": round(float(r.get("price") or 0.0), 4), "quantity": int(r.get("quantity") or 0), "orders": int(r.get("orders") or 0)}
+            for r in buys
+            if isinstance(r, dict) and (float(r.get("price") or 0.0) > 0 or int(r.get("quantity") or 0) > 0)
+        ]
+        asks_norm = [
+            {"price": round(float(r.get("price") or 0.0), 4), "quantity": int(r.get("quantity") or 0), "orders": int(r.get("orders") or 0)}
+            for r in sells
+            if isinstance(r, dict) and (float(r.get("price") or 0.0) > 0 or int(r.get("quantity") or 0) > 0)
+        ]
+        bid = round(bids_norm[0]["price"], 2) if (bids_norm and bids_norm[0]["price"] > 0) else None
+        ask = round(asks_norm[0]["price"], 2) if (asks_norm and asks_norm[0]["price"] > 0) else None
+        raw_zts = item.get("timestamp") or item.get("last_trade_time")
+        z_source_ts: Optional[str] = str(raw_zts).strip() if raw_zts else None
+        depth_payload = (
+            {
+                "symbol": sym,
+                "exchange": meta.get("exchange", "NSE"),
+                "depth_levels": max(len(bids_norm), len(asks_norm)),
+                "bids": bids_norm,
+                "asks": asks_norm,
+                "best_bid": bid,
+                "best_ask": ask,
+                "total_buy_qty": int(item.get("buy_quantity") or sum(b["quantity"] for b in bids_norm)),
+                "total_sell_qty": int(item.get("sell_quantity") or sum(a["quantity"] for a in asks_norm)),
+                "source": "zerodha",
+                "transport": "kiteticker+quote",
+                "ts_ist": z_source_ts or now_ist,
+            }
+            if (bids_norm or asks_norm)
+            else None
+        )
 
         quotes[sym] = {
             "symbol": sym,
@@ -713,10 +806,16 @@ def _fetch_live_quotes_zerodha(symbols: List[Any], timeout: float = 4.5) -> Dict
             "oi": int(item.get("oi") or 0),
             "bid": bid,
             "ask": ask,
+            "depth": depth_payload,
+            "depth_levels": depth_payload["depth_levels"] if depth_payload else 0,
             "source": "zerodha",
             "transport": "kiteticker+quote",
+            "execution_grade": True,
+            "feed_quality": "exchange_realtime",
+            "source_timestamp_ist": z_source_ts,
+            "received_at_ist": now_ist,
             "note": "",
-            "ts_ist": now_ist,
+            "ts_ist": z_source_ts or now_ist,
         }
     return quotes
 
@@ -1631,6 +1730,102 @@ class HotStandbyFeedManager:
                 "quotes": ordered_quotes,
                 "tick_events": list(self._tick_events[:30]),
             }
+
+    # ── Modular Provider & L5/L30 Market Depth API ───────────────────────
+
+    def register_provider(
+        self,
+        provider_id: str,
+        fetcher: Callable[[List[Any]], Dict[str, Dict[str, Any]]],
+    ) -> None:
+        """Register an additional market-data provider fetcher without modifying feed_manager."""
+        pid = (provider_id or "").strip().lower()
+        if not pid or not callable(fetcher):
+            raise ValueError("Valid provider_id and callable fetcher required.")
+        with self._lock:
+            self._fetchers[pid] = fetcher
+            if pid not in self._slots:
+                self._slots[pid] = FeedSlotHealth(feed_id=pid, role="standby", status="STANDBY")
+
+    def set_depth_levels(self, levels: int, broker_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Switch live broker WebSocket market-depth level (e.g. Level 5 vs Level 30 on Upstox `full_d30`).
+        """
+        target = 30 if int(levels or 5) > 5 else 5
+        bid = (broker_id or self._active_feed_id or self._primary_id or "upstox").strip().lower()
+        applied = self._broker_ws.set_depth_levels(bid, target)
+        return {
+            "ok": applied > 0,
+            "broker_id": bid,
+            "requested_levels": target,
+            "active_depth_levels": applied,
+            "ws_status": self._broker_ws.status(bid),
+        }
+
+    def get_market_depth(
+        self,
+        symbol: str,
+        exchange: str = "NSE",
+        *,
+        levels: int = 5,
+        broker_id: Optional[str] = None,
+        instrument_key: str = "",
+    ) -> Dict[str, Any]:
+        """
+        Return normalized Level-5 or Level-30 market depth for `symbol`:
+        1. Prefers live broker WebSocket cached depth if it already satisfies `levels`.
+        2. Otherwise fetches via modular `BrokerRegistry.get(bid).fetch_market_depth(...)` REST API.
+        3. Falls back to latest cached quote depth if present.
+        """
+        from broker.registry import BrokerRegistry
+
+        sym = (symbol or "").strip().upper()
+        exch = (exchange or "NSE").strip().upper()
+        req_levels = 30 if int(levels or 5) > 5 else 5
+        preferred = (broker_id or self._active_feed_id or self._primary_id or "upstox").strip().lower()
+
+        # 1. Check live WebSocket cache first
+        ws_depth = self._broker_ws.get_cached_depth(preferred, sym, max_age_sec=15.0)
+        if ws_depth and int(ws_depth.get("depth_levels") or 0) >= min(req_levels, 5):
+            if req_levels <= 5 or int(ws_depth.get("depth_levels") or 0) > 5:
+                return {"ok": True, "source": ws_depth.get("source", preferred), "depth": ws_depth}
+
+        # 2. Try modular REST depth via BrokerRegistry
+        candidate_ids = [preferred] + [
+            pid for pid in BrokerRegistry.list_market_data_providers() if pid != preferred
+        ]
+        for pid in candidate_ids:
+            if not BrokerRegistry.has(pid):
+                continue
+            try:
+                adapter = BrokerRegistry.get(pid)
+                caps = getattr(adapter, "capabilities", None)
+                if caps is not None and int(getattr(caps, "max_depth_levels", 0) or 0) <= 0:
+                    continue
+                ikey = instrument_key
+                if not ikey and pid in {"upstox", "zerodha"}:
+                    ikey = instrument_index.resolve_key(sym, broker_id=pid, exchange=exch) or ""
+                md = adapter.fetch_market_depth(sym, exchange=exch, instrument_key=ikey, levels=req_levels)
+                if md is not None:
+                    return {"ok": True, "source": pid, "depth": md.to_dict()}
+            except Exception as exc:
+                logger.debug("Market depth REST fetch skipped for %s/%s: %s", pid, sym, exc)
+
+        # 3. Fallback to in-memory quote cache (including any WS depth with fewer levels)
+        if ws_depth:
+            return {"ok": True, "source": ws_depth.get("source", preferred), "depth": ws_depth}
+        with self._lock:
+            cached = self._quotes.get(_sub_key(sym, exch))
+        if isinstance(cached, dict) and isinstance(cached.get("depth"), dict):
+            return {"ok": True, "source": cached.get("source", preferred), "depth": dict(cached["depth"])}
+        return {
+            "ok": False,
+            "symbol": sym,
+            "exchange": exch,
+            "requested_levels": req_levels,
+            "depth": None,
+            "message": f"No live L{req_levels} depth available for {exch}:{sym} (connect Upstox/Zerodha or another depth-capable broker).",
+        }
 
 
 feed_manager = HotStandbyFeedManager()

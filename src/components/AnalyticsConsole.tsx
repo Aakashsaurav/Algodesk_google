@@ -263,7 +263,7 @@ interface BacktestResultPayload {
   final_equity: number;
   net_pnl: number;
   total_return_pct: number;
-  cagr_pct: number;
+  cagr_pct: number | null;
   max_drawdown_pct: number;
   sharpe_ratio: number;
   total_trades: number;
@@ -2818,7 +2818,11 @@ export function AnalyticsConsole({
                 </div>
                 <div>
                   <div className="text-slate-500">CAGR</div>
-                  <div className="mt-1 text-sm font-semibold text-slate-100">{btResult.cagr_pct}%</div>
+                  <div className="mt-1 text-sm font-semibold text-slate-100">
+                    {btResult.cagr_pct !== null && btResult.cagr_pct !== undefined
+                      ? `${btResult.cagr_pct}%`
+                      : 'N/A (<90d)'}
+                  </div>
                 </div>
                 <div>
                   <div className="text-slate-500">Max DD</div>

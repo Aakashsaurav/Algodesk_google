@@ -53,6 +53,53 @@ class AmbiguousSubmissionError(BrokerError):
     """
 
 
+class OrderRejectedError(BrokerError):
+    """
+    Raised when the broker or pre-flight contract validation DEFINITELY rejected
+    an order (e.g. HTTP 400/403/422 validation error, insufficient funds, invalid lot size).
+    Safe to mark REJECTED immediately without entering uncertain reconciliation.
+    """
+
+
+class TransientBrokerError(BrokerError):
+    """
+    Raised for non-order-modifying transient errors (e.g. quote/position read timeout)
+    or pre-dispatch local/connection failures where no order reached the exchange.
+    """
+
+
+def build_position_identity(
+    *,
+    symbol: str,
+    exchange: str = "NSE",
+    segment: str = "",
+    instrument_key: str = "",
+    product: str = "",
+    expiry: Optional[str] = None,
+    strike: Optional[float] = None,
+    option_type: Optional[str] = None,
+) -> str:
+    """
+    Canonical composite position identity (H-02 / H-06):
+    exchange|segment|instrument_key|symbol|product|expiry|strike|option_type
+    Prevents cross-exchange, cross-product (MIS vs CNC), and derivative expiry/strike collisions.
+    """
+    ex = (exchange or "NSE").strip().upper()
+    sym = (symbol or "").strip().upper()
+    seg = (segment or "").strip().upper()
+    if not seg:
+        if ex in {"NFO", "BFO", "MCX"} or expiry or option_type:
+            seg = "OPT" if option_type else "FUT"
+        else:
+            seg = "EQ"
+    ikey = (instrument_key or "").strip().upper()
+    prod = (product or "").strip().upper()
+    exp = (expiry or "").strip()
+    strike_str = f"{float(strike):g}" if strike is not None else ""
+    opt = (option_type or "").strip().upper()
+    return "|".join([ex, seg, ikey, sym, prod, exp, strike_str, opt])
+
+
 def make_broker_tag(client_order_id: str, max_len: int = 20) -> str:
     """
     Encode a deterministic, unique per-order broker tag fitting strictly within
@@ -116,9 +163,151 @@ class BrokerCapabilities:
     supports_market_data: bool = True
     supports_websocket: bool = False
     requires_oauth: bool = True
+    supports_historical: bool = True
+    supports_instrument_master: bool = False
+    max_depth_levels: int = 5
+    execution_grade_feed: bool = True
 
-    def to_dict(self) -> Dict[str, bool]:
+    def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(frozen=True, slots=True)
+class DepthLevel:
+    """Single level in a Level-2 / Level-5 / Level-30 market depth ladder."""
+
+    price: float
+    quantity: int
+    orders: int = 0
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "price": round(float(self.price), 4),
+            "quantity": int(self.quantity),
+            "orders": int(self.orders),
+        }
+
+
+@dataclass(slots=True)
+class MarketDepth:
+    """
+    Normalized Level-5 / Level-20 / Level-30 order-book snapshot exposed across
+    broker WebSockets (Upstox v3 `full` / `full_d30`, Zerodha KiteTicker) and REST APIs.
+    """
+
+    symbol: str
+    exchange: str = "NSE"
+    bids: List[DepthLevel] = field(default_factory=list)
+    asks: List[DepthLevel] = field(default_factory=list)
+    total_buy_qty: int = 0
+    total_sell_qty: int = 0
+    depth_levels: int = 0
+    source: str = ""
+    transport: str = ""
+    ts_ist: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        self.symbol = (self.symbol or "").strip().upper()
+        self.exchange = (self.exchange or "NSE").strip().upper()
+        if self.depth_levels <= 0:
+            self.depth_levels = max(len(self.bids), len(self.asks))
+        if self.total_buy_qty <= 0 and self.bids:
+            self.total_buy_qty = sum(max(0, int(b.quantity)) for b in self.bids)
+        if self.total_sell_qty <= 0 and self.asks:
+            self.total_sell_qty = sum(max(0, int(a.quantity)) for a in self.asks)
+
+    @property
+    def best_bid(self) -> Optional[float]:
+        for lvl in self.bids:
+            if lvl.price > 0:
+                return round(float(lvl.price), 4)
+        return None
+
+    @property
+    def best_ask(self) -> Optional[float]:
+        for lvl in self.asks:
+            if lvl.price > 0:
+                return round(float(lvl.price), 4)
+        return None
+
+    @property
+    def spread(self) -> Optional[float]:
+        bb, ba = self.best_bid, self.best_ask
+        if bb is None or ba is None:
+            return None
+        return round(ba - bb, 4)
+
+    @property
+    def spread_bps(self) -> Optional[float]:
+        bb, ba = self.best_bid, self.best_ask
+        if bb is None or ba is None or (bb + ba) <= 0:
+            return None
+        mid = (bb + ba) / 2.0
+        return round(((ba - bb) / mid) * 10000.0, 2)
+
+    @property
+    def imbalance_ratio(self) -> float:
+        tot = self.total_buy_qty + self.total_sell_qty
+        if tot <= 0:
+            return 0.0
+        return round((self.total_buy_qty - self.total_sell_qty) / float(tot), 4)
+
+    def walk_book(self, side: str, quantity: int) -> Dict[str, Any]:
+        """
+        Walk available order-book levels for a market order of `quantity` shares/contracts.
+        BUY/COVER consumes asks; SELL/SHORT consumes bids.
+        Returns VWAP fill price, fillable quantity, remaining unfilled quantity, and levels consumed.
+        """
+        qty_needed = max(0, int(quantity or 0))
+        if qty_needed <= 0:
+            return {"filled_qty": 0, "unfilled_qty": 0, "vwap": 0.0, "levels_used": 0, "slippage_bps": 0.0}
+        side_u = (side or "BUY").strip().upper()
+        book = self.asks if side_u in {"BUY", "COVER"} else self.bids
+        top_px = book[0].price if (book and book[0].price > 0) else 0.0
+        filled = 0
+        notional = 0.0
+        levels_used = 0
+        for lvl in book:
+            if lvl.price <= 0 or lvl.quantity <= 0:
+                continue
+            take = min(qty_needed - filled, int(lvl.quantity))
+            if take > 0:
+                filled += take
+                notional += take * float(lvl.price)
+                levels_used += 1
+            if filled >= qty_needed:
+                break
+        vwap = (notional / float(filled)) if filled > 0 else 0.0
+        slip_bps = 0.0
+        if filled > 0 and top_px > 0:
+            diff = (vwap - top_px) if side_u in {"BUY", "COVER"} else (top_px - vwap)
+            slip_bps = round((diff / top_px) * 10000.0, 2)
+        return {
+            "filled_qty": filled,
+            "unfilled_qty": max(0, qty_needed - filled),
+            "vwap": round(vwap, 4),
+            "levels_used": levels_used,
+            "slippage_bps": max(0.0, slip_bps),
+        }
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "symbol": self.symbol,
+            "exchange": self.exchange,
+            "depth_levels": self.depth_levels,
+            "bids": [b.to_dict() for b in self.bids],
+            "asks": [a.to_dict() for a in self.asks],
+            "best_bid": self.best_bid,
+            "best_ask": self.best_ask,
+            "spread": self.spread,
+            "spread_bps": self.spread_bps,
+            "total_buy_qty": int(self.total_buy_qty),
+            "total_sell_qty": int(self.total_sell_qty),
+            "imbalance_ratio": self.imbalance_ratio,
+            "source": self.source,
+            "transport": self.transport,
+            "ts_ist": self.ts_ist,
+        }
 
 
 @dataclass(slots=True)
@@ -237,6 +426,91 @@ class InstrumentContract:
     option_type: Optional[str] = None  # CE | PE | None
     upstox_key: str = ""
     zerodha_token: str = ""
+
+    @property
+    def effective_lot_size(self) -> int:
+        return max(1, int(self.lot_size or 1))
+
+    @property
+    def effective_tick_size(self) -> float:
+        ts = float(self.tick_size or 0.05)
+        return ts if ts > 0 else 0.05
+
+    @property
+    def is_derivative(self) -> bool:
+        ex = (self.exchange or "").strip().upper()
+        seg = (self.segment or "").strip().upper()
+        if ex in {"NFO", "BFO", "MCX", "NSE_FO", "BSE_FO", "MCX_FO"}:
+            return True
+        if seg in {"FUT", "OPT", "FO", "FNO", "NSE_FO", "BSE_FO", "MCX_FO"}:
+            return True
+        return bool(self.expiry or self.option_type or self.effective_lot_size > 1)
+
+    def identity_key(self, product: str = "") -> str:
+        """Full canonical contract identity key avoiding cross-exchange/product/expiry collisions."""
+        ex = (self.exchange or "NSE").strip().upper()
+        sym = (self.symbol or "").strip().upper()
+        prod = (product or "").strip().upper()
+        exp = (self.expiry or "").strip()
+        strike_str = f"{float(self.strike):g}" if self.strike is not None else ""
+        opt = (self.option_type or "").strip().upper()
+        parts = [ex, sym]
+        if prod:
+            parts.append(prod)
+        if exp or strike_str or opt:
+            parts.extend([exp, strike_str, opt])
+        return ":".join(parts)
+
+    def normalize_quantity(self, raw_qty: int) -> int:
+        """Floor raw quantity to the nearest valid contract lot-size multiple (0 if below 1 lot)."""
+        q = max(0, int(raw_qty or 0))
+        lot = self.effective_lot_size
+        if lot <= 1:
+            return q
+        return (q // lot) * lot
+
+    def validate_quantity(self, qty: int) -> Optional[str]:
+        """Return None if qty is valid for this contract, else an error message."""
+        q = int(qty or 0)
+        if q <= 0:
+            return f"Order quantity must be > 0 for {self.exchange}:{self.symbol}."
+        lot = self.effective_lot_size
+        if lot > 1 and (q % lot) != 0:
+            return (
+                f"Invalid quantity {q} for {self.exchange}:{self.symbol}: "
+                f"must be an exact multiple of lot_size={lot}."
+            )
+        return None
+
+    def normalize_price(self, price: float) -> float:
+        """Snap price to the contract's exchange tick size."""
+        ts = self.effective_tick_size
+        if price <= 0:
+            return 0.0
+        steps = round(float(price) / ts)
+        return round(steps * ts, 4)
+
+    def validate_price(self, price: Optional[float], *, allow_none: bool = False) -> Optional[str]:
+        """Validate price finiteness, positivity, and tick-size alignment."""
+        import math
+
+        if price is None:
+            return None if allow_none else f"Price is required for {self.exchange}:{self.symbol}."
+        try:
+            px = float(price)
+        except (TypeError, ValueError):
+            return f"Invalid non-numeric price {price!r} for {self.exchange}:{self.symbol}."
+        if not math.isfinite(px) or px <= 0:
+            return f"Price must be finite and > 0 for {self.exchange}:{self.symbol}, got {price!r}."
+        ts = self.effective_tick_size
+        if ts > 0:
+            nearest = round(px / ts) * ts
+            if abs(px - nearest) > max(1e-6, ts * 1e-3):
+                return (
+                    f"Price {px} for {self.exchange}:{self.symbol} is not aligned to "
+                    f"tick_size={ts} (nearest valid: {nearest:.4f})."
+                )
+        return None
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -436,6 +710,21 @@ class BrokerPosition:
     def market_value(self) -> float:
         return self.last_price * self.quantity
 
+    @property
+    def identity_key(self) -> str:
+        """Full composite instrument+product position identity for reconciliation."""
+        meta = self.metadata or {}
+        return build_position_identity(
+            symbol=self.symbol,
+            exchange=self.exchange,
+            segment=str(meta.get("segment") or ""),
+            instrument_key=self.instrument_key or str(meta.get("instrument_key") or ""),
+            product=self.product,
+            expiry=meta.get("expiry"),
+            strike=meta.get("strike"),
+            option_type=meta.get("option_type"),
+        )
+
 
 @dataclass(slots=True)
 class AccountBalance:
@@ -594,4 +883,125 @@ class BrokerBase(ABC):
             return float(self.get_balance().balance)
         except Exception:
             return 0.0
+
+    # ── Modular provider hooks (plug-and-play market data, depth, historical, instruments, WS) ──
+    def is_authenticated(self) -> bool:
+        """Return True if this provider currently holds valid credentials/session."""
+        try:
+            return bool(self.health_check(timeout=2.0).is_connected)
+        except Exception:
+            return False
+
+    def fetch_market_depth(
+        self,
+        symbol: str,
+        exchange: str = "NSE",
+        instrument_key: str = "",
+        levels: int = 5,
+    ) -> Optional[MarketDepth]:
+        """
+        Fetch Level-5 or Level-30 market depth via REST API.
+        Brokers that expose order-book depth (Upstox L5/L30, Zerodha L5, etc.) override this.
+        """
+        return None
+
+    def fetch_live_quote(
+        self,
+        symbol: str,
+        exchange: str = "NSE",
+        instrument_key: str = "",
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Fetch a single normalized live quote dict with authentic exchange/provider
+        timestamp (`source_timestamp_ist` / `exchange_timestamp`) and optional `depth`.
+        """
+        return None
+
+    def fetch_historical_candles(
+        self,
+        symbol: str,
+        exchange: str,
+        timeframe: str,
+        start_date: str,
+        end_date: str,
+        *,
+        instrument_key: str = "",
+        adjustment_mode: str = "raw",
+    ) -> Optional[List[Dict[str, Any]]]:
+        """
+        Fetch historical OHLCV candles from this provider.
+        Returning None indicates this adapter delegates to core/historical fallback.
+        """
+        return None
+
+    def sync_instruments(self, store: Any, **kwargs: Any) -> Optional[Dict[str, Any]]:
+        """
+        Synchronize this provider's instrument master into `store`.
+        Returning None indicates no custom instrument sync hook is implemented.
+        """
+        return None
+
+    def create_ws_client(
+        self,
+        *,
+        on_tick: Any = None,
+        on_status: Any = None,
+        depth_levels: int = 5,
+    ) -> Optional[Any]:
+        """
+        Create a provider-specific WebSocket feed client supporting L5/L30 depth.
+        Returning None indicates this provider does not offer a WebSocket stream.
+        """
+        return None
+
+
+class MarketDataProviderBase(BrokerBase):
+    """
+    Convenience base class for data-only providers (e.g. Yahoo Finance, NSE/BSE feeds,
+    Polygon, TrueData) that do not support live order placement.
+    Adding a new data provider only requires subclassing this and registering via
+    `BrokerRegistry.register_data_provider("name", MyProvider)`.
+    """
+
+    capabilities: BrokerCapabilities = BrokerCapabilities(
+        supports_trading=False,
+        supports_market_data=True,
+        supports_websocket=False,
+        requires_oauth=False,
+        supports_historical=True,
+        supports_instrument_master=False,
+        max_depth_levels=0,
+        execution_grade_feed=False,
+    )
+
+    def connect(self) -> bool:
+        return True
+
+    def health_check(self, timeout: float = 2.0) -> BrokerHealthSnapshot:
+        return BrokerHealthSnapshot(
+            broker_id=self.broker_id,
+            display_name=self.display_name,
+            stage="active",
+            state=ConnectionState.CONNECTED,
+            capabilities=self.capabilities,
+            message=f"{self.display_name} market data provider ready.",
+            has_credentials=True,
+            auth_mode="public" if not self.capabilities.requires_oauth else "oauth2",
+        )
+
+    def place_order(self, order: OrderRequest) -> Optional[BrokerOrder]:
+        raise OrderRejectedError(f"{self.display_name} is a market-data provider and does not support trading.")
+
+    def cancel_order(self, order_id: str) -> bool:
+        raise OrderRejectedError(f"{self.display_name} is a market-data provider and does not support order cancellation.")
+
+    def get_positions(self) -> Sequence[BrokerPosition]:
+        return []
+
+    def get_balance(self) -> AccountBalance:
+        return AccountBalance(cash=0.0, available_cash=0.0, equity=0.0, currency="INR")
+
+    def get_orders(self) -> Sequence[BrokerOrder]:
+        return []
+
 

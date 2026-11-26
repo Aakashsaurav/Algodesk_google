@@ -1,0 +1,1269 @@
+# **AlgoDesk – Technical & Production Readiness Audit**
+
+Not ready for real-money trading
+
+Significant risk-control gaps
+
+Architecture review
+
+**Repository:** [Aakashsaurav/Algodesk_google](https://github.com/Aakashsaurav/Algodesk_google?utm_source=chatgpt.com)
+
+**Review baseline:** `main` branch, commit `99f9d6dca87df885d3d8f6818a7482dd1083d848`.
+
+**Review scope:** The repository tree contains 159 entries. I examined the main architectural modules, execution and risk paths, broker adapters, historical data infrastructure, backtesting engines, security implementation, frontend structure, configuration and test organization.
+
+**Important execution limitation:** I could inspect the repository remotely, but could not obtain a local working checkout in this environment. Consequently, I have not executed the Python test suite, TypeScript compiler or production build. I distinguish implementation findings from runtime issues that still require reproduction.
+
+# **1. Executive assessment**
+
+## **Overall verdict**
+
+AlgoDesk has evolved considerably beyond a basic trading dashboard.
+
+There is meaningful engineering work in:
+
+- Persistent order management.
+- Broker abstraction.
+- SQLite-based historical data management.
+- Portfolio backtesting.
+- Strategy deployment.
+- Risk management.
+- Authentication.
+- Audit logging.
+- Instrument discovery.
+- Paper and live execution workflows.
+
+The architecture has recognizable modular boundaries and several thoughtful safety mechanisms.
+
+However, there is a fundamental distinction between having these components and having a dependable trading system.
+
+**AlgoDesk currently has the appearance of a reasonably advanced trading platform, but its financial correctness and production safety have not been demonstrated.**
+
+Some of the most important concerns are not missing features. They are gaps between what the implementation claims to guarantee and what it actually enforces.
+
+## **Maturity assessment**
+
+These are my engineering assessments, not measured benchmark scores.
+
+| Area                    | Assessment | Verdict                                   |
+| ----------------------- | ---------- | ----------------------------------------- |
+| Frontend functionality  | 7/10       | Good foundation                           |
+| Backend functionality   | 7/10       | Substantial implementation                |
+| Architecture/modularity | 6/10       | Modular folders, coupled internals        |
+| Broker abstraction      | 6/10       | Good starting contract                    |
+| Historical data         | 6/10       | Sophisticated but needs validation        |
+| Technical indicators    | 7/10       | Useful foundation                         |
+| Screening               | 7/10       | Good extensibility potential              |
+| Backtesting             | 5/10       | Important limitations                     |
+| Portfolio simulation    | 5/10       | Requires financial validation             |
+| Paper trading           | 6/10       | Functional foundation, incomplete realism |
+| Live execution          | 5/10       | Good OMS concepts, unresolved risks       |
+| Risk management         | 5/10       | Important enforcement gaps                |
+| Security                | 6/10       | Good defaults, some weaknesses            |
+| Testing infrastructure  | 5/10       | Tests exist; assurance insufficient       |
+| Maintainability         | 5/10       | Oversized modules and complexity          |
+
+**My conclusion**
+
+AlgoDesk is suitable for continued development, research, screening and controlled experimentation.
+
+It is not yet suitable for unattended automated trading with meaningful capital.
+
+I would not authorize live automated trading until the Critical and High findings in this report have been addressed and independently validated.
+
+# **2. Architecture assessment**
+
+## **2.1 What has been built**
+
+The current architecture is approximately:
+
+```
+                 React / TypeScript
+                        |
+                  Express Server
+                        |
+                 Python API Hub
+                        |
+                  BrokerHubService
+                        |
+       +----------------+----------------+
+       |                |                |
+    Brokers          Analytics        Execution
+       |                |                |
+  Upstox/Zerodha    Backtesting         OMS
+  Yahoo Finance    Screeners            |
+                   Indicators        Risk Limits
+                   Historical          |
+                   Instruments       Deployments
+                        |
+                   SQLite / Parquet
+```
+
+This is a sensible starting architecture.
+
+The most important architectural decision is separating the Python trading backend from the React frontend.
+
+The broker interface in `broker/base.py`, broker registry in `broker/registry.py`, and strategy registries are also useful foundations.
+
+## **2.2 Major architectural weaknesses**
+
+### **A. Modular folders, but oversized implementation modules**
+
+The project has many well-named folders, but several modules contain too many responsibilities.
+
+Examples:
+
+| File                    | Approximate size |
+| ----------------------- | ---------------- |
+| `core/historical.py`    | 86 KB            |
+| `core/feed_manager.py`  | 71 KB            |
+| `deploy/manager.py`     | 92 KB            |
+| `backtest/portfolio.py` | 68 KB            |
+| `web/service.py`        | 69 KB            |
+| `src/App.tsx`           | 155 KB           |
+| `AnalyticsConsole.tsx`  | 140 KB           |
+| `LiveTerminal.tsx`      | 72 KB            |
+
+This is a significant maintainability concern.
+
+For example:
+
+- `core/historical.py` handles provider-specific downloads, normalization, caching, storage, coverage tracking and resampling.
+- `deploy/manager.py` handles strategy evaluation, deployment persistence, order generation, paper fills, live execution and position accounting.
+- `web/service.py` acts as a large application orchestration layer.
+
+These modules are becoming difficult to understand and safely modify.
+
+For someone maintaining the system through AI coding agents, this matters considerably.
+
+An AI agent modifying a 90 KB deployment manager can easily introduce an unintended change to another workflow.
+
+**Recommendation:** Split responsibilities gradually. Do not rewrite these modules from scratch.
+
+### **B. Broker abstraction is incomplete**
+
+`BrokerBase` is a useful abstraction, but the system still knows about individual providers in several core modules.
+
+For example:
+
+- `core/historical.py` directly imports Upstox and Zerodha authentication managers.
+- `core/feed_manager.py` knows about provider-specific authentication and WebSocket behavior.
+- `core/instruments.py` contains provider-specific instrument synchronization.
+- Broker selection and execution are coordinated through several different services.
+
+Adding another broker therefore requires modifications beyond registering a new adapter.
+
+A genuinely extensible system should have separate contracts for:
+
+1. Trading broker.
+2. Market data provider.
+3. Instrument master provider.
+4. Historical data provider.
+5. Order execution adapter.
+
+The current implementation partially combines these concerns.
+
+### **C. BrokerRegistry creates new adapter instances**
+
+In `broker/registry.py`, `BrokerRegistry.get()` instantiates the broker class rather than returning a managed adapter instance.
+
+This matters because broker adapters maintain instance-level state, including connection status and rate limiters.
+
+For example, the Zerodha adapter uses `self._rate_limiter`.
+
+Repeatedly creating adapters can reset rate-limiting state and connection caches.
+
+It also means that the deployment manager, reconciliation process and other services may use different adapter instances.
+
+**Recommendation:** Introduce a managed broker lifecycle with one adapter instance per configured broker/account, with explicit connection management.
+
+### **D. Two backend server implementations**
+
+There are two server implementations:
+
+- `web/app.py` – FastAPI.
+- `web/local_server.py` – standard-library HTTP fallback.
+
+Both implement substantial portions of the API, authentication, routing and streaming functionality.
+
+This creates a risk of behavioral differences between the two execution environments.
+
+I would strongly prefer FastAPI as the canonical implementation.
+
+The fallback should either be removed or reduced to a deliberately limited compatibility mode.
+
+### **E. Application service is too central**
+
+`web/service.py` imports almost every significant subsystem.
+
+This makes it a dependency concentration point.
+
+A better arrangement would have dedicated application services for:
+
+- Market data.
+- Instrument management.
+- Screening.
+- Backtesting.
+- Strategy deployment.
+- Order management.
+- Risk management.
+
+The API should invoke these services rather than directly coordinating many subsystems.
+
+**Architecture verdict:** The existing architecture is worth preserving, but it needs controlled decomposition and clearer contracts.
+
+# **3. Critical technical findings**
+
+These are the findings I would prioritize because they can affect financial results or live execution.
+
+## **Finding 1: Derivative order quantity does not respect lot size**
+
+Critical
+
+**Files:**
+
+- `deploy/manager.py`
+- `core/instruments.py`
+- `backtest/portfolio.py`
+
+The instrument database correctly stores:
+
+- `lot_size`
+- `tick_size`
+- `expiry`
+- `strike`
+- `instrument_type`
+
+However, the deployment quantity calculation in `_compute_order_qty()` calculates quantity using:
+
+```
+return int(budget // (price * 1.005))
+```
+
+The risk-based calculation similarly calculates integer quantities without applying the instrument's lot size.
+
+The portfolio backtester has the same fundamental limitation.
+
+This is acceptable for ordinary cash equity calculations but not for a dependable futures and options execution system.
+
+For example, suppose a contract has:
+
+- Premium/price: ₹100
+- Lot size: 75
+- Calculated quantity: 23
+
+The system can generate an order for 23 units instead of a valid multiple of 75.
+
+The broker will generally reject an invalid quantity.
+
+More importantly, there is no unified contract-level quantity validation before execution.
+
+**Required fix:**
+
+Introduce an instrument contract specification as a mandatory part of order construction.
+
+```
+class InstrumentContract:    symbol: str    exchange: str    instrument_type: str    lot_size: int    tick_size: float    multiplier: float    expiry: str | None
+```
+
+All quantity calculations must use contract specifications.
+
+The OMS must independently validate the quantity before sending an order.
+
+This is a prerequisite for F&O.
+
+## **Finding 2: Risk validation can bypass exposure limits when price is zero**
+
+Critical
+
+**File:** `risk/limits.py`, `check_entry()`.
+
+The code calculates:
+
+```
+px = max(0.0, float(price or 0.0))notional = qty * px
+```
+
+But the notional and gross-exposure checks are conditional:
+
+```
+if px > 0 and notional > max_trade_notional:    ...
+```
+
+And:
+
+```
+if px > 0 and projected_exposure > max_gross_exposure:    ...
+```
+
+There is no corresponding rejection for a missing or invalid price.
+
+Consequently, a positive-quantity order with zero price can pass these two checks.
+
+This is particularly concerning for manual order paths or future broker integrations that might not provide a valid reference price.
+
+**Required fix:**
+
+For risk-increasing orders:
+
+- Reject missing prices.
+- Reject zero or negative prices.
+- Reject NaN and infinity.
+- Validate tick size.
+- Validate instrument identity.
+- Never silently treat unavailable pricing as zero exposure.
+
+The risk engine should fail closed.
+
+Reference: [RiskLimitManager.check_entry()](https://github.com/Aakashsaurav/Algodesk_google/blob/main/risk/limits.py?utm_source=chatgpt.com#L127-L180).
+
+## **Finding 3: Account-wide risk calculations do not represent actual account-wide exposure**
+
+Critical
+
+**File:** `deploy/manager.py`, `_account_risk_context_locked()`.
+
+The function calculates account exposure by iterating over:
+
+```
+self._runtime.values()
+```
+
+It aggregates positions and P&L maintained inside AlgoDesk deployments.
+
+It does not independently include every position in the actual broker account.
+
+Consider this situation:
+
+- You purchase Reliance manually through Zerodha.
+- AlgoDesk has another strategy running on TCS.
+- AlgoDesk evaluates a new entry on Infosys.
+
+The risk engine can calculate exposure using its internal deployment positions without incorporating the manually purchased Reliance position.
+
+This means the configured account-wide gross exposure limit is not actually an account-wide limit.
+
+There is another problem.
+
+The variable called `daily_loss` is calculated using the accumulated realized and unrealized P&L of deployments.
+
+There is no trading-day reset in this calculation.
+
+It therefore represents deployment-level accumulated P&L, not necessarily actual daily account loss.
+
+**Required fix:**
+
+Create an authoritative account-risk snapshot using:
+
+1. Broker positions.
+2. Broker funds and margins.
+3. Broker order book.
+4. OMS pending orders.
+5. Internal deployment attribution.
+
+Daily P&L must be calculated using a well-defined trading-day boundary.
+
+Manual broker trades must also be incorporated into risk calculations.
+
+Reference: [Deployment risk context](https://github.com/Aakashsaurav/Algodesk_google/blob/main/deploy/manager.py?utm_source=chatgpt.com#L1190-L1270).
+
+## **Finding 4: Market data freshness is not sufficiently trustworthy**
+
+Critical
+
+**File:** `core/feed_manager.py`.
+
+The Yahoo Finance live quote implementation uses:
+
+```
+?range=5d&interval=1d
+```
+
+This is daily-interval data, not a proper exchange-grade intraday feed.
+
+More importantly, the function assigns:
+
+```
+now_ist = datetime.now(tz=IST_TZ).isoformat(...)
+```
+
+to the quote's timestamp.
+
+That timestamp represents the local time when the application fetched the data, not the actual exchange tick time.
+
+The deployment manager uses `_quote_age_seconds()` to determine whether a quote is stale.
+
+This creates a potentially dangerous situation:
+
+The application can fetch an old or delayed market value, assign it the current time and treat it as fresh.
+
+The stale-data protection is then ineffective.
+
+There is also a separate issue: `_quote_age_seconds()` returns `None` when it cannot identify a timestamp. The caller treats that as not stale.
+
+Unknown freshness therefore does not automatically block entries.
+
+**Required fix:**
+
+- Do not permit Yahoo daily data as an execution-grade live feed.
+- Never manufacture source timestamps.
+- Require valid exchange/provider timestamps.
+- Distinguish delayed, stale and unknown data.
+- Maintain maximum permissible feed latency per instrument and timeframe.
+- Disable automated entries whenever freshness cannot be verified.
+
+Reference: [Feed manager](https://github.com/Aakashsaurav/Algodesk_google/blob/main/core/feed_manager.py?utm_source=chatgpt.com) and [Quote freshness implementation](https://github.com/Aakashsaurav/Algodesk_google/blob/main/deploy/manager.py?utm_source=chatgpt.com#L40-L95).
+
+## **Finding 5: Corporate-action adjustment is inconsistent across providers**
+
+Critical
+
+**File:** `core/historical.py`.
+
+The Yahoo Finance historical downloader implements adjusted prices by calculating:
+
+```
+ratio = adj_c / raw_co *= ratioh *= ratiol *= ratioc_val = adj_c
+```
+
+However, volume is left unchanged.
+
+For stock splits, volume needs appropriate adjustment as well if the objective is a consistently split-adjusted historical dataset.
+
+There is another issue.
+
+The provider dispatch for Upstox and Zerodha does not apply the requested `adjustment_mode` in the same way as the Yahoo downloader.
+
+Consequently, requesting adjusted data from different providers does not necessarily produce equivalent adjustment semantics.
+
+This can materially distort:
+
+- Moving averages.
+- Relative strength.
+- Volume breakout calculations.
+- Historical returns.
+- Strategy performance around corporate actions.
+
+**Required fix:**
+
+Establish explicit data adjustment semantics:
+
+- Raw exchange OHLCV.
+- Split-adjusted OHLCV.
+- Total-return adjusted OHLCV.
+- Corporate-action event history.
+
+Store the adjustment methodology and source in dataset metadata.
+
+Never mix datasets with different adjustment semantics in the same backtest.
+
+Reference: [Yahoo historical adjustment implementation](https://github.com/Aakashsaurav/Algodesk_google/blob/main/core/historical.py?utm_source=chatgpt.com#L1200-L1280).
+
+## **Finding 6: Risk watchdog can report healthy when reconciliation fails**
+
+Critical
+
+**File:** `risk/limits.py`, `RiskWatchdog`.
+
+The watchdog has a sensible degraded-state mechanism.
+
+However, the implementation has an important weakness.
+
+`_record_success()` resets:
+
+```
+self._degraded = False
+```
+
+whenever the risk evaluation completes without raising an exception.
+
+The risk evaluation can return successfully even when the broker is disconnected, using the configured capital envelope.
+
+Separately, periodic reconciliation callback failures are caught and logged:
+
+```
+except Exception as exc:    logger.warning(...)
+```
+
+They do not increment the watchdog failure counter.
+
+Therefore, the watchdog can report a healthy state even though the order or position reconciliation process is repeatedly failing.
+
+This undermines the intended protection against stale or inconsistent execution state.
+
+**Required fix:**
+
+The watchdog should track independent health dimensions:
+
+| Health dimension        | Required behavior                |
+| ----------------------- | -------------------------------- |
+| Broker connectivity     | Must be healthy for live entries |
+| Market data freshness   | Must be healthy for live entries |
+| OMS reconciliation      | Must be healthy                  |
+| Position reconciliation | Must be healthy                  |
+| Order recovery          | Must be healthy                  |
+| Risk calculations       | Must be healthy                  |
+
+Any critical health failure should block new live entries.
+
+Risk-reducing exits should remain available.
+
+Reference: [RiskWatchdog implementation](https://github.com/Aakashsaurav/Algodesk_google/blob/main/risk/limits.py?utm_source=chatgpt.com#L500-L615).
+
+## **Finding 7: Historical universe selection is vulnerable to survivorship bias**
+
+Critical
+
+**Files:**
+
+- `screener/universes.py`
+- `screener/nse_universe_sync.py`
+- `backtest/portfolio.py`
+
+The universe resolver uses locally synchronized NSE universe data and current instrument information.
+
+That is useful for current screening.
+
+However, historical portfolio testing requires point-in-time universe membership.
+
+Suppose you backtest a Nifty 50 strategy from 2015 to 2026.
+
+If you use the currently synchronized Nifty 50 constituents throughout that period, the test does not represent the actual historical Nifty 50 universe.
+
+Companies that were removed from the index are absent.
+
+This can create significant survivorship and selection bias.
+
+**Required fix:**
+
+Introduce historical universe snapshots with effective dates.
+
+Every portfolio backtest should be able to resolve:
+
+```
+Universe as of 2015-01-01
+Universe as of 2016-01-01
+Universe as of 2017-01-01
+...
+```
+
+Also account for delisted securities and unavailable historical instruments.
+
+Reference: [UniverseResolver](https://github.com/Aakashsaurav/Algodesk_google/blob/main/screener/universes.py?utm_source=chatgpt.com).
+
+## **Finding 8: OMS submission handling is cautious but not fully production-proven**
+
+High
+
+**File:** `execution/oms.py`.
+
+There are several good decisions:
+
+- Persisting the order intent before broker submission.
+- Using deterministic client order IDs.
+- Maintaining strict order states.
+- Distinguishing confirmed fills from accepted orders.
+- Recovering ambiguous submissions through broker tags.
+- Tracking partial fills.
+
+These are important capabilities.
+
+However, the submission function catches broad exceptions and classifies them as uncertain submissions.
+
+This is conservative against duplicate orders, but it can also classify local programming errors or non-network failures as uncertain broker submissions.
+
+The order can remain pending reconciliation even if it never reached the broker.
+
+The implementation also needs stronger cross-process concurrency guarantees around intent creation and dispatch.
+
+**Required improvements:**
+
+- Separate definite rejection, transient failure and ambiguous submission.
+- Maintain a durable order-intent/outbox model.
+- Use a broker-supported idempotency mechanism where available.
+- Introduce explicit reconciliation deadlines and escalation.
+- Require manual intervention for permanently unresolved submissions.
+- Test restart and concurrent submission scenarios.
+
+Reference: [OrderManagementSystem](https://github.com/Aakashsaurav/Algodesk_google/blob/main/execution/oms.py?utm_source=chatgpt.com).
+
+# **4. Additional high-priority findings**
+
+| ID   | Severity | Finding                                                                                        | Main location           |
+| ---- | -------- | ---------------------------------------------------------------------------------------------- | ----------------------- |
+| H-01 | High     | F&O quantity and lot-size validation missing                                                   | `deploy/manager.py`     |
+| H-02 | High     | Account risk excludes external broker positions                                                | `deploy/manager.py`     |
+| H-03 | High     | Unknown quote timestamps are treated as fresh                                                  | `deploy/manager.py`     |
+| H-04 | High     | Broker adapter recreation resets instance-level state and rate limiters                        | `broker/registry.py`    |
+| H-05 | High     | Provider adjustment semantics are inconsistent                                                 | `core/historical.py`    |
+| H-06 | High     | Reconciliation compares positions primarily by symbol, not complete instrument identity        | `deploy/manager.py`     |
+| H-07 | High     | F&O historical contract expiry and rollover are not fully integrated into portfolio simulation | `backtest/portfolio.py` |
+| H-08 | High     | Python plugin AST validation is not a security sandbox                                         | `web/security.py`       |
+| H-09 | High     | No demonstrated point-in-time historical universe                                              | `screener/universes.py` |
+| H-10 | High     | Automated tests do not establish end-to-end trading correctness                                | `tests/`                |
+
+### **Additional explanations**
+
+**H-04 – Broker adapter lifecycle**
+
+`BrokerRegistry.get()` creates a new adapter instance. Broker adapters maintain instance-level connection and rate-limiting state.
+
+This makes a shared account-wide rate limiter difficult to guarantee.
+
+Use managed instances and a central rate-limiting policy.
+
+**H-06 – Position identity**
+
+Position reconciliation aggregates positions using symbols.
+
+A robust identity should include:
+
+`exchange + segment + instrument_key + product + expiry + strike + option_type`
+
+Otherwise, instruments with identical or overlapping symbols can create incorrect reconciliation results.
+
+**H-08 – Python plugin security**
+
+The AST validator blocks several dangerous imports and operations.
+
+But static AST filtering cannot reliably sandbox arbitrary Python code.
+
+An administrator uploading Python code is effectively granting it execution privileges inside the application process.
+
+This is acceptable only if the product explicitly treats plugins as trusted operator code. It must not be advertised as protection against malicious plugins.
+
+# **5. Backtesting and quantitative correctness**
+
+This deserves particular attention.
+
+A backtesting engine can produce attractive results while being mathematically or financially incorrect.
+
+I found several good design decisions, but also significant missing validation.
+
+## **What is implemented well**
+
+The backtesting implementation has several positive characteristics:
+
+- Signals evaluated at bar close.
+- Execution at next bar open.
+- No same-bar entry and exit.
+- Gap-through stop handling.
+- Separate long and short calculations.
+- Portfolio-level event loop.
+- Configurable transaction costs.
+- Intraday session handling.
+- Equity curves.
+- Drawdown and Sharpe calculations.
+
+These are good foundations.
+
+## **What needs correction**
+
+| Issue                                            | Consequence                            | Priority |
+| ------------------------------------------------ | -------------------------------------- | -------- |
+| No point-in-time universe                        | Survivorship bias                      | Critical |
+| No complete corporate-action framework           | Incorrect historical signals           | Critical |
+| F&O lot-size enforcement absent                  | Invalid simulations                    | Critical |
+| No robust futures rollover model                 | Misleading continuous futures results  | High     |
+| No expiry-aware options lifecycle                | Incomplete options backtesting         | High     |
+| Partial-fill and queue-position modelling absent | Optimistic execution                   | High     |
+| Liquidity and market impact modelling incomplete | Unrealistic large orders               | High     |
+| No demonstrated reproducibility manifest         | Difficult to reproduce results         | High     |
+| Limited validation of provider parity            | Different results from different feeds | High     |
+
+### **Performance metric concern**
+
+The portfolio metrics function in `backtest/portfolio.py` calculates CAGR.
+
+For short backtest periods, it falls back to total return rather than annualizing.
+
+This avoids extreme annualized values, but the resulting number is still exposed under the `cagr_pct` label.
+
+That can mislead someone interpreting a short-duration backtest.
+
+I recommend returning:
+
+- Actual CAGR when mathematically meaningful.
+- Annualized return with an explicit methodology.
+- Total return.
+- Backtest duration.
+- A minimum sample warning.
+
+### **Execution assumptions**
+
+The current engines largely use bar-based execution.
+
+For a market order, a next-bar-open fill is an approximation, not a simulation of actual order-book execution.
+
+You should eventually support:
+
+- Bid/ask spread.
+- Volume participation.
+- Slippage based on liquidity.
+- Market impact.
+- Partial fills.
+- Exchange tick sizes.
+- Order rejection.
+- Trading halts and price bands.
+
+Do not make the backtester excessively complicated immediately.
+
+First ensure correctness of the existing accounting and data.
+
+# **6. Live trading and execution assessment**
+
+The execution architecture is one of the more promising areas.
+
+The OMS design is substantially better than simply sending orders directly from strategy functions.
+
+However, there is a difference between correct order-state tracking and correct trading-account reconciliation.
+
+## **Positive features**
+
+- SQLite-backed OMS.
+- Unique client order IDs.
+- Explicit partial-fill support.
+- Fill-level accounting.
+- Ambiguous submission handling.
+- Order reconciliation.
+- Position reconciliation.
+- Kill switch.
+- Live trading master lock.
+- Separate paper, live-alert and live-auto modes.
+
+## **Remaining problems**
+
+### **6.1 Broker order book must be authoritative**
+
+The system maintains its own deployment positions.
+
+It should never assume that those positions necessarily represent the broker's actual account.
+
+The broker account must be treated as the execution source of truth.
+
+AlgoDesk should maintain a separate internal attribution layer for its strategies.
+
+### **6.2 Order lifecycle needs more extensive failure testing**
+
+Consider:
+
+1. AlgoDesk sends an order.
+2. Broker accepts it.
+3. Network connection drops.
+4. AlgoDesk restarts.
+5. Broker reports a partial fill.
+6. Remaining quantity is cancelled.
+7. A new strategy signal arrives.
+
+The system needs to guarantee that every fill is booked exactly once and that the resulting position is correct.
+
+The current implementation has mechanisms for this, but I would require extensive fault-injection testing before trusting it.
+
+### **6.3 Paper trading is not equivalent to live execution**
+
+The paper adapter immediately fills orders using a reference or limit price.
+
+It is a useful testing mechanism, but it does not reproduce:
+
+- Exchange order queues.
+- Bid/ask spread.
+- Partial fills.
+- Market depth.
+- Rejections.
+- Exchange delays.
+
+Paper trading should have multiple simulation profiles rather than one immediate-fill model.
+
+### **6.4 Manual and external orders**
+
+The system needs a clear policy for positions that were not created by AlgoDesk.
+
+Options include:
+
+- Treat as externally managed positions.
+- Import into account-level exposure.
+- Prevent AlgoDesk from modifying them unless explicitly adopted.
+
+They must not simply disappear from risk calculations.
+
+# **7. Security assessment**
+
+Needs hardening before remote access
+
+## **Positive aspects**
+
+The repository has several thoughtful protections:
+
+- Authentication enforced by default.
+- Bearer-token authorization.
+- First-run bootstrap mechanism.
+- Login throttling.
+- Default-off live trading.
+- Sensitive log redaction.
+- File permission restrictions.
+- Atomic kill-switch state persistence.
+- Hash-chained audit logging.
+
+These are good decisions.
+
+## **Remaining issues**
+
+| Issue                                                                 | Severity |
+| --------------------------------------------------------------------- | -------- |
+| Plaintext local credential vault by default                           | High     |
+| AST filtering mistaken for plugin isolation                           | High     |
+| WebSocket query-token fallback                                        | Medium   |
+| OAuth callback origin handling needs tightening                       | Medium   |
+| Duplicate server implementations increase security maintenance burden | Medium   |
+| No demonstrated independent security testing                          | High     |
+
+### **Credential storage**
+
+`config.py` stores credentials in a local JSON vault with restrictive file permissions.
+
+This is better than leaving them in ordinary application configuration files.
+
+However, file permissions are not encryption.
+
+A compromised user account, backup or disk image can expose these credentials.
+
+Use OS keychain storage by default where practical, with an explicitly documented encrypted fallback.
+
+### **WebSocket authentication**
+
+`authClient.ts` correctly prefers WebSocket subprotocol authentication.
+
+However, it falls back to query-string authentication for tokens containing certain characters.
+
+Query tokens can leak through URL logging and diagnostics.
+
+Avoid this fallback in remotely accessible deployments.
+
+### **Network exposure**
+
+`server.ts` has an environment-based host selection that can bind to `0.0.0.0` when `PORT` is present.
+
+This is intentional for hosted deployments but deserves explicit environment validation.
+
+A local deployment should not accidentally become network-accessible because an environment variable was set.
+
+# **8. Frontend assessment**
+
+The frontend is feature-rich.
+
+The repository includes:
+
+- Platform dashboard.
+- Live terminal.
+- Strategy builder.
+- Scanner builder.
+- Technical analysis.
+- Options studio.
+- Backtest results.
+- Deployment console.
+- Risk limits.
+- Portfolio charts.
+- Basket management.
+
+The UI has a good product direction.
+
+However, the main frontend components are extremely large.
+
+I would prioritize:
+
+1. Extracting API clients.
+2. Separating domain-specific state.
+3. Establishing typed API contracts.
+4. Introducing consistent error handling.
+5. Centralizing loading and cancellation behavior.
+6. Separating reusable trading components.
+
+One particularly important requirement is that the UI must distinguish:
+
+- Order submitted.
+- Order accepted.
+- Partially filled.
+- Fully filled.
+- Rejected.
+- Unknown submission state.
+
+A successful API request must never be displayed as a successful trade.
+
+The backend already has the beginnings of this distinction; the frontend must consistently reflect it.
+
+# **9. Missing capabilities**
+
+These are important capabilities that need to be added or demonstrated before AlgoDesk can be considered a dependable professional trading platform.
+
+| Capability                                     | Required status           |
+| ---------------------------------------------- | ------------------------- |
+| Historical corporate-action database           | Missing/incomplete        |
+| Point-in-time universe membership              | Missing                   |
+| Derivative contract lifecycle                  | Incomplete                |
+| Futures continuous contract and rollover       | Incomplete                |
+| Options expiry and settlement simulation       | Incomplete                |
+| Multi-leg options execution                    | Incomplete                |
+| Account-level external position reconciliation | Incomplete                |
+| Exchange-grade execution simulation            | Incomplete                |
+| Historical data quality scoring                | Incomplete                |
+| Provider data parity verification              | Incomplete                |
+| Durable order event history                    | Needs strengthening       |
+| Disaster recovery and state restoration tests  | Needs validation          |
+| Database backup and restore workflow           | Needs demonstration       |
+| Reproducible backtest manifests                | Incomplete                |
+| CI/CD automated quality gates                  | Not evident in repository |
+| Independent security testing                   | Not demonstrated          |
+
+# **10. Prioritized issue register**
+
+This is the implementation priority I would use.
+
+| ID   | Severity | Issue                                     | Recommended action                                |
+| ---- | -------- | ----------------------------------------- | ------------------------------------------------- |
+| C-01 | Critical | Zero-price risk bypass                    | Reject invalid prices                             |
+| C-02 | Critical | Incomplete account-wide exposure          | Broker-authoritative risk snapshot                |
+| C-03 | Critical | Unreliable market-data freshness          | Source timestamps and execution-feed restrictions |
+| C-04 | Critical | F&O lot-size validation absent            | Contract-aware sizing and validation              |
+| C-05 | Critical | Corporate-action adjustment inconsistency | Unified adjustment framework                      |
+| C-06 | Critical | Survivorship bias                         | Point-in-time universes                           |
+| C-07 | Critical | Watchdog reconciliation health gaps       | Independent health states                         |
+| H-01 | High     | Broker adapter lifecycle                  | Managed adapter instances                         |
+| H-02 | High     | Position reconciliation identity          | Full instrument identity                          |
+| H-03 | High     | Futures expiry/rollover                   | Contract lifecycle manager                        |
+| H-04 | High     | Backtest execution realism                | Fill and liquidity model                          |
+| H-05 | High     | Plugin execution isolation                | Trusted-code boundary or process isolation        |
+| H-06 | High     | Missing CI pipeline                       | Automated verification                            |
+| H-07 | High     | Oversized backend modules                 | Incremental decomposition                         |
+| H-08 | High     | Credential storage hardening              | Encrypted vault/keychain                          |
+| M-01 | Medium   | Duplicate HTTP server implementations     | One canonical backend                             |
+| M-02 | Medium   | CAGR presentation for short periods       | Explicit metric methodology                       |
+| M-03 | Medium   | WebSocket query-token fallback            | Remove URL authentication fallback                |
+| M-04 | Medium   | Insufficient data lineage                 | Store provider/version/adjustment metadata        |
+| M-05 | Medium   | Incomplete API schema validation          | Central request/response contracts                |
+
+# **11. Recommended target architecture**
+
+I would not recommend a complete rewrite.
+
+The current repository contains valuable implementation that should be retained.
+
+Instead, evolve it toward a modular architecture with clear domain boundaries.
+
+```
+AlgoDesk/
+│
+├── domain/
+│   ├── instruments/
+│   ├── orders/
+│   ├── positions/
+│   ├── portfolios/
+│   ├── strategies/
+│   └── risk/
+│
+├── adapters/
+│   ├── brokers/
+│   │   ├── upstox/
+│   │   └── zerodha/
+│   │
+│   ├── market_data/
+│   │   ├── upstox/
+│   │   ├── zerodha/
+│   │   └── yahoo/
+│   │
+│   └── storage/
+│       ├── sqlite/
+│       └── parquet/
+│
+├── application/
+│   ├── data_service/
+│   ├── screening/
+│   ├── strategy_service/
+│   ├── backtesting/
+│   ├── execution/
+│   ├── deployment/
+│   └── reconciliation/
+│
+├── infrastructure/
+│   ├── database/
+│   ├── logging/
+│   ├── authentication/
+│   ├── audit/
+│   └── monitoring/
+│
+├── api/
+│
+├── frontend/
+│
+└── tests/
+    ├── unit/
+    ├── integration/
+    ├── backtesting/
+    ├── execution/
+    ├── risk/
+    └── fault_injection/
+```
+
+The most important design principle:
+
+**Strategies should never know which broker is executing their orders.**
+
+Similarly:
+
+- Indicators should not know where data came from.
+- Backtesting should not depend on live broker connections.
+- Risk calculations should not depend on frontend state.
+- Execution should not depend on strategy implementation.
+- The frontend should communicate through stable application APIs.
+
+This is the architecture I would progressively establish.
+
+# **12. Testing and validation plan**
+
+Before allowing real-money trading, I would establish three separate release gates.
+
+Gate 1 – Research correctness
+
+### **Required tests**
+
+**Historical data**
+
+- Missing candles.
+- Duplicate timestamps.
+- Out-of-order candles.
+- Incorrect time zones.
+- Split adjustment.
+- Dividend adjustment.
+- Different provider parity.
+- Market holidays.
+- Partial trading sessions.
+
+**Indicators**
+
+- Compare RSI, EMA, ATR, MACD and Supertrend against independent reference calculations.
+- Validate warmup periods.
+- Test NaN handling.
+- Verify indicator values do not use future observations.
+
+**Backtesting**
+
+- Next-bar execution.
+- Stop-loss gap handling.
+- Same-bar stop and target collision.
+- Position sizing.
+- Transaction charges.
+- Portfolio equity.
+- Maximum drawdown.
+- Sharpe ratio.
+- Short positions.
+- End-of-window liquidation.
+
+**Acceptance criteria:** Independently calculated expected results must match AlgoDesk within defined numerical tolerances.
+
+Gate 2 – Paper trading correctness
+
+Test:
+
+1. Full fill.
+2. Partial fill.
+3. Order rejection.
+4. Cancellation.
+5. Timeout after successful broker submission.
+6. Duplicate submission.
+7. Broker disconnection.
+8. Feed disconnection.
+9. Stale quote.
+10. Application restart.
+11. Database restart.
+12. Position mismatch.
+13. Kill switch activation.
+14. Daily loss breach.
+
+**Acceptance criteria:**
+
+- No duplicate orders.
+- No duplicate fills.
+- No unaccounted positions.
+- No new entry when critical health checks fail.
+- Every order has a traceable lifecycle.
+- Paper and broker state reconciliation is deterministic.
+
+Gate 3 – Live trading readiness
+
+Before enabling real orders:
+
+- Validate broker-specific order behavior.
+- Verify actual broker positions and funds.
+- Test real exchange instrument masters.
+- Verify lot sizes and tick sizes.
+- Validate contract expiry handling.
+- Test order recovery after application restart.
+- Verify kill-switch behavior with working orders.
+- Test emergency square-off.
+- Verify credential security.
+- Validate audit-log integrity.
+- Independently verify risk calculations.
+
+I would initially authorize only very small manual or operator-approved trades.
+
+Automated trading should come later.
+
+# **13. Implementation roadmap**
+
+I recommend the following order of work.
+
+## **Phase 1 – Financial correctness and safety**
+
+Highest priority
+
+**Objective:** Eliminate risks that can result in incorrect orders or misleading results.
+
+Tasks:
+
+1. Fix zero-price risk validation.
+2. Implement authoritative account-level risk snapshots.
+3. Correct daily-loss calculations.
+4. Repair watchdog health-state handling.
+5. Restrict live trading to verified fresh market data.
+6. Implement contract-aware quantity validation.
+7. Fix position reconciliation identity.
+8. Standardize corporate-action adjustment semantics.
+
+**Acceptance:** All critical risk and execution tests pass.
+
+## **Phase 2 – Data integrity**
+
+**Objective:** Ensure research data is trustworthy.
+
+Tasks:
+
+1. Establish canonical OHLCV schema.
+2. Add provider provenance.
+3. Add corporate-action handling.
+4. Implement historical universe snapshots.
+5. Add data-quality validation.
+6. Validate resampling.
+7. Implement reproducible dataset versions.
+
+**Acceptance:** Same strategy and dataset produce reproducible results.
+
+## **Phase 3 – Backtesting reliability**
+
+**Objective:** Make reported performance financially meaningful.
+
+Tasks:
+
+1. Validate accounting calculations.
+2. Improve transaction-cost modelling.
+3. Implement realistic execution assumptions.
+4. Add derivative contract handling.
+5. Add futures rollover.
+6. Add options expiry and settlement.
+7. Add historical portfolio risk metrics.
+
+**Acceptance:** Independent reference backtests match AlgoDesk.
+
+## **Phase 4 – Execution hardening**
+
+**Objective:** Make order execution recoverable and predictable.
+
+Tasks:
+
+1. Managed broker adapter lifecycle.
+2. Durable order-intent handling.
+3. Complete order event history.
+4. Robust partial-fill reconciliation.
+5. Restart recovery.
+6. Broker failure simulation.
+7. Account-level position reconciliation.
+
+**Acceptance:** No unresolved order or position discrepancies in fault-injection testing.
+
+## **Phase 5 – Architecture and maintainability**
+
+**Objective:** Make the codebase sustainable for AI-assisted development.
+
+Tasks:
+
+1. Decompose oversized modules.
+2. Separate domain contracts.
+3. Consolidate backend server implementation.
+4. Centralize API contracts.
+5. Improve frontend state management.
+6. Add automated CI checks.
+7. Document module ownership and extension procedures.
+
+**Acceptance:** New broker, data provider and strategy can be added without unrelated module modifications.
+
+## **Phase 6 – Controlled live deployment**
+
+**Objective:** Establish operational confidence.
+
+Tasks:
+
+1. Broker certification tests.
+2. Small-capital manual trading.
+3. Operator-approved live alerts.
+4. Limited automated strategies.
+5. Gradual capital expansion.
+6. Continuous reconciliation and monitoring.
+
+**Acceptance:** Independently verified operational and financial correctness.
+
+# **14. What I would retain and what I would change**
+
+| Component               | Decision                                        |
+| ----------------------- | ----------------------------------------------- |
+| `broker/base.py`        | Retain and refine                               |
+| `broker/registry.py`    | Retain, change lifecycle                        |
+| `execution/oms.py`      | Retain, strengthen                              |
+| `risk/limits.py`        | Retain, correct enforcement                     |
+| `core/preflight.py`     | Retain, expand                                  |
+| `core/historical.py`    | Decompose incrementally                         |
+| `core/feed_manager.py`  | Retain, separate provider adapters              |
+| `core/instruments.py`   | Retain and strengthen contract identity         |
+| `backtest/engine.py`    | Retain and validate                             |
+| `backtest/portfolio.py` | Retain and correct accounting/contract handling |
+| `deploy/manager.py`     | Decompose incrementally                         |
+| `web/service.py`        | Split into application services                 |
+| `web/local_server.py`   | Simplify or remove                              |
+| React frontend          | Retain, modularize                              |
+
+**I would not rewrite AlgoDesk.**
+
+There is too much useful implementation to justify that.
+
+The right approach is to correct financial invariants first, then progressively improve architecture.
+
+# **15. Final recommendation**
+
+There is a lot to appreciate in the direction of AlgoDesk.
+
+The project has moved toward a genuine trading workstation rather than simply collecting indicators and generating buy/sell signals.
+
+However, I would make one important change to the development philosophy.
+
+Until now, the emphasis appears to have been on adding capabilities:
+
+- More screens.
+- More strategies.
+- More indicators.
+- More broker connections.
+- More trading functionality.
+
+The next development stage should prioritize something different:
+
+**Correctness, consistency, recoverability and verifiability.**
+
+A smaller system with verified calculations and dependable execution is significantly more valuable than a larger system with unverified capabilities.
+
+My recommended immediate priorities are:
+
+1. Fix the seven Critical findings.
+2. Establish a comprehensive financial-correctness test suite.
+3. Validate historical data and backtest calculations independently.
+4. Complete order and position reconciliation.
+5. Only then begin controlled live trading.
+
+I believe the existing codebase can evolve into a good platform without a complete rewrite. But the present implementation should be treated as a development and research platform, not yet as a trusted capital-deployment system.
+
+**My suggested next step:** Before implementing additional features, I would turn the Critical and High findings into individually testable engineering tasks, starting with the risk engine, instrument contract validation, market-data freshness and OMS reconciliation. This will give AlgoDesk a much stronger foundation than adding another screen or strategy.

@@ -595,7 +595,11 @@ export function StrategyBacktestStudio({ meta, initialPreset, onRefreshMeta, onD
               <p className={`mt-1 font-mono text-lg font-bold tabular-nums ${result.net_pnl >= 0 ? 'text-emerald-400' : 'text-red-400'}`}>
                 {result.net_pnl >= 0 ? '+' : ''}{fmtInr(result.net_pnl)}
               </p>
-              <p className="font-mono text-[11px] text-slate-500 tabular-nums">{result.total_return_pct >= 0 ? '+' : ''}{result.total_return_pct}% · CAGR {result.cagr_pct}%</p>
+              <p className="font-mono text-[11px] text-slate-500 tabular-nums">
+                {result.total_return_pct >= 0 ? '+' : ''}
+                {result.total_return_pct}% · CAGR{' '}
+                {result.cagr_pct !== null && result.cagr_pct !== undefined ? `${result.cagr_pct}%` : 'N/A (<90d)'}
+              </p>
             </div>
             <div className="rounded-xl border border-slate-800 bg-[#111827] p-4">
               <p className="text-[11px] uppercase tracking-wider text-slate-500">Gross P&amp;L</p>

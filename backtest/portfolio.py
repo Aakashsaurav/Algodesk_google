@@ -70,17 +70,31 @@ def _compute_metrics_from_curve_and_trades(
     net_pnl = final_equity - cap
     total_return_pct = (net_pnl / cap) * 100.0
 
-    cagr_pct = total_return_pct
+    span_days = 0
+    cagr_pct: Optional[float] = None
+    cagr_methodology = "suppressed_short_window_lt_90d"
+    sample_warning: Optional[str] = None
     if len(raw_curve) >= 2:
         try:
             start_d = date.fromisoformat(str(raw_curve[0]["date"])[:10])
             end_d = date.fromisoformat(str(raw_curve[-1]["date"])[:10])
             span_days = max(1, (end_d - start_d).days)
             years = max(span_days / 365.25, 1.0 / 252.0)
-            if years >= 0.08:
-                cagr_pct = ((max(final_equity, 1.0) / cap) ** (1.0 / years) - 1.0) * 100.0
+            if span_days >= 90:
+                cagr_pct = round(((max(final_equity, 1.0) / cap) ** (1.0 / years) - 1.0) * 100.0, 2)
+                cagr_methodology = "compound_annualized_365_25"
+            else:
+                sample_warning = (
+                    f"Backtest duration is {span_days} days (< 90 days); CAGR is suppressed to avoid misleading annualization."
+                )
         except Exception:
-            cagr_pct = total_return_pct
+            cagr_pct = None
+            sample_warning = "Could not determine backtest date span; CAGR suppressed."
+    else:
+        sample_warning = "Insufficient equity curve points to annualize CAGR."
+
+    if sample_warning is None and len(trades) < 10:
+        sample_warning = f"Low trade sample ({len(trades)} trades < 10); metrics may lack statistical significance."
 
     peak = cap
     max_dd = 0.0
@@ -105,7 +119,11 @@ def _compute_metrics_from_curve_and_trades(
         "final_equity": round(final_equity, 2),
         "net_pnl": round(net_pnl, 2),
         "total_return_pct": round(total_return_pct, 2),
-        "cagr_pct": round(cagr_pct, 2),
+        "cagr_pct": cagr_pct,
+        "annualized_return_pct": cagr_pct,
+        "duration_days": span_days,
+        "cagr_methodology": cagr_methodology,
+        "sample_warning": sample_warning,
         "max_drawdown_pct": round(max_dd, 2),
         "sharpe_ratio": sharpe_meta["sharpe_ratio"],
         "daily_sharpe_ratio": sharpe_meta["daily_sharpe_ratio"],
@@ -155,11 +173,12 @@ class PortfolioBacktestEngine:
         universe: Optional[str] = None,
         exchange: str = "NSE",
         timeframe: str = "1day",
-    ) -> Tuple[List[str], str]:
+        as_of_date: Optional[str] = None,
+    ) -> Tuple[List[str], str, Dict[str, Any]]:
         if basket_id:
             basket = basket_store.get(basket_id)
             if basket and basket.get("symbols"):
-                return list(basket["symbols"]), f"Basket: {basket['name']}"
+                return list(basket["symbols"]), f"Basket: {basket['name']}", {"point_in_time": False}
         if symbols and len(symbols) > 0:
             cleaned: List[str] = []
             seen: set[str] = set()
@@ -169,16 +188,22 @@ class PortfolioBacktestEngine:
                     seen.add(s)
                     cleaned.append(s)
             if cleaned:
-                return cleaned, "Custom Symbols"
+                return cleaned, "Custom Symbols", {"point_in_time": False}
         if universe and universe.strip().upper() != "CUSTOM":
             bundle = universe_resolver.resolve(
                 universe=universe,
                 custom_symbols=None,
                 exchange=exchange,
                 timeframe=timeframe,
+                as_of_date=as_of_date,
             )
-            return list(bundle.get("symbols") or []), str(bundle.get("label") or universe)
-        return ["RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK"], "Default Watchlist"
+            return list(bundle.get("symbols") or []), str(bundle.get("label") or universe), {
+                "point_in_time": bool(bundle.get("point_in_time", False)),
+                "effective_date": bundle.get("effective_date"),
+                "as_of_date": bundle.get("as_of_date"),
+                "survivorship_warning": bundle.get("survivorship_warning"),
+            }
+        return ["RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK"], "Default Watchlist", {"point_in_time": False}
 
     def _resolve_strategy(self, strategy: str, rule_def: Optional[Dict[str, Any]] = None):
         return self._single._resolve_strategy(strategy, rule_def=rule_def)
@@ -642,6 +667,11 @@ class PortfolioBacktestEngine:
         segment: str = "equity_intraday",
         charges_overrides: Optional[Dict[str, Any]] = None,
         slippage_bps: float = 5.0,
+        spread_bps: float = 0.0,
+        max_volume_participation_pct: float = 0.0,
+        as_of_date: Optional[str] = None,
+        strict_adjustment_consistency: bool = False,
+        contracts: Optional[Dict[str, Any]] = None,
         provider: Optional[str] = None,
         backend: str = "auto",
         fetcher: Optional[Callable[..., List[Dict[str, Any]]]] = None,
@@ -677,16 +707,26 @@ class PortfolioBacktestEngine:
             elif eff_holding == "MIS" and segment == "equity_delivery":
                 eff_segment = "equity_intraday"
 
-        resolved_syms, symbol_source = self._resolve_symbols(
+        eff_as_of = as_of_date or (start_str if (universe and universe.strip().upper() != "CUSTOM") else None)
+        resolved_syms, symbol_source, universe_meta = self._resolve_symbols(
             symbols=symbols,
             basket_id=basket_id,
             universe=universe,
             exchange=clean_exch,
             timeframe=tf,
+            as_of_date=eff_as_of,
         )
         resolved_syms = resolved_syms[:50]
         if not resolved_syms:
             raise ValueError("At least one symbol is required to run a backtest.")
+
+        adj_consistency = self._hist.check_adjustment_consistency(
+            resolved_syms,
+            exchange=clean_exch,
+            timeframe=tf,
+        )
+        if strict_adjustment_consistency and not adj_consistency["consistent"]:
+            raise ValueError(adj_consistency["warning"] or "Incompatible adjustment modes across symbols.")
 
         cap = max(5000.0, float(initial_capital or 500000.0))
         max_pos = max(1, min(len(resolved_syms), int(max_open_positions or 5)))
@@ -772,6 +812,11 @@ class PortfolioBacktestEngine:
             tsl_pct=tsl_pct,
             charges_cfg=charges_cfg,
             charges_overrides=ov,
+            spread_bps=max(0.0, float(spread_bps or 0.0)),
+            max_volume_participation_pct=max(0.0, min(100.0, float(max_volume_participation_pct or 0.0))),
+            universe_meta=universe_meta,
+            adjustment_consistency=adj_consistency,
+            contracts=contracts,
             provider=eff_provider,
             backend=backend,
             fetcher=fetcher,
@@ -1053,15 +1098,52 @@ class PortfolioBacktestEngine:
         tsl_pct: float,
         charges_cfg: ChargesConfig,
         charges_overrides: Dict[str, Any],
-        provider: str,
-        backend: str,
-        fetcher: Optional[Callable[..., List[Dict[str, Any]]]],
-        progress_cb: Optional[Callable[[int, int, str], None]],
-        cancel_event: Optional[threading.Event],
+        spread_bps: float = 0.0,
+        max_volume_participation_pct: float = 0.0,
+        universe_meta: Optional[Dict[str, Any]] = None,
+        adjustment_consistency: Optional[Dict[str, Any]] = None,
+        contracts: Optional[Dict[str, Any]] = None,
+        provider: str = "yfinance",
+        backend: str = "auto",
+        fetcher: Optional[Callable[..., List[Dict[str, Any]]]] = None,
+        progress_cb: Optional[Callable[[int, int, str], None]] = None,
+        cancel_event: Optional[threading.Event] = None,
     ) -> Dict[str, Any]:
         is_short = side == "SELL"
         is_intraday_tf = timeframe not in {"1day", "1week", "1month"}
         mis_eod_squareoff = is_intraday_tf and holding_type == "MIS"
+        half_spread_rate = max(0.0, float(spread_bps or 0.0)) / 20000.0
+        vol_cap_pct = max(0.0, min(100.0, float(max_volume_participation_pct or 0.0)))
+
+        # Resolve per-symbol contract specs (lot_size, tick_size, expiry) for F&O realism
+        contract_specs: Dict[str, Dict[str, Any]] = {}
+        try:
+            from core.instruments import instrument_index
+        except Exception:
+            instrument_index = None  # type: ignore[assignment]
+
+        for sym in symbols:
+            spec: Dict[str, Any] = {"lot_size": 1, "tick_size": 0.05, "expiry": None}
+            if contracts and sym in contracts:
+                raw_c = contracts[sym]
+                if hasattr(raw_c, "effective_lot_size"):
+                    spec["lot_size"] = int(raw_c.effective_lot_size)
+                    spec["tick_size"] = float(raw_c.effective_tick_size)
+                    spec["expiry"] = getattr(raw_c, "expiry", None)
+                elif isinstance(raw_c, dict):
+                    spec["lot_size"] = max(1, int(raw_c.get("lot_size") or 1))
+                    spec["tick_size"] = float(raw_c.get("tick_size") or 0.05)
+                    spec["expiry"] = raw_c.get("expiry")
+            elif instrument_index is not None:
+                try:
+                    c_obj = instrument_index.get_contract(sym, exchange=exchange)
+                    if c_obj is not None:
+                        spec["lot_size"] = c_obj.effective_lot_size
+                        spec["tick_size"] = c_obj.effective_tick_size
+                        spec["expiry"] = c_obj.expiry
+                except Exception:
+                    pass
+            contract_specs[sym.strip().upper()] = spec
 
         # Phase 1: Load OHLCV and pre-compute per-symbol signals & indicator series ONCE
         sym_series: Dict[str, Dict[str, Any]] = {}
@@ -1182,12 +1264,13 @@ class PortfolioBacktestEngine:
             pos = positions.pop(psym)
             qty = int(pos["qty"])
             entry_px = float(pos["entry_price"])
-            gross_pnl = (entry_px - exit_px) * qty if is_short else (exit_px - entry_px) * qty
+            exit_px_eff = exit_px * (1.0 + half_spread_rate) if is_short else exit_px * (1.0 - half_spread_rate)
+            gross_pnl = (entry_px - exit_px_eff) * qty if is_short else (exit_px_eff - entry_px) * qty
             total_gross_pnl += gross_pnl
 
             exit_side = "BUY" if is_short else "SELL"
             exit_leg = charges_engine.calculate_leg(
-                side=exit_side, price=exit_px, quantity=qty, cfg=charges_cfg, include_slippage=True
+                side=exit_side, price=exit_px_eff, quantity=qty, cfg=charges_cfg, include_slippage=True
             )
             trade_chg = ChargeBreakdown()
             trade_chg.add(pos["entry_leg"])
@@ -1198,8 +1281,9 @@ class PortfolioBacktestEngine:
             if is_short:
                 cash += (qty * entry_px) + gross_pnl - exit_leg.total_charges
             else:
-                cash += (qty * exit_px) - exit_leg.total_charges
+                cash += (qty * exit_px_eff) - exit_leg.total_charges
             ret_pct = (net_pnl / max(1.0, qty * entry_px)) * 100.0
+            exit_px = exit_px_eff
 
             trades.append(
                 {
@@ -1285,10 +1369,17 @@ class PortfolioBacktestEngine:
                     ranked_candidates.sort(key=lambda c: (c[2], c[0]), reverse=True)
 
                 entry_side = "SELL" if is_short else "BUY"
-                for sym, entry_px, _, sym_i, bar_ts in ranked_candidates:
+                for sym, raw_entry_px, _, sym_i, bar_ts in ranked_candidates:
                     open_slots = eff_max_slots - len(positions)
-                    if open_slots <= 0 or cash <= 0 or entry_px <= 0:
+                    if open_slots <= 0 or cash <= 0 or raw_entry_px <= 0:
                         break
+                    c_spec = contract_specs.get(sym, {"lot_size": 1, "tick_size": 0.05, "expiry": None})
+                    lot_sz = max(1, int(c_spec.get("lot_size") or 1))
+                    c_expiry = c_spec.get("expiry")
+                    # Never open a new position on or after contract expiry
+                    if c_expiry and cur_day >= str(c_expiry)[:10]:
+                        continue
+                    entry_px = raw_entry_px * (1.0 - half_spread_rate) if is_short else raw_entry_px * (1.0 + half_spread_rate)
                     cur_equity = _mark_to_market_equity()
                     est_rate = (charges_cfg.slippage_bps / 10000.0) + charges_cfg.stt_buy_pct + charges_cfg.stamp_duty_buy_pct + 0.001
                     if allocation_mode == "equal_split":
@@ -1306,19 +1397,35 @@ class PortfolioBacktestEngine:
                         target_budget = cash / float(open_slots)
                         qty = int(max(0.0, target_budget - charges_cfg.brokerage_flat_per_order * 1.2) // (entry_px * (1.0 + est_rate)))
 
-                    if qty < 1:
+                    # Enforce volume participation cap if configured
+                    rec_entry = sym_series[sym]["bar_by_ts"].get(ts_key)
+                    if vol_cap_pct > 0 and rec_entry is not None:
+                        bar_vol = int(float(rec_entry[1].get("volume") or 0))
+                        if bar_vol > 0:
+                            max_vol_qty = max(0, int(bar_vol * (vol_cap_pct / 100.0)))
+                            qty = min(qty, max_vol_qty)
+
+                    # Enforce F&O lot-size multiples (never fractional lots)
+                    if lot_sz > 1:
+                        qty = (qty // lot_sz) * lot_sz
+
+                    if qty < lot_sz:
                         continue
                     entry_leg = charges_engine.calculate_leg(
                         side=entry_side, price=entry_px, quantity=qty, cfg=charges_cfg, include_slippage=True
                     )
                     total_outlay = (qty * entry_px) + entry_leg.total_charges
-                    if total_outlay > cash and qty > 1:
-                        qty = max(1, int((cash - entry_leg.total_charges) // entry_px))
+                    if total_outlay > cash and qty > lot_sz:
+                        qty = int((cash - entry_leg.total_charges) // entry_px)
+                        if lot_sz > 1:
+                            qty = (qty // lot_sz) * lot_sz
+                        if qty < lot_sz:
+                            continue
                         entry_leg = charges_engine.calculate_leg(
                             side=entry_side, price=entry_px, quantity=qty, cfg=charges_cfg, include_slippage=True
                         )
                         total_outlay = (qty * entry_px) + entry_leg.total_charges
-                    if qty >= 1 and total_outlay <= cash:
+                    if qty >= lot_sz and total_outlay <= cash:
                         cash -= total_outlay
                         positions[sym] = {
                             "qty": qty,
@@ -1327,6 +1434,8 @@ class PortfolioBacktestEngine:
                             "entry_bar_idx": step_idx,
                             "entry_leg": entry_leg,
                             "extreme": entry_px,
+                            "lot_size": lot_sz,
+                            "expiry": c_expiry,
                         }
                         entered_this_step.add(sym)
                         er = sym_series[sym]["export_rows"][sym_i]
@@ -1388,6 +1497,10 @@ class PortfolioBacktestEngine:
                         elif is_session_last_bar:
                             exit_px = b_close
                             reason = "MIS_EOD_SQUAREOFF"
+
+                    if not reason and pos.get("expiry") and cur_day >= str(pos["expiry"])[:10]:
+                        exit_px = b_close
+                        reason = "EXPIRY_SETTLEMENT"
 
                     if reason:
                         _close_position(sym, exit_px, bar_ts, step_idx, sym_i, reason)
@@ -1468,6 +1581,50 @@ class PortfolioBacktestEngine:
                 f"Portfolio backtest complete ({len(trades)} trades, Net PnL ₹{metrics['net_pnl']:,.2f}).",
             )
 
+        manifest_warnings: List[str] = []
+        if universe_meta and universe_meta.get("survivorship_warning"):
+            manifest_warnings.append(str(universe_meta["survivorship_warning"]))
+        if adjustment_consistency and adjustment_consistency.get("warning"):
+            manifest_warnings.append(str(adjustment_consistency["warning"]))
+        if metrics.get("sample_warning"):
+            manifest_warnings.append(str(metrics["sample_warning"]))
+
+        import hashlib
+
+        params_hash = hashlib.sha256(
+            json.dumps(
+                {
+                    "strategy": strategy_id,
+                    "params": params,
+                    "symbols": active_syms,
+                    "timeframe": timeframe,
+                    "from_date": ordered_ts[0][:10] if ordered_ts else from_date,
+                    "to_date": ordered_ts[-1][:10] if ordered_ts else to_date,
+                    "allocation_mode": allocation_mode,
+                    "spread_bps": spread_bps,
+                    "max_volume_participation_pct": vol_cap_pct,
+                },
+                sort_keys=True,
+                default=str,
+            ).encode("utf-8")
+        ).hexdigest()[:16]
+
+        generated_at = datetime.now(tz=IST_TZ).isoformat(timespec="seconds")
+        reproducibility_manifest = {
+            "run_id": run_id,
+            "params_hash": params_hash,
+            "strategy_id": strategy_id,
+            "strategy_mode": strategy_mode,
+            "provider": provider,
+            "timeframe": timeframe,
+            "base_timeframe": base_tf,
+            "universe_point_in_time": bool((universe_meta or {}).get("point_in_time", False)),
+            "universe_effective_date": (universe_meta or {}).get("effective_date"),
+            "adjustment_consistency": adjustment_consistency or {"consistent": True},
+            "warnings": manifest_warnings,
+            "generated_at_ist": generated_at,
+        }
+
         result = {
             "ok": True,
             "run_id": run_id,
@@ -1507,8 +1664,14 @@ class PortfolioBacktestEngine:
                 "no_same_bar_exit": True,
                 "gap_through_stops": True,
                 "slippage_bps": float(charges_cfg.slippage_bps or 0.0),
+                "spread_bps": float(spread_bps or 0.0),
+                "max_volume_participation_pct": vol_cap_pct,
+                "lot_size_enforced": True,
+                "expiry_settlement_enforced": True,
                 "sharpe_method": metrics.get("sharpe_method", "daily_resampled_sqrt252"),
             },
+            "reproducibility_manifest": reproducibility_manifest,
+            "warnings": manifest_warnings,
             "indicator_columns": export_ind_cols,
             "has_ohlcv_export": True,
             **metrics,
@@ -1538,7 +1701,7 @@ class PortfolioBacktestEngine:
                 "segment": charges_cfg.segment,
                 "charges_overrides": charges_overrides,
             },
-            "generated_at_ist": datetime.now(tz=IST_TZ).isoformat(timespec="seconds"),
+            "generated_at_ist": generated_at,
         }
         self._save_run_snapshot(result)
         return result

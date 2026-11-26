@@ -29,6 +29,8 @@ from broker.base import (
     BrokerOrder,
     BrokerPosition,
     ConnectionState,
+    DepthLevel,
+    MarketDepth,
     OrderRequest,
     OrderStatus,
     TokenBucketRateLimiter,
@@ -75,6 +77,10 @@ class ZerodhaBroker(BrokerBase):
         supports_market_data=True,
         supports_websocket=True,
         requires_oauth=True,
+        supports_historical=True,
+        supports_instrument_master=True,
+        max_depth_levels=5,
+        execution_grade_feed=True,
     )
 
     def __init__(
@@ -705,6 +711,97 @@ class ZerodhaBroker(BrokerBase):
                 self._log_read_warning("trades", "Zerodha live trade book read failed", exc)
         return []
 
+    def is_authenticated(self) -> bool:
+        if self.access_token:
+            return True
+        try:
+            return bool(zerodha_auth_manager.get_valid_token())
+        except Exception:
+            return False
+
+    def fetch_market_depth(
+        self,
+        symbol: str,
+        exchange: str = "NSE",
+        instrument_key: str = "",
+        levels: int = 5,
+    ) -> Optional[MarketDepth]:
+        """
+        Fetch Level-5 market depth from Zerodha Kite Connect REST API (`/quote?i=EXCH:SYMBOL`).
+        """
+        from urllib.parse import quote as url_quote
+
+        sym = (symbol or "").strip().upper()
+        exch = (exchange or "NSE").strip().upper()
+        if not sym or not self.is_authenticated():
+            return None
+        query_key = f"{exch}:{sym}"
+        try:
+            if self._kite is not None and hasattr(self._kite, "quote"):
+                data_map = self._kite.quote([query_key]) or {}
+            else:
+                raw = self._rest_request_json(
+                    f"{config.ZERODHA_BASE_URL}/quote?i={url_quote(query_key, safe=':')}",
+                    method="GET",
+                    timeout=5.0,
+                )
+                data_map = raw.get("data") or {}
+            item = data_map.get(query_key) or next(iter(data_map.values()), None)
+            if not isinstance(item, dict):
+                return None
+            depth_obj = item.get("depth") or {}
+            req_levels = max(1, min(int(levels or 5), 5))
+            bids: List[DepthLevel] = []
+            asks: List[DepthLevel] = []
+            for row in (depth_obj.get("buy") or [])[:req_levels]:
+                px = float(row.get("price") or 0.0)
+                qty = int(row.get("quantity") or 0)
+                if px > 0 or qty > 0:
+                    bids.append(DepthLevel(price=px, quantity=qty, orders=int(row.get("orders") or 0)))
+            for row in (depth_obj.get("sell") or [])[:req_levels]:
+                px = float(row.get("price") or 0.0)
+                qty = int(row.get("quantity") or 0)
+                if px > 0 or qty > 0:
+                    asks.append(DepthLevel(price=px, quantity=qty, orders=int(row.get("orders") or 0)))
+            if not bids and not asks:
+                return None
+            ts_raw = item.get("timestamp") or item.get("last_trade_time")
+            return MarketDepth(
+                symbol=sym,
+                exchange=exch,
+                bids=bids,
+                asks=asks,
+                total_buy_qty=int(item.get("buy_quantity") or 0),
+                total_sell_qty=int(item.get("sell_quantity") or 0),
+                depth_levels=max(len(bids), len(asks)),
+                source="zerodha",
+                transport="rest",
+                ts_ist=str(ts_raw) if ts_raw else None,
+            )
+        except Exception as exc:
+            self._log_read_warning("depth", "Zerodha depth fetch failed", exc)
+            return None
+
+    def create_ws_client(
+        self,
+        *,
+        on_tick: Any = None,
+        on_status: Any = None,
+        depth_levels: int = 5,
+    ) -> Optional[Any]:
+        from core.broker_ws import ZerodhaWSFeedClient
+
+        return ZerodhaWSFeedClient(
+            on_tick=on_tick,
+            on_status=on_status,
+        )
+
+    def sync_instruments(self, store: Any, **kwargs: Any) -> Optional[Dict[str, Any]]:
+        if hasattr(store, "sync_zerodha"):
+            return store.sync_zerodha(**kwargs)
+        return None
+
 
 __all__ = ["ZerodhaBroker"]
+
 

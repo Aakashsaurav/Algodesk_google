@@ -156,6 +156,40 @@ export function DeploymentsConsole({ onGoToStrategies, onGoToRisk }: Props) {
     }
   };
 
+  const handleResolveManualOrder = async (
+    clientOrderId: string,
+    status: 'FILLED' | 'REJECTED' | 'CANCELLED',
+    defaultQty: number,
+    defaultPrice: number,
+  ) => {
+    setBusyId(clientOrderId);
+    setFeedback(null);
+    try {
+      const payload: Record<string, unknown> = {
+        client_order_id: clientOrderId,
+        status,
+        note: `Resolved via operator console as ${status}`,
+      };
+      if (status === 'FILLED') {
+        payload.filled_qty = defaultQty;
+        if (defaultPrice > 0) payload.avg_price = defaultPrice;
+      }
+      const res = await apiFetch('/api/streak/oms/resolve', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(body.detail || 'Manual order resolution failed.');
+      setFeedback({ ok: true, text: `OMS order ${clientOrderId} resolved as ${status}.` });
+      await fetchDeployments();
+    } catch (err) {
+      setFeedback({ ok: false, text: err instanceof Error ? err.message : 'Manual order resolution failed.' });
+    } finally {
+      setBusyId(null);
+    }
+  };
+
   const deployments = data?.deployments || [];
   const filtered = deployments.filter((d) => {
     if (tab === 'paper') return d.exec_mode === 'paper';
@@ -367,70 +401,139 @@ export function DeploymentsConsole({ onGoToStrategies, onGoToRisk }: Props) {
       </div>
 
       {tab === 'oms' ? (
-        <div className="overflow-x-auto rounded-xl border border-slate-800 bg-[#111827] p-4">
-          {omsOrders.length === 0 ? (
-            <p className="py-8 text-center text-xs text-slate-500">
-              No OMS orders recorded yet. Paper, quick, and live orders appear here with full broker fill reconciliation.
-            </p>
-          ) : (
-            <table className="w-full text-xs">
-              <thead className="border-b border-slate-800 text-[11px] uppercase text-slate-500">
-                <tr>
-                  <th className="py-2 text-left">Client / Broker ID</th>
-                  <th className="py-2 text-left">Instrument</th>
-                  <th className="py-2 text-left">Side / Product</th>
-                  <th className="py-2 text-right">Filled / Qty</th>
-                  <th className="py-2 text-right">Avg ₹</th>
-                  <th className="py-2 pl-3 text-left">Status</th>
-                  <th className="py-2 text-left">Note / Rejection</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-800/60 font-mono tabular-nums">
-                {omsOrders.map((o) => {
-                  const st = (o.status || '').toUpperCase();
-                  const stColor =
-                    st === 'FILLED'
-                      ? 'text-emerald-400'
-                      : st === 'REJECTED' || st === 'CANCELLED' || st === 'EXPIRED'
-                        ? 'text-red-400'
-                        : st === 'PARTIALLY_FILLED'
-                          ? 'text-amber-300'
-                          : 'text-sky-300';
-                  const totalQty = Number(o.quantity ?? o.qty ?? 0);
-                  const filledQty = Number(o.filled_quantity ?? o.filled_qty ?? 0);
-                  const avgPx = Number(o.average_fill_price ?? o.avg_price ?? 0);
-                  const modeLabel = o.exec_mode || o.mode || '';
-                  return (
-                    <tr key={o.client_order_id} className="hover:bg-slate-800/30">
-                      <td className="py-2 text-[11px] text-slate-300">
-                        <div>{o.client_order_id}</div>
-                        <div className="text-[10px] text-slate-500">
-                          {o.broker_order_id || '—'} · {modeLabel}
-                        </div>
-                      </td>
-                      <td className="py-2 text-slate-100">
-                        {o.symbol} <span className="text-slate-500">({o.exchange})</span>
-                      </td>
-                      <td className="py-2">
-                        <span className={o.side === 'BUY' || o.side === 'COVER' ? 'text-emerald-400' : 'text-red-400'}>
-                          {o.side}
-                        </span>{' '}
-                        <span className="text-slate-400">{o.product}</span>
-                      </td>
-                      <td className="py-2 text-right text-slate-200">
-                        {filledQty} / {totalQty}
-                      </td>
-                      <td className="py-2 text-right text-slate-200">
-                        {avgPx > 0 ? `₹${avgPx.toFixed(2)}` : '—'}
-                      </td>
-                      <td className={`py-2 pl-3 font-sans font-semibold ${stColor}`}>{st}</td>
-                      <td className="py-2 font-sans text-slate-400">{o.rejection_reason || o.updated_at_ist.slice(11, 19)}</td>
-                    </tr>
-                  );
-                })}
-              </tbody>
-            </table>
+        <div className="space-y-3">
+          {omsOrders.some((o) => {
+            const st = (o.status || '').toUpperCase();
+            return st === 'MANUAL_INTERVENTION' || st === 'UNCERTAIN';
+          }) && (
+            <div className="flex items-center gap-2.5 rounded-xl border border-amber-700/70 bg-amber-950/35 px-4 py-3 text-xs text-amber-200">
+              <ShieldAlert className="h-4 w-4 shrink-0 text-amber-400" />
+              <span>
+                <strong>Operator Verification Required</strong> — One or more orders are in{' '}
+                <span className="font-mono font-semibold">UNCERTAIN</span> or{' '}
+                <span className="font-mono font-semibold">MANUAL_INTERVENTION</span> state after an ambiguous broker
+                response. Verify status directly in your broker terminal before resolving below.
+              </span>
+            </div>
           )}
+          <div className="overflow-x-auto rounded-xl border border-slate-800 bg-[#111827] p-4">
+            {omsOrders.length === 0 ? (
+              <p className="py-8 text-center text-xs text-slate-500">
+                No OMS orders recorded yet. Paper, quick, and live orders appear here with full broker fill reconciliation.
+              </p>
+            ) : (
+              <table className="w-full text-xs">
+                <thead className="border-b border-slate-800 text-[11px] uppercase text-slate-500">
+                  <tr>
+                    <th className="py-2 text-left">Client / Broker ID</th>
+                    <th className="py-2 text-left">Instrument</th>
+                    <th className="py-2 text-left">Side / Product</th>
+                    <th className="py-2 text-right">Filled / Qty</th>
+                    <th className="py-2 text-right">Avg ₹</th>
+                    <th className="py-2 pl-3 text-left">Lifecycle State</th>
+                    <th className="py-2 text-left">Note / Operator Action</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-800/60 font-mono tabular-nums">
+                  {omsOrders.map((o) => {
+                    const st = (o.status || '').toUpperCase();
+                    const statusBadge =
+                      st === 'FILLED'
+                        ? { label: 'FILLED (Confirmed)', cls: 'border-emerald-700/70 bg-emerald-950/40 text-emerald-300' }
+                        : st === 'PARTIALLY_FILLED'
+                          ? { label: 'PARTIAL FILL', cls: 'border-amber-700/70 bg-amber-950/40 text-amber-300' }
+                          : st === 'SUBMITTED' || st === 'PENDING' || st === 'OPEN'
+                            ? {
+                                label: st === 'SUBMITTED' ? 'SUBMITTED (Unfilled)' : `${st} (Working)`,
+                                cls: 'border-sky-700/70 bg-sky-950/40 text-sky-300',
+                              }
+                            : st === 'UNCERTAIN' || st === 'MANUAL_INTERVENTION'
+                              ? {
+                                  label: st === 'MANUAL_INTERVENTION' ? 'MANUAL INTERVENTION' : 'UNCERTAIN (Verify)',
+                                  cls: 'border-amber-600/80 bg-amber-950/60 text-amber-200',
+                                }
+                              : st === 'REJECTED' || st === 'CANCELLED' || st === 'EXPIRED'
+                                ? { label: st, cls: 'border-red-800/70 bg-red-950/40 text-red-300' }
+                                : { label: st || 'UNKNOWN', cls: 'border-slate-700 bg-slate-900 text-slate-300' };
+                    const totalQty = Number(o.quantity ?? o.qty ?? 0);
+                    const filledQty = Number(o.filled_quantity ?? o.filled_qty ?? 0);
+                    const avgPx = Number(o.average_fill_price ?? o.avg_price ?? o.limit_price ?? 0);
+                    const modeLabel = o.exec_mode || o.mode || '';
+                    const needsManualResolve = st === 'MANUAL_INTERVENTION' || st === 'UNCERTAIN';
+                    return (
+                      <tr key={o.client_order_id} className="hover:bg-slate-800/30">
+                        <td className="py-2 text-[11px] text-slate-300">
+                          <div>{o.client_order_id}</div>
+                          <div className="text-[10px] text-slate-500">
+                            {o.broker_order_id || '—'} · {modeLabel}
+                          </div>
+                        </td>
+                        <td className="py-2 text-slate-100">
+                          {o.symbol} <span className="text-slate-500">({o.exchange})</span>
+                        </td>
+                        <td className="py-2">
+                          <span className={o.side === 'BUY' || o.side === 'COVER' ? 'text-emerald-400' : 'text-red-400'}>
+                            {o.side}
+                          </span>{' '}
+                          <span className="text-slate-400">{o.product}</span>
+                        </td>
+                        <td className="py-2 text-right text-slate-200">
+                          {filledQty} / {totalQty}
+                        </td>
+                        <td className="py-2 text-right text-slate-200">
+                          {avgPx > 0 ? `₹${avgPx.toFixed(2)}` : '—'}
+                        </td>
+                        <td className="py-2 pl-3 font-sans">
+                          <span
+                            className={`inline-block rounded border px-2 py-0.5 text-[11px] font-semibold ${statusBadge.cls}`}
+                          >
+                            {statusBadge.label}
+                          </span>
+                        </td>
+                        <td className="py-2 font-sans text-slate-400">
+                          <div>{o.rejection_reason || o.updated_at_ist.slice(11, 19)}</div>
+                          {needsManualResolve && (
+                            <div className="mt-1.5 flex flex-wrap items-center gap-1.5">
+                              <button
+                                type="button"
+                                disabled={busyId === o.client_order_id}
+                                onClick={() =>
+                                  void handleResolveManualOrder(o.client_order_id, 'FILLED', totalQty, avgPx)
+                                }
+                                className="rounded border border-emerald-700/70 bg-emerald-950/40 px-2 py-0.5 text-[10px] font-semibold text-emerald-300 hover:bg-emerald-900/50 disabled:opacity-50"
+                              >
+                                Confirm Filled
+                              </button>
+                              <button
+                                type="button"
+                                disabled={busyId === o.client_order_id}
+                                onClick={() =>
+                                  void handleResolveManualOrder(o.client_order_id, 'CANCELLED', 0, 0)
+                                }
+                                className="rounded border border-slate-700 bg-slate-900 px-2 py-0.5 text-[10px] font-semibold text-slate-300 hover:bg-slate-800 disabled:opacity-50"
+                              >
+                                Mark Cancelled
+                              </button>
+                              <button
+                                type="button"
+                                disabled={busyId === o.client_order_id}
+                                onClick={() =>
+                                  void handleResolveManualOrder(o.client_order_id, 'REJECTED', 0, 0)
+                                }
+                                className="rounded border border-red-800/70 bg-red-950/40 px-2 py-0.5 text-[10px] font-semibold text-red-300 hover:bg-red-900/50 disabled:opacity-50"
+                              >
+                                Mark Rejected
+                              </button>
+                            </div>
+                          )}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            )}
+          </div>
         </div>
       ) : tab === 'alerts' ? (
         <div className="overflow-x-auto rounded-xl border border-slate-800 bg-[#111827] p-4">

@@ -26,8 +26,29 @@ function readCliArg(flag: string): string | undefined {
 }
 
 const PORT = Number(readCliArg('--port') || process.env.PORT || 3000);
-const IS_HOSTED_ENV = Boolean(process.env.K_SERVICE || process.env.CLOUD_RUN_JOB || process.env.PORT);
-const HOST = readCliArg('--host') || process.env.HOST || (IS_HOSTED_ENV ? '0.0.0.0' : '127.0.0.1');
+const IS_CLOUD_RUNTIME = Boolean(
+  process.env.K_SERVICE ||
+    process.env.CLOUD_RUN_JOB ||
+    process.env.RENDER ||
+    process.env.FLY_APP_NAME ||
+    process.env.PORT
+);
+const ALLOW_REMOTE = ['1', 'true', 'yes', 'on'].includes(
+  String(process.env.ALGODESK_ALLOW_REMOTE || '').trim().toLowerCase()
+);
+const REQUESTED_HOST = readCliArg('--host') || process.env.HOST;
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '::1']);
+let HOST = REQUESTED_HOST || (IS_CLOUD_RUNTIME || ALLOW_REMOTE ? '0.0.0.0' : '127.0.0.1');
+if (!LOOPBACK_HOSTS.has(HOST) && !ALLOW_REMOTE && !IS_CLOUD_RUNTIME) {
+  console.warn(
+    `[security] Refusing non-loopback bind '${HOST}' without ALGODESK_ALLOW_REMOTE=1; falling back to 127.0.0.1.`
+  );
+  HOST = '127.0.0.1';
+} else if (!LOOPBACK_HOSTS.has(HOST)) {
+  console.warn(
+    `[security] Binding AlgoDesk web bridge on non-loopback interface ${HOST}:${PORT}. Ensure TLS reverse proxy and operator authentication are active.`
+  );
+}
 const BASE_PYTHON_PORT = Number(process.env.PYTHON_HUB_PORT || 8001);
 let activePythonPort = BASE_PYTHON_PORT;
 const IS_PROD = process.env.NODE_ENV === 'production';
@@ -40,8 +61,9 @@ function getPythonOrigin(): string {
 }
 
 function resolvePythonBin(): string {
-  if (process.env.PYTHON_BIN?.trim()) {
-    return process.env.PYTHON_BIN.trim();
+  const explicit = process.env.ALGODESK_PYTHON?.trim() || process.env.PYTHON_BIN?.trim();
+  if (explicit) {
+    return explicit;
   }
   const candidates: string[] = [];
   const activeVenv = process.env.VIRTUAL_ENV?.trim();
@@ -70,6 +92,15 @@ function resolvePythonBin(): string {
   for (const candidate of candidates) {
     if (fs.existsSync(candidate)) {
       return candidate;
+    }
+  }
+  const pathDirs = (process.env.PATH || '').split(path.delimiter).filter(Boolean);
+  for (const binName of process.platform === 'win32' ? ['python.exe', 'python3.exe'] : ['python3', 'python']) {
+    for (const dir of pathDirs) {
+      const full = path.join(dir, binName);
+      if (fs.existsSync(full)) {
+        return full;
+      }
     }
   }
   return 'python3';
@@ -419,6 +450,15 @@ export class ErrorOverlay extends HTMLElement {}
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
+  process.on('exit', () => {
+    if (pythonProc && pythonProc.exitCode === null && !pythonProc.killed) {
+      try {
+        pythonProc.kill('SIGTERM');
+      } catch {
+        // ignore
+      }
+    }
+  });
 }
 
 void bootstrap();

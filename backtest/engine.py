@@ -398,6 +398,26 @@ class BacktestEngine:
                 if (vol_cap_pct > 0 and bar_vol > 0)
                 else 0
             )
+            # Resolve F&O contract lot size & tick size if registered in local instrument master
+            _lot_size = 1
+            _contract_expiry: Optional[str] = None
+            try:
+                from core.instruments import instrument_index
+
+                _c = instrument_index.get_contract(
+                    dl_meta["symbol"],
+                    exchange=clean_exch,
+                    instrument_type=instrument_type,
+                )
+                if _c is not None:
+                    _lot_size = _c.effective_lot_size
+                    _contract_expiry = _c.expiry
+            except Exception:
+                pass
+            if _lot_size > 1:
+                if max_vol_qty > 0:
+                    max_vol_qty = (max_vol_qty // _lot_size) * _lot_size
+
             if use_real_charges and charges_cfg is not None:
                 from charges.calculator import charges_engine
 
@@ -405,21 +425,27 @@ class BacktestEngine:
                 qty = int(max(0.0, cash - charges_cfg.brokerage_flat_per_order * 1.2) // (fill_px * (1.0 + est_rate)))
                 if max_vol_qty > 0:
                     qty = min(qty, max_vol_qty)
-                if qty < 1:
+                if _lot_size > 1:
+                    qty = (qty // _lot_size) * _lot_size
+                if qty < _lot_size:
                     return False
                 leg = charges_engine.calculate_leg(
                     side=entry_side, price=fill_px, quantity=qty, cfg=charges_cfg, include_slippage=True
                 )
                 total_outlay = (qty * fill_px) + leg.total_charges
-                if total_outlay > cash and qty > 1:
-                    qty = max(1, int((cash - leg.total_charges) // fill_px))
+                if total_outlay > cash and qty > _lot_size:
+                    qty = int((cash - leg.total_charges) // fill_px)
                     if max_vol_qty > 0:
                         qty = min(qty, max_vol_qty)
+                    if _lot_size > 1:
+                        qty = (qty // _lot_size) * _lot_size
+                    if qty < _lot_size:
+                        return False
                     leg = charges_engine.calculate_leg(
                         side=entry_side, price=fill_px, quantity=qty, cfg=charges_cfg, include_slippage=True
                     )
                     total_outlay = (qty * fill_px) + leg.total_charges
-                if qty < 1 or total_outlay > cash:
+                if qty < _lot_size or total_outlay > cash:
                     return False
                 shares = qty
                 entry_price = fill_px
@@ -434,7 +460,9 @@ class BacktestEngine:
                 qty = int(cash // buy_eff)
                 if max_vol_qty > 0:
                     qty = min(qty, max_vol_qty)
-                if qty < 1:
+                if _lot_size > 1:
+                    qty = (qty // _lot_size) * _lot_size
+                if qty < _lot_size:
                     return False
                 shares = qty
                 entry_price = fill_px
@@ -638,7 +666,20 @@ class BacktestEngine:
         end_d = date.fromisoformat(str(rows[-1]["trade_date"])[:10])
         span_days = max(1, (end_d - start_d).days)
         years = max(span_days / 365.25, 1.0 / 252.0)
-        cagr_pct = ((max(final_equity, 1.0) / cap) ** (1.0 / years) - 1.0) * 100.0 if years >= 0.08 else total_return_pct
+        if span_days >= 90:
+            cagr_pct: Optional[float] = round(((max(final_equity, 1.0) / cap) ** (1.0 / years) - 1.0) * 100.0, 2)
+            cagr_methodology = "compound_annualized_365_25"
+            sample_warning: Optional[str] = (
+                f"Low trade sample ({len(trades)} trades < 10); metrics may lack statistical significance."
+                if len(trades) < 10
+                else None
+            )
+        else:
+            cagr_pct = None
+            cagr_methodology = "suppressed_short_window_lt_90d"
+            sample_warning = (
+                f"Backtest duration is {span_days} days (< 90 days); CAGR is suppressed to avoid misleading annualization."
+            )
 
         sharpe_metrics = compute_sharpe_metrics(raw_curve, cap, tf, exchange=clean_exch)
         sharpe = float(sharpe_metrics["sharpe_ratio"])
@@ -740,7 +781,11 @@ class BacktestEngine:
             "charges_breakdown": charges_breakdown,
             "net_pnl": round(net_pnl, 2),
             "total_return_pct": round(total_return_pct, 2),
-            "cagr_pct": round(cagr_pct, 2),
+            "cagr_pct": cagr_pct,
+            "annualized_return_pct": cagr_pct,
+            "duration_days": span_days,
+            "cagr_methodology": cagr_methodology,
+            "sample_warning": sample_warning,
             "max_drawdown_pct": round(max_drawdown_pct, 2),
             "sharpe_ratio": round(sharpe, 2),
             "daily_sharpe_ratio": sharpe_metrics["daily_sharpe_ratio"],

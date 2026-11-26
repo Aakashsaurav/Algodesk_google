@@ -342,22 +342,35 @@ class PreflightChecker:
             )
         )
 
-        # 2. Trading Broker Live Auth Check
+        # 2. Trading Broker Live Auth Check (+ proactive token expiry monitoring)
         t_adapter = BrokerRegistry.get(trading_broker)
         t_snap = t_adapter.health_check(timeout=3.0) if probe_brokers else None
         t_ok = bool(t_snap and t_snap.is_connected)
+        expiry_detail: Optional[Dict[str, Any]] = None
+        if trading_broker.strip().lower() == "upstox":
+            expiry_detail = upstox_auth.get_token_expiry_status(now=ref_dt)
+        elif trading_broker.strip().lower() == "zerodha":
+            expiry_detail = zerodha_auth.get_token_expiry_status(now=ref_dt)
+
+        t_msg = (
+            f"Verified session for {t_snap.account_name} ({t_snap.client_id})."
+            if t_snap and t_ok
+            else (t_snap.message if t_snap else "Trading session not verified.")
+        )
+        t_status = "PASS" if t_ok else "FAIL"
+        if t_ok and expiry_detail and expiry_detail.get("expiring_soon"):
+            t_status = "WARN"
+            t_msg += f" Token expires in {expiry_detail['minutes_remaining']:.0f} min ({expiry_detail['expires_at_ist']})."
+
         checks.append(
             PreflightCheckItem(
                 id="trading_auth",
                 name=f"Trading Connection ({t_adapter.display_name})",
                 passed=t_ok,
-                status="PASS" if t_ok else "FAIL",
+                status=t_status,
                 severity="ERROR",
-                message=(
-                    f"Verified session for {t_snap.account_name} ({t_snap.client_id})."
-                    if t_snap and t_ok
-                    else (t_snap.message if t_snap else "Trading session not verified.")
-                ),
+                message=t_msg,
+                detail={"token_expiry": expiry_detail} if expiry_detail else None,
             )
         )
 

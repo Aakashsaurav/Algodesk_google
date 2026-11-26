@@ -55,10 +55,23 @@ export function withAuthTokenQuery(url: string): string {
   return `${url}${sep}token=${encodeURIComponent(_sessionToken)}`;
 }
 
+function isLoopbackUrl(rawUrl: string): boolean {
+  try {
+    const parsed = new URL(
+      rawUrl,
+      typeof window !== 'undefined' ? window.location.href : 'http://127.0.0.1:8000'
+    );
+    const h = parsed.hostname.toLowerCase();
+    return h === '127.0.0.1' || h === 'localhost' || h === '::1' || h === '[::1]';
+  } catch {
+    return false;
+  }
+}
+
 /**
- * Open a WebSocket authenticating via Sec-WebSocket-Protocol (`algodesk.v1`, `bearer.<token>`)
- * so the session token never appears in URLs, proxy logs, or server access logs.
- * Falls back cleanly to query-string auth only if a custom env token contains non-RFC6455 token characters.
+ * Open a WebSocket authenticating strictly via Sec-WebSocket-Protocol (`algodesk.v1`, `bearer.<token>`)
+ * so the session token NEVER appears in URLs, proxy logs, or server access logs.
+ * Query-string fallback is permanently disabled on non-loopback hosts.
  */
 export function createAuthenticatedWebSocket(url: string): WebSocket {
   if (!_sessionToken) {
@@ -66,6 +79,11 @@ export function createAuthenticatedWebSocket(url: string): WebSocket {
   }
   if (/^[A-Za-z0-9._~-]+$/.test(_sessionToken)) {
     return new WebSocket(url, ['algodesk.v1', `bearer.${_sessionToken}`]);
+  }
+  if (!isLoopbackUrl(url)) {
+    throw new Error(
+      'WebSocket session token contains invalid RFC6455 subprotocol characters; query-string auth is disabled on remote hosts.'
+    );
   }
   return new WebSocket(withAuthTokenQuery(url));
 }

@@ -1932,9 +1932,281 @@ class SafeStrat(BacktestStrategy):
         self.assertIn("Sec-WebSocket-Protocol: algodesk.v1\r\n", resp_text)
         self.assertNotIn(sample_tok, resp_text)
 
+    # ── Test 27: Audit External Checkpoint Detects DB Truncation/Replacement ─
+    def test_27_audit_external_checkpoint_detects_db_deletion_and_replacement(self) -> None:
+        from core.audit import AuditTrail
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            db_path = tmp / "audit_chain.db"
+            trail = AuditTrail(db_path=db_path)
+
+            trail.log("ORDER_SUBMITTED", {"symbol": "RELIANCE", "qty": 10}, actor="oms")
+            trail.log("KILL_SWITCH_ENGAGED", {"reason": "test"}, actor="operator")
+            self.assertTrue(trail.checkpoint_path.exists())
+
+            ok_check = trail.verify_chain()
+            self.assertTrue(ok_check["valid"])
+            self.assertTrue(ok_check["checkpoint_verified"])
+            self.assertEqual(ok_check["total_events"], 2)
+
+            # Simulate an attacker deleting audit_chain.db and writing a fresh clean 1-event chain
+            for suffix in ("", "-wal", "-shm"):
+                p = Path(f"{db_path}{suffix}")
+                if p.exists():
+                    p.unlink()
+
+            forged = AuditTrail(db_path=db_path, checkpoint_path=trail.checkpoint_path)
+            # Write directly to SQLite without touching the external checkpoint (simulating DB swap)
+            with forged._connect() as conn:
+                conn.execute("SELECT 1")
+            tamper_check = forged.verify_chain()
+            self.assertFalse(tamper_check["valid"])
+            self.assertFalse(tamper_check["checkpoint_verified"])
+            self.assertIn("checkpoint mismatch", tamper_check["reason"])
+
+    # ── Test 28: SQLite WAL & busy_timeout Pragmas Across All Stores ──────
+    def test_28_sqlite_concurrency_wal_and_busy_timeout_across_all_stores(self) -> None:
+        from core.audit import AuditTrail
+        from core.historical import HistoricalDataManager
+        from core.instruments import InstrumentIndex
+        from deploy.manager import DeploymentManager
+        from execution.oms import OrderManagementSystem
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            audit = AuditTrail(db_path=tmp / "audit.db")
+            instruments = InstrumentIndex(db_path=tmp / "instr.db")
+            hist = HistoricalDataManager(db_path=tmp / "hist.db", parquet_dir=tmp / "pq")
+            oms = OrderManagementSystem(db_path=tmp / "oms.db", audit=audit)
+            dep_mgr = DeploymentManager(
+                db_path=tmp / "deployments.db",
+                hist_manager=hist,
+                instruments=instruments,
+                audit=audit,
+                oms=oms,
+            )
+
+            try:
+                stores = [
+                    ("audit", audit._connect()),
+                    ("instruments", instruments._connect()),
+                    ("historical", hist._connect()),
+                    ("oms", oms._connect()),
+                    ("deployments", dep_mgr._connect()),
+                ]
+                for label, conn in stores:
+                    mode = str(conn.execute("PRAGMA journal_mode;").fetchone()[0]).lower()
+                    busy_ms = int(conn.execute("PRAGMA busy_timeout;").fetchone()[0])
+                    self.assertEqual(mode, "wal", f"{label} DB must run in WAL mode")
+                    self.assertGreaterEqual(busy_ms, 5000, f"{label} DB must enforce busy_timeout >= 5000ms")
+                    if label != "oms":
+                        conn.close()
+            finally:
+                oms.close_connections()
+
+    # ── Test 29: Pre-Trade Margin Reserve Gate Blocks Entries, Allows Exits ─
+    def test_29_pretrade_margin_reserve_gate_blocks_entry_allows_exit(self) -> None:
+        from core.audit import AuditTrail
+        from core.preflight import KillSwitchController
+        from risk.limits import RiskLimitManager
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            audit = AuditTrail(db_path=tmp / "audit.db")
+            ks = KillSwitchController(state_file=tmp / "ks.json", audit=audit)
+            risk = RiskLimitManager(limits_file=tmp / "limits.json", audit=audit, kill_switch=ks)
+
+            saved = risk.save_limits(
+                {
+                    "total_capital_inr": 500000.0,
+                    "max_capital_per_trade_pct": 25.0,
+                    "max_gross_exposure_inr": 400000.0,
+                    "min_margin_buffer_pct": 10.0,
+                }
+            )
+            self.assertEqual(saved["min_margin_buffer_pct"], 10.0)
+
+            # Available margin ₹50,000 with 10% buffer -> usable ₹45,000
+            # Order notional ₹40,000 + pending ₹10,000 = ₹50,000 -> must block!
+            blocked = risk.check_entry(
+                symbol="RELIANCE",
+                quantity=20,
+                price=2000.0,
+                pending_exposure_inr=10000.0,
+                available_margin_inr=50000.0,
+            )
+            self.assertFalse(blocked["allowed"])
+            self.assertTrue(any("Insufficient broker margin" in r for r in blocked["reasons"]))
+
+            # Order notional ₹30,000 + pending ₹10,000 = ₹40,000 <= ₹45,000 -> allowed!
+            allowed = risk.check_entry(
+                symbol="RELIANCE",
+                quantity=15,
+                price=2000.0,
+                pending_exposure_inr=10000.0,
+                available_margin_inr=50000.0,
+            )
+            self.assertTrue(allowed["allowed"])
+
+            # Risk-reducing exit must NEVER be blocked even when available_margin_inr == 0
+            exit_res = risk.validate_order(
+                symbol="RELIANCE",
+                quantity=15,
+                price=2000.0,
+                transaction_type="SELL",
+                open_position_qty=15,
+                available_margin_inr=0.0,
+            )
+            self.assertTrue(exit_res["allowed"])
+
+    # ── Test 30: Broker Registry Isolation, Plugins & Token Expiry Warnings ─
+    def test_30_broker_registry_plugins_isolation_and_token_expiry_monitoring(self) -> None:
+        import hashlib
+        from datetime import datetime
+        from broker.base import AccountBalance, BrokerBase
+        from broker.registry import BrokerRegistry, SelectionStore
+        from broker.upstox.auth import AuthManager
+        from broker.zerodha.auth import ZerodhaAuthManager
+        from config import IST_TZ
+
+        class _DummyPluginBroker(BrokerBase):
+            name = "dummy_plugin"
+            display_name = "Dummy Plugin"
+
+            def connect(self) -> bool:
+                return True
+
+            def place_order(self, order):
+                return None
+
+            def cancel_order(self, order_id: str) -> bool:
+                return True
+
+            def get_positions(self):
+                return []
+
+            def get_balance(self) -> AccountBalance:
+                return AccountBalance(cash=1000.0)
+
+            def get_orders(self):
+                return []
+
+        iso = BrokerRegistry.create_isolated(copy_existing=True)
+        iso.register("dummy_plugin", _DummyPluginBroker)
+        self.assertTrue(iso.has("dummy_plugin"))
+        self.assertFalse(BrokerRegistry.has("dummy_plugin"))
+        self.assertEqual(iso.get("dummy_plugin").name, "dummy_plugin")
+        self.assertTrue(iso.unregister("dummy_plugin"))
+        self.assertFalse(iso.has("dummy_plugin"))
+
+        with self.assertRaises(TypeError):
+            iso.register("invalid", object)  # type: ignore[arg-type]
+
+        # Atomic SelectionStore persistence
+        with tempfile.TemporaryDirectory() as tmpdir:
+            sel_store = SelectionStore(path=Path(tmpdir) / "sel.json")
+            saved = sel_store.save("zerodha", "upstox")
+            self.assertEqual(saved["trading_broker"], "zerodha")
+            self.assertEqual(sel_store.load()["data_connection"], "upstox")
+
+        # Zerodha SHA-256 checksum + proactive 60-minute expiry warning (06:00 IST reset)
+        z_auth = ZerodhaAuthManager()
+        with patch.object(ZerodhaAuthManager, "api_key", new="kitekey123"), \
+             patch.object(ZerodhaAuthManager, "api_secret", new="kitesecret456"):
+            expected_sha = hashlib.sha256(b"kitekey123reqtok789kitesecret456").hexdigest()
+            self.assertEqual(z_auth._compute_checksum("reqtok789"), expected_sha)
+
+        z_auth._token_data = {
+            "access_token": "tok_z",
+            "generated_at_ist": "2026-11-25T07:00:00+05:30",
+            "expires_at_ist": "2026-11-26T06:00:00+05:30",
+            "generated_date": "2026-11-25",
+        }
+        with patch.object(z_auth, "_is_token_fresh", return_value=True):
+            warn_dt = datetime(2026, 11, 26, 5, 25, 0, tzinfo=IST_TZ)  # 35 min before 06:00 IST
+            exp_status = z_auth.get_token_expiry_status(warn_within_minutes=60, now=warn_dt)
+            self.assertTrue(exp_status["authenticated"])
+            self.assertTrue(exp_status["expiring_soon"])
+            self.assertAlmostEqual(exp_status["minutes_remaining"], 35.0, delta=0.5)
+
+        # Upstox proactive 60-minute expiry warning (03:30 IST reset)
+        u_auth = AuthManager()
+        u_auth._token_data = {
+            "access_token": "tok_u",
+            "generated_at_ist": "2026-11-25T09:00:00+05:30",
+            "expires_at_ist": "2026-11-26T03:30:00+05:30",
+            "generated_date": "2026-11-25",
+        }
+        with patch.object(u_auth, "_is_token_fresh", return_value=True):
+            warn_u_dt = datetime(2026, 11, 26, 2, 45, 0, tzinfo=IST_TZ)  # 45 min before 03:30 IST
+            u_status = u_auth.get_token_expiry_status(warn_within_minutes=60, now=warn_u_dt)
+            self.assertTrue(u_status["authenticated"])
+            self.assertTrue(u_status["expiring_soon"])
+            self.assertAlmostEqual(u_status["minutes_remaining"], 45.0, delta=0.5)
+
+    # ── Test 31: Rate Limiter, GET 429 Retry & No Blind POST Retry ────────
+    def test_31_broker_rate_limiter_429_get_retry_and_no_post_blind_retry(self) -> None:
+        import io
+        from broker.base import AmbiguousSubmissionError, OrderRequest, TokenBucketRateLimiter
+        from broker.upstox.broker import UpstoxBroker
+
+        # TokenBucketRateLimiter allows immediate burst up to capacity and times out when exhausted
+        limiter = TokenBucketRateLimiter(rate_per_sec=1.0, capacity=2.0)
+        self.assertTrue(limiter.acquire(tokens=1.0, timeout=0.1))
+        self.assertTrue(limiter.acquire(tokens=1.0, timeout=0.1))
+        self.assertFalse(limiter.acquire(tokens=1.0, timeout=0.02))
+
+        # Upstox GET retries on HTTP 429 and succeeds on attempt 2
+        broker = UpstoxBroker(access_token="tok_live")
+        broker._connected = True
+        get_attempts = {"count": 0}
+
+        class _FakeResp:
+            def __init__(self, payload: dict) -> None:
+                self._raw = json.dumps(payload).encode("utf-8")
+
+            def read(self) -> bytes:
+                return self._raw
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        def fake_urlopen_get(req, timeout=5.0):
+            get_attempts["count"] += 1
+            if get_attempts["count"] == 1:
+                raise urllib.error.HTTPError(
+                    req.full_url, 429, "Too Many Requests", {}, io.BytesIO(b'{"message":"rate limited"}')
+                )
+            return _FakeResp({"data": {"equity": {"available_margin": 125000.0, "used_margin": 5000.0}}})
+
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen_get):
+            funds = broker.get_funds("equity")
+            self.assertEqual(get_attempts["count"], 2)
+            self.assertEqual(funds["available"], 125000.0)
+
+        # Upstox POST place_order MUST NEVER blind-retry on HTTP 429/500 — raises AmbiguousSubmissionError
+        post_attempts = {"count": 0}
+
+        def fake_urlopen_post(req, timeout=5.0):
+            post_attempts["count"] += 1
+            raise urllib.error.HTTPError(
+                req.full_url, 502, "Bad Gateway", {}, io.BytesIO(b'{"message":"gateway timeout"}')
+            )
+
+        req_ord = OrderRequest(symbol="RELIANCE", side="BUY", quantity=5, exchange="NSE")
+        with patch("urllib.request.urlopen", side_effect=fake_urlopen_post):
+            with self.assertRaises(AmbiguousSubmissionError):
+                broker.place_order(req_ord)
+            self.assertEqual(post_attempts["count"], 1, "Non-idempotent POST place_order must never blind-retry")
+
 
 if __name__ == "__main__":
     unittest.main()
+
 
 
 

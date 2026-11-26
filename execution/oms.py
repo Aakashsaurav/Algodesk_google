@@ -38,12 +38,17 @@ from broker.base import (
     BrokerBase,
     BrokerCapabilities,
     BrokerHealthSnapshot,
+    BrokerHttpError,
     BrokerOrder,
     BrokerPosition,
     ConnectionState,
     ExecutionFill,
+    InstrumentContract,
+    MarketDepth,
+    OrderRejectedError,
     OrderRequest,
     OrderStatus,
+    TransientBrokerError,
     make_broker_tag,
 )
 from config import IST_TZ, config
@@ -161,7 +166,13 @@ def _parse_meta(rec: Dict[str, Any]) -> Dict[str, Any]:
 
 
 class PaperExecutionAdapter(BrokerBase):
-    """Simulated execution adapter sharing the canonical BrokerBase & OMS contract."""
+    """
+    Simulated execution adapter sharing the canonical BrokerBase & OMS contract.
+    Supports configurable simulation profiles (§6.3):
+    - `instant`: immediate full fill at reference/limit price (deterministic baseline)
+    - `realistic_spread`: applies half-spread slippage (`spread_bps`) and optional partial fills
+    - `depth_aware`: walks live L5/L30 `MarketDepth` order book when available
+    """
 
     name = "paper"
     display_name = "Paper Simulator"
@@ -171,14 +182,30 @@ class PaperExecutionAdapter(BrokerBase):
         supports_market_data=False,
         supports_websocket=False,
         requires_oauth=False,
+        supports_historical=False,
+        supports_instrument_master=False,
+        max_depth_levels=30,
+        execution_grade_feed=False,
     )
 
-    def __init__(self, initial_balance: float = 500000.0) -> None:
+    def __init__(
+        self,
+        initial_balance: float = 500000.0,
+        *,
+        profile: str = "instant",
+        spread_bps: float = 5.0,
+        partial_fill_ratio: float = 1.0,
+        depth_provider: Optional[Callable[[str, str], Optional[MarketDepth]]] = None,
+    ) -> None:
         self._connected = True
         self._balance = AccountBalance(cash=float(initial_balance))
         self._orders: List[BrokerOrder] = []
         self._trades: List[ExecutionFill] = []
         self._positions: Dict[str, BrokerPosition] = {}
+        self.profile = str(profile or "instant").strip().lower()
+        self.spread_bps = max(0.0, float(spread_bps or 0.0))
+        self.partial_fill_ratio = max(0.05, min(1.0, float(partial_fill_ratio or 1.0)))
+        self._depth_provider = depth_provider
 
     def connect(self) -> bool:
         self._connected = True
@@ -191,27 +218,79 @@ class PaperExecutionAdapter(BrokerBase):
             stage=self.stage,
             state=ConnectionState.CONNECTED,
             capabilities=self.capabilities,
-            message="Paper simulator ready.",
+            message=f"Paper simulator ready (profile={self.profile}).",
         )
 
     def place_order(self, order: OrderRequest) -> Optional[BrokerOrder]:
         exch = order.require_exchange()
-        fill_px = float(order.price or (order.metadata or {}).get("reference_price") or 0.0)
-        if fill_px <= 0:
+        ref_px = float(order.price or (order.metadata or {}).get("reference_price") or 0.0)
+        if ref_px <= 0:
             return BrokerOrder(
                 order_id=order.client_order_id,
                 request=order,
                 status=OrderStatus.REJECTED,
                 rejection_reason="Paper simulator requires a positive reference or limit price.",
             )
+
+        req_qty = int(order.quantity)
+        fill_qty = req_qty
+        fill_px = ref_px
+        slip_bps = 0.0
+
+        if self.profile == "depth_aware" and callable(self._depth_provider):
+            try:
+                depth = self._depth_provider(order.symbol, exch)
+                if isinstance(depth, MarketDepth):
+                    walked = depth.walk_book(order.side, req_qty)
+                    if int(walked.get("filled_qty") or 0) > 0 and float(walked.get("vwap") or 0.0) > 0:
+                        fill_qty = int(walked["filled_qty"])
+                        fill_px = float(walked["vwap"])
+                        slip_bps = float(walked.get("slippage_bps") or 0.0)
+            except Exception:
+                pass
+        elif self.profile == "realistic_spread":
+            half_spread = self.spread_bps / 20000.0
+            if order.side in {"BUY", "COVER"}:
+                fill_px = round(ref_px * (1.0 + half_spread), 4)
+            else:
+                fill_px = round(max(0.01, ref_px * (1.0 - half_spread)), 4)
+            slip_bps = self.spread_bps / 2.0
+            if self.partial_fill_ratio < 0.999 and req_qty > 1:
+                fill_qty = max(1, int(req_qty * self.partial_fill_ratio))
+
+        # Respect limit price if specified
+        if order.order_type == "LIMIT" and order.price is not None and float(order.price) > 0:
+            lim = float(order.price)
+            if (order.side in {"BUY", "COVER"} and fill_px > lim) or (
+                order.side in {"SELL", "SHORT"} and fill_px < lim
+            ):
+                oid = f"PAPER-{uuid.uuid4().hex[:10]}"
+                bo = BrokerOrder(
+                    order_id=oid,
+                    request=order,
+                    status=OrderStatus.OPEN,
+                    filled_quantity=0,
+                    average_fill_price=None,
+                    raw={"simulated": True, "profile": self.profile, "exchange": exch, "tag": order.tag},
+                )
+                self._orders.append(bo)
+                return bo
+
         oid = f"PAPER-{uuid.uuid4().hex[:10]}"
+        status = OrderStatus.FILLED if fill_qty >= req_qty else OrderStatus.PARTIALLY_FILLED
         bo = BrokerOrder(
             order_id=oid,
             request=order,
-            status=OrderStatus.FILLED,
-            filled_quantity=int(order.quantity),
+            status=status,
+            filled_quantity=fill_qty,
             average_fill_price=fill_px,
-            raw={"simulated": True, "exchange": exch, "tag": order.tag},
+            raw={
+                "simulated": True,
+                "profile": self.profile,
+                "slippage_bps": round(slip_bps, 2),
+                "exchange": exch,
+                "tag": order.tag,
+            },
         )
         self._orders.append(bo)
         self._trades.append(
@@ -222,7 +301,7 @@ class PaperExecutionAdapter(BrokerBase):
                 symbol=order.symbol,
                 exchange=exch,
                 side=order.side,
-                quantity=int(order.quantity),
+                quantity=fill_qty,
                 price=fill_px,
                 product=order.product,
             )
@@ -258,11 +337,13 @@ class OrderManagementSystem:
         audit: Optional[AuditTrail] = None,
         notifier: Optional[TelegramNotifier] = None,
         stale_unmatched_sec: float = 120.0,
+        manual_intervention_sec: float = 300.0,
     ) -> None:
         self._explicit_db_path = db_path
         self._audit = audit or audit_trail
         self._notifier = notifier or telegram_notifier
         self._stale_unmatched_sec = max(1.0, float(stale_unmatched_sec))
+        self._manual_intervention_sec = max(self._stale_unmatched_sec, float(manual_intervention_sec))
         self._lock = threading.RLock()
         self._local = threading.local()
         self._all_conns: List[sqlite3.Connection] = []
@@ -359,9 +440,135 @@ class OrderManagementSystem:
                 recorded_at_ist TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_oms_fills_order ON oms_fills (client_order_id);
+
+            CREATE TABLE IF NOT EXISTS oms_order_events (
+                event_id TEXT PRIMARY KEY,
+                client_order_id TEXT NOT NULL,
+                broker_order_id TEXT DEFAULT '',
+                from_status TEXT DEFAULT '',
+                to_status TEXT NOT NULL,
+                event_type TEXT NOT NULL,
+                detail TEXT DEFAULT '',
+                recorded_at_ist TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_oms_events_order ON oms_order_events (client_order_id, recorded_at_ist);
             """
         )
         conn.commit()
+
+    def _record_order_event(
+        self,
+        *,
+        client_order_id: str,
+        broker_order_id: str = "",
+        from_status: str = "",
+        to_status: str = "",
+        event_type: str = "STATE_TRANSITION",
+        detail: str = "",
+    ) -> None:
+        conn = self._connect()
+        try:
+            with conn:
+                conn.execute(
+                    """
+                    INSERT INTO oms_order_events (
+                        event_id, client_order_id, broker_order_id, from_status,
+                        to_status, event_type, detail, recorded_at_ist
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        f"oe-{uuid.uuid4().hex[:14]}",
+                        client_order_id,
+                        broker_order_id or "",
+                        from_status or "",
+                        to_status or "",
+                        event_type,
+                        str(detail or "")[:1000],
+                        _now_ist(),
+                    ),
+                )
+        except Exception as exc:
+            logger.debug("OMS order event write skipped: %s", exc)
+
+    def list_order_events(
+        self,
+        client_order_id: Optional[str] = None,
+        limit: int = 200,
+    ) -> List[Dict[str, Any]]:
+        with self._lock:
+            conn = self._connect()
+            if client_order_id:
+                rows = conn.execute(
+                    "SELECT * FROM oms_order_events WHERE client_order_id = ? ORDER BY recorded_at_ist ASC LIMIT ?",
+                    (client_order_id, max(1, int(limit))),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT * FROM oms_order_events ORDER BY recorded_at_ist DESC LIMIT ?",
+                    (max(1, int(limit)),),
+                ).fetchall()
+        return [dict(r) for r in rows]
+
+    def resolve_manual_order(
+        self,
+        client_order_id: str,
+        resolution_status: str,
+        *,
+        actor: str = "operator",
+        note: str = "",
+        broker_order_id: str = "",
+        filled_quantity: Optional[int] = None,
+        average_fill_price: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """Explicit operator resolution for orders escalated to manual intervention."""
+        target = OrderStatus(str(resolution_status or "").strip().upper())
+        if target not in _TERMINAL_STATUSES:
+            raise ValueError(f"Manual resolution requires a terminal status, got {target.value}")
+        with self._lock:
+            rec = self.get_order_by_client_id(client_order_id)
+            if rec is None:
+                raise ValueError(f"OMS order '{client_order_id}' not found.")
+            prev_status = str(rec["status"])
+            meta = _parse_meta(rec)
+            meta["needs_manual_intervention"] = False
+            meta["uncertain"] = False
+            meta["manual_resolution"] = {
+                "actor": actor,
+                "note": note,
+                "resolved_at_ist": _now_ist(),
+                "to_status": target.value,
+            }
+            if broker_order_id:
+                rec["broker_order_id"] = broker_order_id
+            if filled_quantity is not None:
+                rec["filled_quantity"] = max(int(rec.get("filled_quantity") or 0), min(int(rec["quantity"]), int(filled_quantity)))
+            if average_fill_price is not None and float(average_fill_price) > 0:
+                rec["average_fill_price"] = round(float(average_fill_price), 4)
+            rec["pending_quantity"] = 0
+            rec["status"] = target.value
+            rec["rejection_reason"] = note or rec.get("rejection_reason") or ""
+            rec["metadata_json"] = json.dumps(meta)
+            rec["updated_at_ist"] = _now_ist()
+            self._update_order_db(rec)
+            self._record_order_event(
+                client_order_id=client_order_id,
+                broker_order_id=rec["broker_order_id"],
+                from_status=prev_status,
+                to_status=target.value,
+                event_type="MANUAL_RESOLUTION",
+                detail=f"Resolved by {actor}: {note}",
+            )
+            self._audit.log(
+                event_type="OMS_MANUAL_ORDER_RESOLVED",
+                actor=actor,
+                payload={
+                    "client_order_id": client_order_id,
+                    "from_status": prev_status,
+                    "to_status": target.value,
+                    "note": note,
+                },
+            )
+            return rec
 
     def get_order_by_client_id(self, client_order_id: str) -> Optional[Dict[str, Any]]:
         with self._lock:
@@ -468,6 +675,33 @@ class OrderManagementSystem:
         ).fetchall()
         return {str(r["fill_id"]) for r in rows}
 
+    @staticmethod
+    def _classify_submission_error(exc: Exception) -> str:
+        """
+        Separate definite broker rejection, ambiguous network/5xx submission,
+        and local programming/validation errors (Finding 8 / §6.2).
+        """
+        if isinstance(exc, (OrderRejectedError, ValueError)):
+            return "definite_rejection"
+        if isinstance(exc, BrokerHttpError):
+            if exc.status_code == 429 or exc.status_code >= 500:
+                return "ambiguous"
+            if 400 <= exc.status_code < 500:
+                return "definite_rejection"
+        if isinstance(exc, AmbiguousSubmissionError):
+            return "ambiguous"
+        if isinstance(exc, (TimeoutError, ConnectionError, OSError)):
+            return "ambiguous"
+        if isinstance(exc, TransientBrokerError):
+            return "ambiguous"
+        # Check optional requests exceptions without requiring requests installed
+        cls_name = exc.__class__.__name__.lower()
+        mod_name = (exc.__class__.__module__ or "").lower()
+        if "requests" in mod_name or "urllib" in mod_name or "http" in mod_name or "socket" in mod_name:
+            if "timeout" in cls_name or "connection" in cls_name or "urlerror" in cls_name:
+                return "ambiguous"
+        return "local_error"
+
     def submit_order(
         self,
         req: OrderRequest,
@@ -477,29 +711,16 @@ class OrderManagementSystem:
         exec_mode: str = "live_auto",
         reason: str = "",
         reference_price: float = 0.0,
+        contract: Optional[InstrumentContract] = None,
     ) -> Tuple[Dict[str, Any], int, float]:
         """
-        Persist order intent idempotently, validate, and submit to broker.
+        Persist order intent idempotently (with atomic SQLite cross-process guard),
+        independently validate contract lot-size/tick-size/expiry (C-04),
+        and submit to broker with clean error classification (Finding 8).
 
         Returns `(order_record, verified_fill_delta_qty, verified_fill_price)`.
-        CRITICAL INVARIANTS:
-        - `verified_fill_delta_qty` is `> 0` ONLY when the broker explicitly
-          confirms `filled_quantity > 0`.
-        - On `AmbiguousSubmissionError` (timeout/connection reset/5xx), order is
-          persisted as `SUBMITTED` with `uncertain=True` and NEVER treated as
-          `REJECTED`, enabling tag-based recovery during reconciliation.
-        - Re-submitting an existing `client_order_id` refuses duplicate submission.
         """
         with self._lock:
-            existing = self.get_order_by_client_id(req.client_order_id)
-            if existing is not None:
-                logger.info(
-                    "Idempotency guard: client_order_id=%s already exists (status=%s); skipping duplicate broker submission.",
-                    req.client_order_id,
-                    existing["status"],
-                )
-                return existing, 0, float(existing.get("average_fill_price") or 0.0)
-
             now = _now_ist()
             exchange = req.require_exchange()
             broker_tag = make_broker_tag(req.client_order_id, max_len=20)
@@ -508,6 +729,29 @@ class OrderManagementSystem:
             meta = dict(req.metadata or {})
             meta["broker_tag"] = broker_tag
             meta["uncertain"] = False
+            meta["needs_manual_intervention"] = False
+
+            # Independent OMS contract validation (C-04 / Finding 1)
+            contract_err: Optional[str] = None
+            if contract is not None:
+                meta["lot_size"] = contract.effective_lot_size
+                meta["tick_size"] = contract.effective_tick_size
+                if contract.expiry:
+                    meta["expiry"] = contract.expiry
+                    today_ist = datetime.now(tz=IST_TZ).strftime("%Y-%m-%d")
+                    if str(contract.expiry).strip() < today_ist:
+                        contract_err = f"Contract {contract.exchange}:{contract.symbol} expired on {contract.expiry}."
+                if contract_err is None:
+                    contract_err = contract.validate_quantity(int(req.quantity))
+                if contract_err is None and req.order_type in {"LIMIT", "STOP_LIMIT", "SL"} and req.price is not None:
+                    contract_err = contract.validate_price(req.price, allow_none=False)
+            elif meta.get("lot_size"):
+                lot_sz = max(1, int(meta.get("lot_size") or 1))
+                if lot_sz > 1 and (int(req.quantity) % lot_sz) != 0:
+                    contract_err = (
+                        f"Order quantity {req.quantity} for {exchange}:{req.symbol} "
+                        f"is not an exact multiple of lot_size={lot_sz}."
+                    )
 
             order_rec: Dict[str, Any] = {
                 "client_order_id": req.client_order_id,
@@ -523,21 +767,24 @@ class OrderManagementSystem:
                 "order_type": req.order_type,
                 "quantity": int(req.quantity),
                 "filled_quantity": 0,
-                "pending_quantity": int(req.quantity),
+                "pending_quantity": 0 if contract_err else int(req.quantity),
                 "average_fill_price": 0.0,
                 "limit_price": float(req.price or reference_price or 0.0),
-                "status": OrderStatus.VALIDATED.value,
+                "status": OrderStatus.REJECTED.value if contract_err else OrderStatus.VALIDATED.value,
                 "reason": reason,
-                "rejection_reason": "",
+                "rejection_reason": contract_err or "",
                 "metadata_json": json.dumps(meta),
                 "created_at_ist": now,
                 "updated_at_ist": now,
             }
+
+            # Atomic cross-process idempotency reservation using INSERT OR IGNORE
             conn = self._connect()
-            with conn:
-                conn.execute(
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = conn.execute(
                     """
-                    INSERT INTO oms_orders (
+                    INSERT OR IGNORE INTO oms_orders (
                         client_order_id, broker_order_id, deployment_id, broker_id, exec_mode,
                         symbol, exchange, side, transaction_type, product, order_type,
                         quantity, filled_quantity, pending_quantity, average_fill_price,
@@ -570,21 +817,103 @@ class OrderManagementSystem:
                         order_rec["updated_at_ist"],
                     ),
                 )
+                inserted = cur.rowcount == 1
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
 
-            # Dispatch to broker adapter
+            if not inserted:
+                existing = self.get_order_by_client_id(req.client_order_id) or order_rec
+                logger.info(
+                    "Idempotency guard: client_order_id=%s already exists (status=%s); skipping duplicate broker submission.",
+                    req.client_order_id,
+                    existing["status"],
+                )
+                return existing, 0, float(existing.get("average_fill_price") or 0.0)
+
+            self._record_order_event(
+                client_order_id=req.client_order_id,
+                from_status=OrderStatus.CREATED.value,
+                to_status=order_rec["status"],
+                event_type="CONTRACT_REJECTED" if contract_err else "INTENT_PERSISTED",
+                detail=contract_err or f"Persisted {req.side} {req.quantity} {exchange}:{req.symbol}",
+            )
+
+            if contract_err:
+                self._audit.log(
+                    event_type="OMS_CONTRACT_VALIDATION_REJECTED",
+                    actor="oms",
+                    payload={
+                        "client_order_id": req.client_order_id,
+                        "deployment_id": deployment_id,
+                        "symbol": req.symbol,
+                        "exchange": exchange,
+                        "quantity": int(req.quantity),
+                        "reason": contract_err,
+                    },
+                )
+                return order_rec, 0, 0.0
+
+            # Dispatch to broker adapter with clean error classification
             try:
                 broker_order = broker.place_order(req)
-            except (AmbiguousSubmissionError, Exception) as exc:
-                # Network timeout / 5xx / ambiguous error: keep as SUBMITTED (uncertain)
-                # so retrying the same client_order_id won't double-submit blindly!
+            except Exception as exc:
                 err_msg = str(exc)
+                err_class = self._classify_submission_error(exc)
+                if err_class in {"definite_rejection", "local_error"}:
+                    meta["uncertain"] = False
+                    meta["failure_class"] = err_class
+                    order_rec["metadata_json"] = json.dumps(meta)
+                    order_rec["status"] = OrderStatus.REJECTED.value
+                    order_rec["pending_quantity"] = 0
+                    order_rec["rejection_reason"] = (
+                        f"Local dispatch error (not sent): {err_msg}"
+                        if err_class == "local_error"
+                        else f"Broker rejected order: {err_msg}"
+                    )
+                    order_rec["updated_at_ist"] = _now_ist()
+                    self._update_order_db(order_rec)
+                    self._record_order_event(
+                        client_order_id=req.client_order_id,
+                        from_status=OrderStatus.VALIDATED.value,
+                        to_status=OrderStatus.REJECTED.value,
+                        event_type="LOCAL_DISPATCH_ERROR" if err_class == "local_error" else "DEFINITE_REJECTION",
+                        detail=err_msg,
+                    )
+                    self._audit.log(
+                        event_type="OMS_ORDER_REJECTED",
+                        actor="oms",
+                        payload={
+                            "client_order_id": req.client_order_id,
+                            "deployment_id": deployment_id,
+                            "broker": broker.name,
+                            "symbol": req.symbol,
+                            "exchange": exchange,
+                            "side": req.side,
+                            "failure_class": err_class,
+                            "error": err_msg,
+                        },
+                    )
+                    return order_rec, 0, 0.0
+
+                # Network timeout / 5xx / 429 / AmbiguousSubmissionError:
+                # keep as SUBMITTED (uncertain) so retrying the same client_order_id won't double-submit blindly!
                 meta["uncertain"] = True
+                meta["failure_class"] = "ambiguous"
                 meta["uncertain_error"] = err_msg
                 order_rec["metadata_json"] = json.dumps(meta)
                 order_rec["status"] = OrderStatus.SUBMITTED.value
                 order_rec["rejection_reason"] = f"Submission uncertain (reconcile required): {err_msg}"
                 order_rec["updated_at_ist"] = _now_ist()
                 self._update_order_db(order_rec)
+                self._record_order_event(
+                    client_order_id=req.client_order_id,
+                    from_status=OrderStatus.VALIDATED.value,
+                    to_status=OrderStatus.SUBMITTED.value,
+                    event_type="AMBIGUOUS_SUBMISSION",
+                    detail=err_msg,
+                )
                 self._audit.log(
                     event_type="OMS_ORDER_SUBMISSION_UNCERTAIN",
                     actor="oms",
@@ -620,6 +949,13 @@ class OrderManagementSystem:
                 order_rec["rejection_reason"] = "Broker returned empty order response"
                 order_rec["updated_at_ist"] = _now_ist()
                 self._update_order_db(order_rec)
+                self._record_order_event(
+                    client_order_id=req.client_order_id,
+                    from_status=OrderStatus.VALIDATED.value,
+                    to_status=OrderStatus.REJECTED.value,
+                    event_type="EMPTY_BROKER_RESPONSE",
+                    detail="Broker returned None",
+                )
                 return order_rec, 0, 0.0
 
             delta_qty, fill_px = self._apply_broker_snapshot_locked(order_rec, broker_order)
@@ -838,6 +1174,19 @@ class OrderManagementSystem:
             rec["rejection_reason"] = str(bo.rejection_reason)
         rec["updated_at_ist"] = _now_ist()
         self._update_order_db(rec)
+        if final_status != current_status or delta_qty > 0:
+            self._record_order_event(
+                client_order_id=rec["client_order_id"],
+                broker_order_id=rec["broker_order_id"],
+                from_status=current_status.value,
+                to_status=final_status.value,
+                event_type="FILL_DELTA" if delta_qty > 0 else "BROKER_STATUS_UPDATE",
+                detail=(
+                    f"filled +{delta_qty} ({effective_filled}/{total_qty}) @ {fill_px:.4f}"
+                    if delta_qty > 0
+                    else (bo.rejection_reason or f"status={final_status.value}")
+                ),
+            )
 
         if delta_qty > 0:
             if incremental_trade_slices:
@@ -914,6 +1263,7 @@ class OrderManagementSystem:
             recovered_count = 0
             fills_applied: List[Dict[str, Any]] = []
             stale_unmatched: List[Dict[str, Any]] = []
+            manual_intervention_required: List[Dict[str, Any]] = []
 
             for rec in active_orders:
                 if rec["broker_id"] != broker.name and broker.name != "paper":
@@ -934,10 +1284,11 @@ class OrderManagementSystem:
                         matched = None
 
                 if matched is None:
-                    # Detect stale unmatched SUBMITTED orders so they don't hang silently forever
+                    # Detect stale unmatched SUBMITTED orders & escalate past manual_intervention_sec
                     created_dt = _parse_iso_ist(str(rec.get("created_at_ist") or ""))
                     age_sec = (now_dt - created_dt).total_seconds() if created_dt is not None else 0.0
                     if age_sec >= self._stale_unmatched_sec:
+                        needs_manual = age_sec >= self._manual_intervention_sec
                         stale_info = {
                             "client_order_id": rec["client_order_id"],
                             "broker_tag": broker_tag,
@@ -945,30 +1296,59 @@ class OrderManagementSystem:
                             "side": rec["side"],
                             "status": rec["status"],
                             "age_sec": round(age_sec, 1),
+                            "needs_manual_intervention": needs_manual,
                         }
                         stale_unmatched.append(stale_info)
+                        if needs_manual:
+                            manual_intervention_required.append(stale_info)
+                        meta_dirty = False
                         if not meta.get("stale_alerted"):
                             meta["stale_alerted"] = True
-                            rec["metadata_json"] = json.dumps(meta)
-                            rec["updated_at_ist"] = _now_ist()
-                            self._update_order_db(rec)
+                            meta_dirty = True
                             self._audit.log(
                                 event_type="OMS_ORDER_STALE_UNMATCHED",
                                 actor="oms",
                                 payload=stale_info,
                             )
+                            self._record_order_event(
+                                client_order_id=rec["client_order_id"],
+                                from_status=rec["status"],
+                                to_status=rec["status"],
+                                event_type="STALE_UNMATCHED",
+                                detail=f"Unmatched for {int(age_sec)}s (tag={broker_tag})",
+                            )
+                        if needs_manual and not meta.get("needs_manual_intervention"):
+                            meta["needs_manual_intervention"] = True
+                            meta["escalated_at_ist"] = _now_ist()
+                            meta_dirty = True
+                            self._audit.log(
+                                event_type="OMS_MANUAL_INTERVENTION_REQUIRED",
+                                actor="oms",
+                                payload=stale_info,
+                            )
+                            self._record_order_event(
+                                client_order_id=rec["client_order_id"],
+                                from_status=rec["status"],
+                                to_status=rec["status"],
+                                event_type="MANUAL_INTERVENTION_REQUIRED",
+                                detail=f"Exceeded reconciliation deadline ({int(self._manual_intervention_sec)}s); operator resolution required.",
+                            )
                             if rec["exec_mode"] != "paper":
                                 try:
                                     self._notifier.notify_event(
-                                        "STALE_ORDER",
-                                        f"Unmatched {rec['side']} {rec['symbol']} order stale for {int(age_sec)}s",
+                                        "MANUAL_INTERVENTION",
+                                        f"ACTION REQUIRED: Unresolved {rec['side']} {rec['symbol']} order ({int(age_sec)}s)",
                                         [
                                             f"Client ID: {rec['client_order_id']} | Tag: {broker_tag}",
-                                            "Not found in broker order book; verify broker terminal.",
+                                            "Exceeded OMS reconciliation deadline; verify broker terminal & resolve manually.",
                                         ],
                                     )
                                 except Exception:
                                     pass
+                        if meta_dirty:
+                            rec["metadata_json"] = json.dumps(meta)
+                            rec["updated_at_ist"] = _now_ist()
+                            self._update_order_db(rec)
                     continue
 
                 reconciled_count += 1
@@ -997,13 +1377,19 @@ class OrderManagementSystem:
                         on_fill(rec, delta_qty, fill_px)
 
             return {
-                "ok": True,
+                "ok": len(manual_intervention_required) == 0,
+                "order_recovery_error": (
+                    f"{len(manual_intervention_required)} order(s) require manual intervention."
+                    if manual_intervention_required
+                    else ""
+                ),
                 "broker": broker.name,
                 "active_checked": len(active_orders),
                 "reconciled_count": reconciled_count,
                 "recovered_count": recovered_count,
                 "fills_applied": fills_applied,
                 "stale_unmatched": stale_unmatched,
+                "manual_intervention_required": manual_intervention_required,
                 "reconciled_at_ist": _now_ist(),
             }
 

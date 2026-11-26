@@ -161,6 +161,8 @@ class InstrumentIndex:
         path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(str(path), timeout=10.0)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=5000;")
+        conn.execute("PRAGMA foreign_keys=ON;")
         if path not in self._initialized_paths:
             with self._lock:
                 if path not in self._initialized_paths:
@@ -879,6 +881,94 @@ class InstrumentIndex:
             )
             conn.commit()
         return {"ok": True, "broker_id": "zerodha", "indexed_count": inserted, "synced_at": now_ist}
+
+    def sync_upstox(self, timeout: int = 25) -> Dict[str, Any]:
+        return self.sync_upstox_master(timeout=timeout)
+
+    def sync_zerodha(self, timeout: int = 25) -> Dict[str, Any]:
+        return self.sync_zerodha_master(timeout=timeout)
+
+    def sync_provider(self, provider_id: str, **kwargs: Any) -> Dict[str, Any]:
+        """Modular instrument sync dispatch via BrokerRegistry so new brokers need no edits here."""
+        from broker.registry import BrokerRegistry
+
+        pid = (provider_id or "").strip().lower()
+        if BrokerRegistry.has(pid):
+            adapter = BrokerRegistry.get(pid)
+            res = adapter.sync_instruments(self, **kwargs)
+            if isinstance(res, dict):
+                return res
+        if pid == "upstox":
+            return self.sync_upstox_master(**kwargs)
+        if pid == "zerodha":
+            return self.sync_zerodha_master(**kwargs)
+        raise ValueError(f"Instrument master sync not supported for provider '{provider_id}'.")
+
+    def get_contract(
+        self,
+        trading_symbol: str,
+        exchange: str = "NSE",
+        instrument_type: Optional[str] = None,
+    ) -> "InstrumentContract":
+        """
+        Resolve a canonical `InstrumentContract` (lot_size, tick_size, expiry, strike,
+        option_type, segment, broker keys) for mandatory contract-aware order sizing
+        and OMS/risk validation (C-04 / Finding 1).
+        """
+        from broker.base import InstrumentContract
+
+        sym = (trading_symbol or "").strip().upper()
+        exch = (exchange or "NSE").strip().upper()
+        row = self.find_exact(sym, exchange=exch, instrument_type=instrument_type)
+        if row:
+            raw_it = str(row.get("instrument_type") or "").strip().upper()
+            opt_type = raw_it if raw_it in {"CE", "PE"} else None
+            seg = str(row.get("segment") or raw_it or "EQUITY").strip().upper()
+            if opt_type:
+                seg = "OPT"
+            elif raw_it.startswith("FUT"):
+                seg = "FUT"
+            elif raw_it in {"EQ", "EQUITY"}:
+                seg = "EQUITY"
+            upstox_key = str(row.get("instrument_key") or "") if str(row.get("broker_id") or "") == "upstox" else ""
+            zerodha_tok = str(row.get("instrument_token") or "") if str(row.get("broker_id") or "") == "zerodha" else ""
+            if not upstox_key:
+                upstox_key = self.resolve_key(sym, broker_id="upstox", exchange=exch, instrument_type=instrument_type) or ""
+            if not zerodha_tok:
+                zerodha_tok = self.resolve_key(sym, broker_id="zerodha", exchange=exch, instrument_type=instrument_type) or ""
+            return InstrumentContract(
+                symbol=str(row.get("trading_symbol") or sym).strip().upper(),
+                exchange=str(row.get("exchange") or exch).strip().upper(),
+                segment=seg,
+                lot_size=max(1, int(row.get("lot_size") or 1)),
+                tick_size=float(row.get("tick_size") or 0.05),
+                multiplier=1.0,
+                expiry=row.get("expiry") or None,
+                strike=float(row["strike"]) if row.get("strike") is not None else None,
+                option_type=opt_type,
+                upstox_key=upstox_key,
+                zerodha_token=zerodha_tok,
+            )
+
+        # Fallback contract when instrument master hasn't been synced locally yet
+        seg = "EQUITY"
+        opt_type = None
+        if exch in {"NFO", "BFO", "MCX", "NSE_FO", "BSE_FO", "MCX_FO"}:
+            if sym.endswith("CE"):
+                seg, opt_type = "OPT", "CE"
+            elif sym.endswith("PE"):
+                seg, opt_type = "OPT", "PE"
+            else:
+                seg = "FUT"
+        return InstrumentContract(
+            symbol=sym,
+            exchange=exch,
+            segment=seg,
+            lot_size=1,
+            tick_size=0.05,
+            multiplier=1.0,
+            option_type=opt_type,
+        )
 
 
 instrument_index = InstrumentIndex()

@@ -430,6 +430,10 @@ def _decode_upstox_market_ff(buf: bytes) -> Dict[str, Any]:
             out["vtt"] = _pb_int64(raw)
         elif fno == 7:
             out["oi"] = _pb_double(wt, raw)
+        elif fno == 8:
+            out["tbq"] = int(_pb_int64(raw) if wt == 0 else _pb_double(wt, raw))
+        elif fno == 9:
+            out["tsq"] = int(_pb_int64(raw) if wt == 0 else _pb_double(wt, raw))
     return out
 
 
@@ -477,7 +481,7 @@ def _decode_upstox_feed_entry(buf: bytes) -> Dict[str, Any]:
     return {}
 
 
-def _ms_to_ist(ms_val: Optional[int]) -> str:
+def _ms_to_ist(ms_val: Optional[int], *, allow_fallback_now: bool = True) -> Optional[str]:
     if ms_val and ms_val > 1_000_000_000_000:
         try:
             return datetime.fromtimestamp(ms_val / 1000.0, tz=timezone.utc).astimezone(IST_TZ).isoformat(timespec="seconds")
@@ -488,7 +492,9 @@ def _ms_to_ist(ms_val: Optional[int]) -> str:
             return datetime.fromtimestamp(float(ms_val), tz=timezone.utc).astimezone(IST_TZ).isoformat(timespec="seconds")
         except Exception:
             pass
-    return datetime.now(tz=IST_TZ).isoformat(timespec="seconds")
+    if allow_fallback_now:
+        return datetime.now(tz=IST_TZ).isoformat(timespec="seconds")
+    return None
 
 
 def decode_upstox_feed_response(
@@ -551,14 +557,57 @@ def decode_upstox_feed_response(
         if not vol_val and day_ohlc and day_ohlc.get("vol"):
             vol_val = day_ohlc.get("vol")
 
-        depth = data.get("depth") or []
-        bid_val = round(float(depth[0]["bidP"]), 2) if (depth and depth[0].get("bidP")) else None
-        ask_val = round(float(depth[0]["askP"]), 2) if (depth and depth[0].get("askP")) else None
+        raw_depth = data.get("depth") or []
+        bids_list: List[Dict[str, Any]] = []
+        asks_list: List[Dict[str, Any]] = []
+        for lvl in raw_depth:
+            if not isinstance(lvl, dict):
+                continue
+            bp = float(lvl.get("bidP") or 0.0)
+            bq = int(lvl.get("bidQ") or 0)
+            ap = float(lvl.get("askP") or 0.0)
+            aq = int(lvl.get("askQ") or 0)
+            if bp > 0 or bq > 0:
+                bids_list.append({"price": round(bp, 4), "quantity": bq, "orders": 0})
+            if ap > 0 or aq > 0:
+                asks_list.append({"price": round(ap, 4), "quantity": aq, "orders": 0})
+
+        bid_val = round(bids_list[0]["price"], 2) if (bids_list and bids_list[0]["price"] > 0) else None
+        ask_val = round(asks_list[0]["price"], 2) if (asks_list and asks_list[0]["price"] > 0) else None
 
         net_chg = (ltp - prev_close) if (prev_close is not None and prev_close > 0) else None
         chg_pct = round((net_chg / prev_close) * 100.0, 2) if (net_chg is not None and prev_close) else 0.0
 
         ts_ms = ltpc.get("ltt") or current_ts_ms
+        source_ts = _ms_to_ist(ts_ms, allow_fallback_now=False)
+        received_ts = datetime.now(tz=IST_TZ).isoformat(timespec="seconds")
+        tbq = int(data.get("tbq") or sum(b["quantity"] for b in bids_list))
+        tsq = int(data.get("tsq") or sum(a["quantity"] for a in asks_list))
+        depth_payload: Optional[Dict[str, Any]] = None
+        if bids_list or asks_list:
+            spread_val = round(ask_val - bid_val, 4) if (bid_val is not None and ask_val is not None) else None
+            mid_val = ((bid_val + ask_val) / 2.0) if (bid_val is not None and ask_val is not None and (bid_val + ask_val) > 0) else None
+            spread_bps = round((spread_val / mid_val) * 10000.0, 2) if (spread_val is not None and mid_val) else None
+            tot_q = tbq + tsq
+            imbalance = round((tbq - tsq) / float(tot_q), 4) if tot_q > 0 else 0.0
+            depth_payload = {
+                "symbol": sym,
+                "exchange": exch,
+                "depth_levels": max(len(bids_list), len(asks_list)),
+                "bids": bids_list,
+                "asks": asks_list,
+                "best_bid": bid_val,
+                "best_ask": ask_val,
+                "spread": spread_val,
+                "spread_bps": spread_bps,
+                "total_buy_qty": tbq,
+                "total_sell_qty": tsq,
+                "imbalance_ratio": imbalance,
+                "source": "upstox",
+                "transport": "broker_websocket",
+                "ts_ist": source_ts or received_ts,
+            }
+
         quotes[sym] = {
             "symbol": sym,
             "exchange": exch,
@@ -575,10 +624,15 @@ def decode_upstox_feed_response(
             "oi": int(float(data.get("oi") or 0)),
             "bid": bid_val,
             "ask": ask_val,
+            "depth": depth_payload,
+            "depth_levels": depth_payload["depth_levels"] if depth_payload else 0,
             "source": "upstox",
             "transport": "broker_websocket",
+            "execution_grade": True,
+            "source_timestamp_ist": source_ts,
+            "received_at_ist": received_ts,
             "note": "",
-            "ts_ist": _ms_to_ist(ts_ms),
+            "ts_ist": source_ts or received_ts,
         }
 
     return quotes, current_ts_ms
@@ -643,6 +697,11 @@ def decode_zerodha_binary_packets(
         oi_val = 0
         bid_val: Optional[float] = None
         ask_val: Optional[float] = None
+        tbq_val = 0
+        tsq_val = 0
+        bids_list: List[Dict[str, Any]] = []
+        asks_list: List[Dict[str, Any]] = []
+        source_ts: Optional[str] = None
         ts_str = now_ist
 
         if pkt_len in {28, 32}:
@@ -655,11 +714,15 @@ def decode_zerodha_binary_packets(
             if pkt_len == 32:
                 exch_ts = struct.unpack("!I", pkt[28:32])[0]
                 if exch_ts > 1_000_000_000:
-                    ts_str = _ms_to_ist(exch_ts)
+                    source_ts = _ms_to_ist(exch_ts, allow_fallback_now=False)
+                    if source_ts:
+                        ts_str = source_ts
         elif pkt_len >= 44:
             # Tradable Quote/Full: token(0), ltp(4), ltq(8), atp(12), vol(16), tbq(20), tsq(24),
             # open(28), high(32), low(36), close(40)
             vol_val = int(struct.unpack("!I", pkt[16:20])[0])
+            tbq_val = int(struct.unpack("!I", pkt[20:24])[0])
+            tsq_val = int(struct.unpack("!I", pkt[24:28])[0])
             o_val = round(struct.unpack("!I", pkt[28:32])[0] / divisor, 2) or ltp
             h_val = round(struct.unpack("!I", pkt[32:36])[0] / divisor, 2) or ltp
             l_val = round(struct.unpack("!I", pkt[36:40])[0] / divisor, 2) or ltp
@@ -672,17 +735,53 @@ def decode_zerodha_binary_packets(
                 exch_ts = struct.unpack("!I", pkt[60:64])[0]
                 chosen_ts = exch_ts if exch_ts > 1_000_000_000 else ltt
                 if chosen_ts > 1_000_000_000:
-                    ts_str = _ms_to_ist(chosen_ts)
+                    source_ts = _ms_to_ist(chosen_ts, allow_fallback_now=False)
+                    if source_ts:
+                        ts_str = source_ts
                 # Market depth: 5 buy entries (64..124) + 5 sell entries (124..184), 12 bytes each: qty(I), price(I), orders(H), pad(2x)
-                _, best_bid_raw, _ = struct.unpack("!IIH2x", pkt[64:76])
-                _, best_ask_raw, _ = struct.unpack("!IIH2x", pkt[124:136])
-                if best_bid_raw > 0:
-                    bid_val = round(best_bid_raw / divisor, 2)
-                if best_ask_raw > 0:
-                    ask_val = round(best_ask_raw / divisor, 2)
+                for lvl_i in range(5):
+                    b_off = 64 + lvl_i * 12
+                    b_qty, b_px_raw, b_orders = struct.unpack("!IIH2x", pkt[b_off : b_off + 12])
+                    b_px = round(b_px_raw / divisor, 4)
+                    if b_px > 0 or b_qty > 0:
+                        bids_list.append({"price": b_px, "quantity": int(b_qty), "orders": int(b_orders)})
+                    a_off = 124 + lvl_i * 12
+                    a_qty, a_px_raw, a_orders = struct.unpack("!IIH2x", pkt[a_off : a_off + 12])
+                    a_px = round(a_px_raw / divisor, 4)
+                    if a_px > 0 or a_qty > 0:
+                        asks_list.append({"price": a_px, "quantity": int(a_qty), "orders": int(a_orders)})
+                if bids_list and bids_list[0]["price"] > 0:
+                    bid_val = round(bids_list[0]["price"], 2)
+                if asks_list and asks_list[0]["price"] > 0:
+                    ask_val = round(asks_list[0]["price"], 2)
 
         net_chg = (ltp - prev_close) if (prev_close is not None and prev_close > 0) else None
         chg_pct = round((net_chg / prev_close) * 100.0, 2) if (net_chg is not None and prev_close) else 0.0
+
+        depth_payload: Optional[Dict[str, Any]] = None
+        if bids_list or asks_list:
+            spread_val = round(ask_val - bid_val, 4) if (bid_val is not None and ask_val is not None) else None
+            mid_val = ((bid_val + ask_val) / 2.0) if (bid_val is not None and ask_val is not None and (bid_val + ask_val) > 0) else None
+            spread_bps = round((spread_val / mid_val) * 10000.0, 2) if (spread_val is not None and mid_val) else None
+            tot_q = tbq_val + tsq_val
+            imbalance = round((tbq_val - tsq_val) / float(tot_q), 4) if tot_q > 0 else 0.0
+            depth_payload = {
+                "symbol": sym,
+                "exchange": exch,
+                "depth_levels": max(len(bids_list), len(asks_list)),
+                "bids": bids_list,
+                "asks": asks_list,
+                "best_bid": bid_val,
+                "best_ask": ask_val,
+                "spread": spread_val,
+                "spread_bps": spread_bps,
+                "total_buy_qty": tbq_val,
+                "total_sell_qty": tsq_val,
+                "imbalance_ratio": imbalance,
+                "source": "zerodha",
+                "transport": "broker_websocket",
+                "ts_ist": source_ts or ts_str,
+            }
 
         quotes[sym] = {
             "symbol": sym,
@@ -700,8 +799,13 @@ def decode_zerodha_binary_packets(
             "oi": oi_val,
             "bid": bid_val,
             "ask": ask_val,
+            "depth": depth_payload,
+            "depth_levels": depth_payload["depth_levels"] if depth_payload else 0,
             "source": "zerodha",
             "transport": "broker_websocket",
+            "execution_grade": True,
+            "source_timestamp_ist": source_ts,
+            "received_at_ist": now_ist,
             "note": "",
             "ts_ist": ts_str,
         }
@@ -981,9 +1085,64 @@ class _BaseBrokerWSClient:
 
 
 class UpstoxWSFeedClient(_BaseBrokerWSClient):
-    """Upstox v3 Market Data Feed persistent WebSocket streamer (Protobuf3)."""
+    """
+    Upstox v3 Market Data Feed persistent WebSocket streamer (Protobuf3).
+    Supports both Level-5 (`mode="full"`) and Level-30 (`mode="full_d30"`)
+    order-book streaming with dynamic live mode switching (`change_mode`).
+    """
 
     broker_id = "upstox"
+    max_depth_levels = 30
+
+    def __init__(
+        self,
+        *,
+        instruments: Optional[InstrumentIndex] = None,
+        on_ticks: Optional[Callable[[str, Dict[str, Dict[str, Any]], Optional[float]], None]] = None,
+        feed_mode: str = "full",
+        depth_levels: Optional[int] = None,
+        on_tick: Any = None,
+        on_status: Any = None,
+    ) -> None:
+        super().__init__(instruments=instruments, on_ticks=on_ticks or on_tick)
+        if depth_levels is not None:
+            self._feed_mode = "full_d30" if int(depth_levels) > 5 else "full"
+        else:
+            self._feed_mode = "full_d30" if str(feed_mode or "").strip().lower() in {"full_d30", "d30", "30"} else "full"
+        self._depth_levels = 30 if self._feed_mode == "full_d30" else 5
+
+    def set_depth_levels(self, levels: int) -> int:
+        """Dynamically switch Upstox v3 stream between Level-5 (`full`) and Level-30 (`full_d30`)."""
+        target_levels = 30 if int(levels or 5) > 5 else 5
+        target_mode = "full_d30" if target_levels == 30 else "full"
+        with self._lock:
+            changed = target_mode != self._feed_mode
+            self._feed_mode = target_mode
+            self._depth_levels = target_levels
+            ws = self._ws
+            active = list(self._active_keys)
+        if changed and ws is not None and active:
+            try:
+                for i in range(0, len(active), 100):
+                    batch = active[i : i + 100]
+                    msg = {
+                        "guid": f"algodesk-{uuid.uuid4().hex[:10]}",
+                        "method": "change_mode",
+                        "data": {"mode": target_mode, "instrumentKeys": batch},
+                    }
+                    ws.send_binary(json.dumps(msg).encode("utf-8"))
+            except Exception as exc:
+                logger.debug("Upstox WS change_mode(%s) failed: %s", target_mode, exc)
+                self._sub_dirty.set()
+        return target_levels
+
+    def status(self) -> Dict[str, Any]:
+        st = super().status()
+        with self._lock:
+            st["feed_mode"] = self._feed_mode
+            st["depth_levels"] = self._depth_levels
+            st["max_depth_levels"] = self.max_depth_levels
+        return st
 
     def _build_connection_params(self) -> Tuple[str, Dict[str, str]]:
         token = upstox_auth.get_valid_token()
@@ -1027,22 +1186,26 @@ class UpstoxWSFeedClient(_BaseBrokerWSClient):
 
     def _send_subscribe(self, ws: StdlibWSClient, keys: List[Any]) -> None:
         # Upstox v3 Market Data Feed expects subscribe JSON as a binary frame (in batches of 100)
+        with self._lock:
+            mode = self._feed_mode
         for i in range(0, len(keys), 100):
             batch = keys[i : i + 100]
             msg = {
                 "guid": f"algodesk-{uuid.uuid4().hex[:10]}",
                 "method": "sub",
-                "data": {"mode": "full", "instrumentKeys": batch},
+                "data": {"mode": mode, "instrumentKeys": batch},
             }
             ws.send_binary(json.dumps(msg).encode("utf-8"))
 
     def _send_unsubscribe(self, ws: StdlibWSClient, keys: List[Any]) -> None:
+        with self._lock:
+            mode = self._feed_mode
         for i in range(0, len(keys), 100):
             batch = keys[i : i + 100]
             msg = {
                 "guid": f"algodesk-{uuid.uuid4().hex[:10]}",
                 "method": "unsub",
-                "data": {"mode": "full", "instrumentKeys": batch},
+                "data": {"mode": mode, "instrumentKeys": batch},
             }
             ws.send_binary(json.dumps(msg).encode("utf-8"))
 
@@ -1061,9 +1224,33 @@ class UpstoxWSFeedClient(_BaseBrokerWSClient):
 
 
 class ZerodhaWSFeedClient(_BaseBrokerWSClient):
-    """Zerodha KiteTicker persistent WebSocket streamer (binary packets)."""
+    """Zerodha KiteTicker persistent WebSocket streamer (binary packets, Level-5 full depth)."""
 
     broker_id = "zerodha"
+    max_depth_levels = 5
+
+    def __init__(
+        self,
+        *,
+        instruments: Optional[InstrumentIndex] = None,
+        on_ticks: Optional[Callable[[str, Dict[str, Dict[str, Any]], Optional[float]], None]] = None,
+        on_tick: Any = None,
+        on_status: Any = None,
+    ) -> None:
+        super().__init__(instruments=instruments, on_ticks=on_ticks or on_tick)
+        self._depth_levels = 5
+
+    def set_depth_levels(self, levels: int) -> int:
+        # KiteTicker binary full mode streams 5-level depth
+        self._depth_levels = 5
+        return 5
+
+    def status(self) -> Dict[str, Any]:
+        st = super().status()
+        st["feed_mode"] = "full"
+        st["depth_levels"] = self._depth_levels
+        st["max_depth_levels"] = self.max_depth_levels
+        return st
 
     def _build_connection_params(self) -> Tuple[str, Dict[str, str]]:
         token = zerodha_auth.get_valid_token()
@@ -1111,8 +1298,9 @@ class ZerodhaWSFeedClient(_BaseBrokerWSClient):
 
 class BrokerWebSocketHub:
     """
-    Coordinates persistent broker WebSocket clients (`upstox`, `zerodha`)
-    for both the Live Terminal watchlist and Live Screener.
+    Modular coordinator for persistent broker WebSocket clients (`upstox`, `zerodha`,
+    plus any third-party broker registered via `BrokerRegistry.register_plugin` or
+    `register_ws_client_factory`) supporting Level-5 and Level-30 market depth.
     """
 
     def __init__(
@@ -1122,17 +1310,61 @@ class BrokerWebSocketHub:
         on_ticks: Optional[Callable[[str, Dict[str, Dict[str, Any]], Optional[float]], None]] = None,
     ) -> None:
         self._instruments = instruments or instrument_index
+        self._on_ticks = on_ticks
         self._clients: Dict[str, _BaseBrokerWSClient] = {
             "upstox": UpstoxWSFeedClient(instruments=self._instruments, on_ticks=on_ticks),
             "zerodha": ZerodhaWSFeedClient(instruments=self._instruments, on_ticks=on_ticks),
         }
 
+    def register_client(self, broker_id: str, client: _BaseBrokerWSClient) -> None:
+        bid = (broker_id or "").strip().lower()
+        if bid and client is not None:
+            self._clients[bid] = client
+
+    def _resolve_client(self, broker_id: str) -> Optional[_BaseBrokerWSClient]:
+        bid = (broker_id or "").strip().lower()
+        if not bid:
+            return None
+        client = self._clients.get(bid)
+        if client is not None:
+            return client
+        # Lazy plug-and-play discovery from BrokerRegistry so adding a broker requires zero edits here
+        try:
+            from broker.registry import BrokerRegistry
+
+            factory = BrokerRegistry.get_ws_client_factory(bid)
+            if callable(factory):
+                client = factory(instruments=self._instruments, on_ticks=self._on_ticks)
+            elif BrokerRegistry.has(bid):
+                adapter = BrokerRegistry.get(bid)
+                if getattr(getattr(adapter, "capabilities", None), "supports_websocket", False):
+                    client = adapter.create_ws_client(on_tick=self._on_ticks)
+            if client is not None:
+                self._clients[bid] = client
+                return client
+        except Exception as exc:
+            logger.debug("Dynamic WS client discovery for '%s' skipped: %s", bid, exc)
+        return None
+
     def supports(self, broker_id: str) -> bool:
-        return (broker_id or "").strip().lower() in self._clients
+        return self._resolve_client(broker_id) is not None
+
+    def set_depth_levels(self, broker_id: str, levels: int) -> int:
+        client = self._resolve_client(broker_id)
+        if client is not None and hasattr(client, "set_depth_levels"):
+            return int(client.set_depth_levels(levels))
+        return 0
+
+    def get_cached_depth(self, broker_id: str, symbol: str, *, max_age_sec: float = 30.0) -> Optional[Dict[str, Any]]:
+        sym = (symbol or "").strip().upper()
+        quotes, _ = self.get_cached_quotes(broker_id, [sym], max_age_sec=max_age_sec)
+        q = quotes.get(sym)
+        if isinstance(q, dict) and isinstance(q.get("depth"), dict):
+            return dict(q["depth"])
+        return None
 
     def set_scope_subscriptions(self, broker_id: str, scope: str, subs: List[Dict[str, str]]) -> None:
-        bid = (broker_id or "").strip().lower()
-        client = self._clients.get(bid)
+        client = self._resolve_client(broker_id)
         if client is not None:
             client.set_scope_subscriptions(scope, subs)
 
@@ -1160,14 +1392,14 @@ class BrokerWebSocketHub:
         *,
         max_age_sec: float = 30.0,
     ) -> Tuple[Dict[str, Dict[str, Any]], Optional[float]]:
-        client = self._clients.get((broker_id or "").strip().lower())
+        client = self._resolve_client(broker_id)
         if client is None:
             return {}, None
         return client.get_cached_quotes(symbols, max_age_sec=max_age_sec)
 
     def status(self, broker_id: Optional[str] = None) -> Dict[str, Any]:
         if broker_id:
-            client = self._clients.get(broker_id.strip().lower())
+            client = self._resolve_client(broker_id)
             return client.status() if client else {"broker_id": broker_id, "connected": False, "transport": "http_poll"}
         return {bid: c.status() for bid, c in self._clients.items()}
 

@@ -45,6 +45,31 @@ export interface LiveTickPoint {
   ltp: number;
 }
 
+export interface MarketDepthLevel {
+  price: number;
+  quantity: number;
+  orders?: number;
+}
+
+export interface MarketDepthSnapshot {
+  symbol?: string;
+  exchange?: string;
+  source?: string;
+  levels?: number;
+  requested_levels?: number;
+  max_broker_levels?: number;
+  bids: MarketDepthLevel[];
+  asks: MarketDepthLevel[];
+  total_buy_qty?: number;
+  total_sell_qty?: number;
+  tbq?: number;
+  tsq?: number;
+  spread?: number | null;
+  spread_bps?: number | null;
+  imbalance_ratio?: number | null;
+  ts_ist?: string | null;
+}
+
 export interface LiveQuoteRow {
   symbol: string;
   exchange?: string;
@@ -61,6 +86,10 @@ export interface LiveQuoteRow {
   oi?: number;
   bid?: number | null;
   ask?: number | null;
+  depth?: MarketDepthSnapshot | null;
+  depth_levels?: number;
+  execution_grade?: boolean;
+  feed_quality?: string;
   source: string;
   transport?: string;
   direction?: 'up' | 'down' | 'flat';
@@ -194,8 +223,12 @@ export function LiveTerminal({ onNavigateHome }: LiveTerminalProps) {
   const [subscribing, setSubscribing] = useState(false);
   const [feedback, setFeedback] = useState<{ type: 'ok' | 'err'; text: string } | null>(null);
 
-  // Selected quote in inspector
+  // Selected quote in inspector + L5/L30 market depth state
   const [selectedKey, setSelectedKey] = useState<string>('');
+  const [depthLevels, setDepthLevels] = useState<5 | 30>(5);
+  const [fetchedDepth, setFetchedDepth] = useState<MarketDepthSnapshot | null>(null);
+  const [depthLoading, setDepthLoading] = useState(false);
+  const [switchingDepth, setSwitchingDepth] = useState(false);
 
   const wsRef = useRef<WebSocket | null>(null);
   const sseRef = useRef<EventSource | null>(null);
@@ -636,6 +669,85 @@ export function LiveTerminal({ onNavigateHome }: LiveTerminalProps) {
       setFeedback({ type: 'err', text: err instanceof Error ? err.message : 'Feed switch failed.' });
     }
   };
+
+  const fetchSelectedDepth = useCallback(
+    async (symbol: string, exchange: string, levels: 5 | 30) => {
+      setDepthLoading(true);
+      try {
+        const qs = new URLSearchParams({
+          symbol,
+          exchange,
+          levels: String(levels),
+        });
+        const res = await apiFetch(`/api/live/depth?${qs.toString()}`);
+        if (res.ok) {
+          const data = await res.json();
+          const d = (data.depth ?? data) as MarketDepthSnapshot;
+          if (d && (Array.isArray(d.bids) || Array.isArray(d.asks))) {
+            setFetchedDepth(d);
+          } else {
+            setFetchedDepth(null);
+          }
+        }
+      } catch {
+        // fallback cleanly to live quote depth if available
+      } finally {
+        setDepthLoading(false);
+      }
+    },
+    [],
+  );
+
+  const handleDepthLevelSwitch = async (nextLevels: 5 | 30) => {
+    setDepthLevels(nextLevels);
+    setSwitchingDepth(true);
+    try {
+      const res = await apiFetch('/api/live/depth/mode', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ levels: nextLevels }),
+      });
+      const body = await res.json().catch(() => ({}));
+      if (res.ok) {
+        setFeedback({
+          type: 'ok',
+          text:
+            body.message ||
+            `Market depth stream mode switched to L${nextLevels} (${nextLevels === 30 ? 'Upstox full_d30 / max supported' : 'standard L5'}).`,
+        });
+      }
+      if (selectedQuote) {
+        await fetchSelectedDepth(selectedQuote.symbol, selectedQuote.exchange || 'NSE', nextLevels);
+      }
+    } catch (err) {
+      setFeedback({ type: 'err', text: err instanceof Error ? err.message : 'Failed to switch depth mode.' });
+    } finally {
+      setSwitchingDepth(false);
+    }
+  };
+
+  useEffect(() => {
+    if (!selectedQuote) {
+      setFetchedDepth(null);
+      return;
+    }
+    void fetchSelectedDepth(selectedQuote.symbol, selectedQuote.exchange || 'NSE', depthLevels);
+  }, [selectedQuote?.symbol, selectedQuote?.exchange, depthLevels, fetchSelectedDepth]);
+
+  const activeDepth: MarketDepthSnapshot | null = useMemo(() => {
+    const liveD = selectedQuote?.depth;
+    if (liveD && ((liveD.bids?.length ?? 0) > 0 || (liveD.asks?.length ?? 0) > 0)) {
+      if (
+        fetchedDepth &&
+        (fetchedDepth.bids?.length ?? 0) > (liveD.bids?.length ?? 0) &&
+        depthLevels === 30
+      ) {
+        return fetchedDepth;
+      }
+      return liveD;
+    }
+    return fetchedDepth;
+  }, [selectedQuote?.depth, fetchedDepth, depthLevels]);
 
   // Sparkline geometry calculation from real WebSocket history
   const sparkline = useMemo(() => {
@@ -1536,6 +1648,182 @@ export function LiveTerminal({ onNavigateHome }: LiveTerminalProps) {
                     ) : (
                       <div className="flex h-20 items-center justify-center text-xs text-slate-500">
                         Waiting for live ticks...
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Level 5 / Level 30 Market Depth Order Book Ladder */}
+                  <div className="mt-4 rounded-lg border border-slate-800 bg-[#0b1120] p-3">
+                    <div className="mb-2.5 flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex items-center gap-2">
+                        <span className="text-[11px] font-semibold uppercase tracking-wider text-slate-300">
+                          Market Depth (L{depthLevels})
+                        </span>
+                        {selectedQuote.execution_grade === false && (
+                          <span className="rounded border border-amber-700/70 bg-amber-950/40 px-1.5 py-0.5 text-[10px] font-semibold text-amber-300">
+                            Delayed Feed
+                          </span>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-1.5">
+                        <div className="inline-flex rounded-md border border-slate-700 bg-[#111827] p-0.5 text-[11px] font-semibold">
+                          <button
+                            type="button"
+                            disabled={switchingDepth}
+                            onClick={() => void handleDepthLevelSwitch(5)}
+                            className={`rounded px-2 py-0.5 transition-colors ${
+                              depthLevels === 5
+                                ? 'bg-sky-500 text-slate-950'
+                                : 'text-slate-400 hover:text-slate-200'
+                            }`}
+                          >
+                            L5
+                          </button>
+                          <button
+                            type="button"
+                            disabled={switchingDepth}
+                            onClick={() => void handleDepthLevelSwitch(30)}
+                            className={`rounded px-2 py-0.5 transition-colors ${
+                              depthLevels === 30
+                                ? 'bg-sky-500 text-slate-950'
+                                : 'text-slate-400 hover:text-slate-200'
+                            }`}
+                            title="Upstox v3 full_d30 (30 levels) or broker maximum"
+                          >
+                            L30
+                          </button>
+                        </div>
+                        <button
+                          type="button"
+                          disabled={depthLoading}
+                          onClick={() =>
+                            void fetchSelectedDepth(
+                              selectedQuote.symbol,
+                              selectedQuote.exchange || 'NSE',
+                              depthLevels,
+                            )
+                          }
+                          className="rounded border border-slate-700 p-1 text-slate-400 hover:border-sky-400 hover:text-slate-200 disabled:opacity-50"
+                          title="Refresh order book depth"
+                        >
+                          <RefreshCw className={`h-3 w-3 ${depthLoading ? 'animate-spin' : ''}`} />
+                        </button>
+                      </div>
+                    </div>
+
+                    {activeDepth && ((activeDepth.bids?.length ?? 0) > 0 || (activeDepth.asks?.length ?? 0) > 0) ? (
+                      (() => {
+                        const bids = (activeDepth.bids || []).slice(0, depthLevels);
+                        const asks = (activeDepth.asks || []).slice(0, depthLevels);
+                        const rows = Math.max(bids.length, asks.length);
+                        const maxQty = Math.max(
+                          1,
+                          ...bids.map((b) => Number(b.quantity || 0)),
+                          ...asks.map((a) => Number(a.quantity || 0)),
+                        );
+                        const tbq = Number(
+                          activeDepth.total_buy_qty ??
+                            activeDepth.tbq ??
+                            bids.reduce((acc, b) => acc + Number(b.quantity || 0), 0),
+                        );
+                        const tsq = Number(
+                          activeDepth.total_sell_qty ??
+                            activeDepth.tsq ??
+                            asks.reduce((acc, a) => acc + Number(a.quantity || 0), 0),
+                        );
+                        const buyPct = tbq + tsq > 0 ? Math.round((tbq / (tbq + tsq)) * 100) : 50;
+                        const bestBid = bids[0]?.price;
+                        const bestAsk = asks[0]?.price;
+                        const spreadVal =
+                          activeDepth.spread ??
+                          (bestBid && bestAsk && bestAsk >= bestBid ? bestAsk - bestBid : null);
+                        const spreadBps =
+                          activeDepth.spread_bps ??
+                          (spreadVal !== null && bestBid && bestAsk
+                            ? (spreadVal / ((bestBid + bestAsk) / 2)) * 10000
+                            : null);
+
+                        return (
+                          <div className="space-y-2 font-mono text-[11px] tabular-nums">
+                            <div className="flex flex-wrap items-center justify-between gap-2 text-[10px] text-slate-400">
+                              <span>
+                                Levels: <strong className="text-slate-200">{rows}</strong>
+                                {activeDepth.source ? ` · ${activeDepth.source.toUpperCase()}` : ''}
+                              </span>
+                              <span>
+                                Spread:{' '}
+                                <strong className="text-slate-200">
+                                  {spreadVal !== null ? `₹${spreadVal.toFixed(2)}` : '—'}
+                                  {spreadBps !== null ? ` (${spreadBps.toFixed(1)} bps)` : ''}
+                                </strong>
+                              </span>
+                            </div>
+
+                            {/* TBQ vs TSQ Imbalance Bar */}
+                            <div>
+                              <div className="mb-1 flex items-center justify-between text-[10px]">
+                                <span className="text-emerald-400">TBQ {fmtInt(tbq)} ({buyPct}%)</span>
+                                <span className="text-red-400">TSQ {fmtInt(tsq)} ({100 - buyPct}%)</span>
+                              </div>
+                              <div className="flex h-1.5 w-full overflow-hidden rounded-full bg-slate-800">
+                                <div className="bg-emerald-500/80" style={{ width: `${buyPct}%` }} />
+                                <div className="bg-red-500/80" style={{ width: `${100 - buyPct}%` }} />
+                              </div>
+                            </div>
+
+                            {/* Bid / Ask Ladder */}
+                            <div className={depthLevels === 30 ? 'max-h-[280px] overflow-y-auto pr-1' : ''}>
+                              <div className="grid grid-cols-6 border-b border-slate-800 pb-1 text-[10px] font-semibold uppercase text-slate-500">
+                                <span className="text-left">Ord</span>
+                                <span className="text-right">Bid Qty</span>
+                                <span className="pr-2 text-right">Bid ₹</span>
+                                <span className="pl-2 text-left">Ask ₹</span>
+                                <span className="text-right">Ask Qty</span>
+                                <span className="text-right">Ord</span>
+                              </div>
+                              <div className="divide-y divide-slate-800/50">
+                                {Array.from({ length: rows }).map((_, idx) => {
+                                  const b = bids[idx];
+                                  const a = asks[idx];
+                                  const bPct = b ? Math.min(100, Math.round((Number(b.quantity || 0) / maxQty) * 100)) : 0;
+                                  const aPct = a ? Math.min(100, Math.round((Number(a.quantity || 0) / maxQty) * 100)) : 0;
+                                  return (
+                                    <div key={idx} className="grid grid-cols-6 items-center py-1 text-[11px]">
+                                      <span className="text-left text-slate-500">{b?.orders ?? '—'}</span>
+                                      <span className="relative text-right text-slate-300">
+                                        <span
+                                          className="pointer-events-none absolute inset-y-0 right-0 rounded-sm bg-emerald-500/15"
+                                          style={{ width: `${bPct}%` }}
+                                        />
+                                        <span className="relative">{b ? fmtInt(b.quantity) : '—'}</span>
+                                      </span>
+                                      <span className="pr-2 text-right font-semibold text-emerald-400">
+                                        {b ? fmtPrice(b.price) : '—'}
+                                      </span>
+                                      <span className="pl-2 text-left font-semibold text-red-400">
+                                        {a ? fmtPrice(a.price) : '—'}
+                                      </span>
+                                      <span className="relative text-right text-slate-300">
+                                        <span
+                                          className="pointer-events-none absolute inset-y-0 left-0 rounded-sm bg-red-500/15"
+                                          style={{ width: `${aPct}%` }}
+                                        />
+                                        <span className="relative">{a ? fmtInt(a.quantity) : '—'}</span>
+                                      </span>
+                                      <span className="text-right text-slate-500">{a?.orders ?? '—'}</span>
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })()
+                    ) : (
+                      <div className="py-4 text-center text-xs text-slate-500">
+                        {depthLoading
+                          ? 'Loading order book depth...'
+                          : 'Order book depth (L5 / L30) requires an authenticated broker feed (Upstox L5/L30 or Zerodha L5).'}
                       </div>
                     )}
                   </div>

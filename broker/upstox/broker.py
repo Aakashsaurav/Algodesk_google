@@ -29,6 +29,8 @@ from broker.base import (
     BrokerOrder,
     BrokerPosition,
     ConnectionState,
+    DepthLevel,
+    MarketDepth,
     OrderRequest,
     OrderStatus,
     TokenBucketRateLimiter,
@@ -94,6 +96,10 @@ class UpstoxBroker(BrokerBase):
         supports_market_data=True,
         supports_websocket=True,
         requires_oauth=True,
+        supports_historical=True,
+        supports_instrument_master=True,
+        max_depth_levels=30,
+        execution_grade_feed=True,
     )
 
     def __init__(
@@ -779,6 +785,122 @@ class UpstoxBroker(BrokerBase):
                 self._log_read_warning("trades", "Upstox live trade book read failed", exc)
         return []
 
+    def is_authenticated(self) -> bool:
+        if self.access_token:
+            return True
+        try:
+            return bool(auth_manager.get_valid_token())
+        except Exception:
+            return False
+
+    def fetch_market_depth(
+        self,
+        symbol: str,
+        exchange: str = "NSE",
+        instrument_key: str = "",
+        levels: int = 5,
+    ) -> Optional[MarketDepth]:
+        """
+        Fetch Level-5 or Level-30 market depth from Upstox REST API.
+        Upstox REST `/v2/market-quote/quotes` returns L5 depth (`depth.buy`/`depth.sell`),
+        and when `levels > 5` (e.g. L30), queries Upstox V3 market-quote full_d30 / depth
+        endpoints when authorized, gracefully falling back to L5 REST if V3 REST depth
+        is unavailable on the account plan (L30 streaming is always available via WS `full_d30`).
+        """
+        from urllib.parse import quote as url_quote
+
+        sym = (symbol or "").strip().upper()
+        exch = (exchange or "NSE").strip().upper()
+        ikey = (instrument_key or "").strip()
+        if not ikey:
+            seg_prefix = "NSE_FO" if exch == "NFO" else ("BSE_FO" if exch == "BFO" else ("MCX_FO" if exch == "MCX" else f"{exch}_EQ"))
+            ikey = f"{seg_prefix}|{sym}"
+        req_levels = 30 if int(levels or 5) > 5 else 5
+        if not self.is_authenticated():
+            return None
+
+        endpoints = []
+        if req_levels >= 30:
+            endpoints.append(f"{config.UPSTOX_BASE_URL}/v3/market-quote/quotes?instrument_key={url_quote(ikey, safe='')}&mode=full_d30")
+        endpoints.append(f"{config.UPSTOX_BASE_URL}/v2/market-quote/quotes?instrument_key={url_quote(ikey, safe='')}")
+
+        for url in endpoints:
+            try:
+                raw = self._rest_request_json(url, method="GET", timeout=5.0)
+                data_map = raw.get("data") or {}
+                if not isinstance(data_map, dict) or not data_map:
+                    continue
+                item = data_map.get(ikey) or next(iter(data_map.values()), None)
+                if not isinstance(item, dict):
+                    continue
+                bids: List[DepthLevel] = []
+                asks: List[DepthLevel] = []
+                depth_obj = item.get("depth") or {}
+                if isinstance(depth_obj, dict) and (depth_obj.get("buy") or depth_obj.get("sell")):
+                    for row in (depth_obj.get("buy") or [])[:req_levels]:
+                        px = float(row.get("price") or 0.0)
+                        qty = int(row.get("quantity") or 0)
+                        if px > 0 or qty > 0:
+                            bids.append(DepthLevel(price=px, quantity=qty, orders=int(row.get("orders") or 0)))
+                    for row in (depth_obj.get("sell") or [])[:req_levels]:
+                        px = float(row.get("price") or 0.0)
+                        qty = int(row.get("quantity") or 0)
+                        if px > 0 or qty > 0:
+                            asks.append(DepthLevel(price=px, quantity=qty, orders=int(row.get("orders") or 0)))
+                elif isinstance(item.get("marketLevel"), dict):
+                    for q in (item["marketLevel"].get("bidAskQuote") or [])[:req_levels]:
+                        bp = float(q.get("bidP") or 0.0)
+                        bq = int(q.get("bidQ") or 0)
+                        ap = float(q.get("askP") or 0.0)
+                        aq = int(q.get("askQ") or 0)
+                        if bp > 0 or bq > 0:
+                            bids.append(DepthLevel(price=bp, quantity=bq))
+                        if ap > 0 or aq > 0:
+                            asks.append(DepthLevel(price=ap, quantity=aq))
+                if not bids and not asks:
+                    continue
+                tbq = int(item.get("total_buy_quantity") or item.get("tbq") or 0)
+                tsq = int(item.get("total_sell_quantity") or item.get("tsq") or 0)
+                ts_raw = item.get("timestamp") or item.get("last_trade_time")
+                return MarketDepth(
+                    symbol=sym,
+                    exchange=exch,
+                    bids=bids,
+                    asks=asks,
+                    total_buy_qty=tbq,
+                    total_sell_qty=tsq,
+                    depth_levels=max(len(bids), len(asks)),
+                    source="upstox",
+                    transport="rest",
+                    ts_ist=str(ts_raw) if ts_raw else None,
+                )
+            except Exception as exc:
+                self._log_read_warning("depth", f"Upstox depth fetch failed ({url})", exc)
+                continue
+        return None
+
+    def create_ws_client(
+        self,
+        *,
+        on_tick: Any = None,
+        on_status: Any = None,
+        depth_levels: int = 5,
+    ) -> Optional[Any]:
+        from core.broker_ws import UpstoxWSFeedClient
+
+        mode = "full_d30" if int(depth_levels or 5) > 5 else "full"
+        return UpstoxWSFeedClient(
+            on_tick=on_tick,
+            on_status=on_status,
+            feed_mode=mode,
+        )
+
+    def sync_instruments(self, store: Any, **kwargs: Any) -> Optional[Dict[str, Any]]:
+        if hasattr(store, "sync_upstox"):
+            return store.sync_upstox(**kwargs)
+        return None
+
 
 __all__ = ["UpstoxBroker"]
+
 

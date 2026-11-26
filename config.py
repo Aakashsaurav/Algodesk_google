@@ -15,16 +15,20 @@ Refactored from Algodesk_R4:
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
 import json
 import logging
 import os
 import platform
 import re
+import secrets
 import stat
 import subprocess
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
 
 try:
@@ -359,7 +363,123 @@ class AppConfig:
             "on",
         }
 
-    # ── Local 0o600 Credentials Vault (popup-free persistence) ────────────
+    # ── Encrypted Local 0o600 Credentials Vault (H-08) ────────────────────
+    @property
+    def VAULT_KEY_FILE(self) -> Path:
+        rel = os.getenv("ALGODESK_VAULT_KEY_FILE", "").strip()
+        if rel:
+            p = Path(rel)
+            return p if p.is_absolute() else (self.BASE_DIR / p)
+        return self.CREDENTIALS_VAULT_FILE.parent / ".vault.key"
+
+    def _get_or_create_vault_secret(self) -> bytes:
+        """
+        Return 32-byte master key material for encrypting the local credential vault.
+        Priority:
+          1. ALGODESK_VAULT_KEY env var (PBKDF2-derived to 32 bytes)
+          2. Local 0o600 keyfile (`data/.vault.key`), auto-generated on first write.
+        """
+        env_key = os.getenv("ALGODESK_VAULT_KEY", "").strip()
+        if env_key:
+            return hashlib.pbkdf2_hmac(
+                "sha256",
+                env_key.encode("utf-8"),
+                b"algodesk-vault-env-v1",
+                120_000,
+                dklen=32,
+            )
+        key_path = self.VAULT_KEY_FILE
+        if key_path.exists():
+            try:
+                raw = base64.urlsafe_b64decode(key_path.read_text(encoding="utf-8").strip().encode("ascii"))
+                if len(raw) >= 32:
+                    return raw[:32]
+            except Exception:
+                pass
+        key_bytes = secrets.token_bytes(32)
+        key_path.parent.mkdir(parents=True, exist_ok=True)
+        key_path.write_text(base64.urlsafe_b64encode(key_bytes).decode("ascii") + "\n", encoding="utf-8")
+        try:
+            os.chmod(key_path, stat.S_IRUSR | stat.S_IWUSR)
+        except OSError:
+            pass
+        return key_bytes
+
+    @staticmethod
+    def _ctr_keystream(enc_key: bytes, nonce: bytes, length: int) -> bytes:
+        out = bytearray()
+        counter = 0
+        while len(out) < length:
+            blk = hmac.new(enc_key, nonce + counter.to_bytes(8, "big"), hashlib.sha256).digest()
+            out.extend(blk)
+            counter += 1
+        return bytes(out[:length])
+
+    def _encrypt_vault_payload(self, plaintext_json: str) -> Dict[str, Any]:
+        master = self._get_or_create_vault_secret()
+        raw_bytes = plaintext_json.encode("utf-8")
+        try:
+            from cryptography.fernet import Fernet  # type: ignore
+
+            f_key = base64.urlsafe_b64encode(master[:32])
+            token = Fernet(f_key).encrypt(raw_bytes).decode("ascii")
+            return {"format": "enc_v1", "cipher": "fernet", "ciphertext": token}
+        except ImportError:
+            pass
+
+        # Stdlib Encrypt-then-MAC (HKDF-like domain-separated enc/mac keys + SHA-256 CTR + HMAC-SHA256)
+        nonce = secrets.token_bytes(16)
+        enc_key = hmac.new(master, b"algodesk-enc-v1" + nonce, hashlib.sha256).digest()
+        mac_key = hmac.new(master, b"algodesk-mac-v1" + nonce, hashlib.sha256).digest()
+        stream = self._ctr_keystream(enc_key, nonce, len(raw_bytes))
+        ct = bytes(a ^ b for a, b in zip(raw_bytes, stream))
+        tag = hmac.new(mac_key, b"enc_v1" + nonce + ct, hashlib.sha256).digest()
+        return {
+            "format": "enc_v1",
+            "cipher": "hmac_sha256_ctr",
+            "nonce": base64.urlsafe_b64encode(nonce).decode("ascii"),
+            "ciphertext": base64.urlsafe_b64encode(ct).decode("ascii"),
+            "tag": base64.urlsafe_b64encode(tag).decode("ascii"),
+        }
+
+    def _decrypt_vault_payload(self, envelope: Dict[str, Any]) -> Dict[str, str]:
+        master = self._get_or_create_vault_secret()
+        cipher = str(envelope.get("cipher") or "")
+        if cipher == "fernet":
+            from cryptography.fernet import Fernet  # type: ignore
+
+            f_key = base64.urlsafe_b64encode(master[:32])
+            raw_bytes = Fernet(f_key).decrypt(str(envelope["ciphertext"]).encode("ascii"))
+            parsed = json.loads(raw_bytes.decode("utf-8"))
+            return {str(k): str(v) for k, v in parsed.items() if v is not None} if isinstance(parsed, dict) else {}
+
+        if cipher == "hmac_sha256_ctr":
+            nonce = base64.urlsafe_b64decode(str(envelope["nonce"]).encode("ascii"))
+            ct = base64.urlsafe_b64decode(str(envelope["ciphertext"]).encode("ascii"))
+            tag = base64.urlsafe_b64decode(str(envelope["tag"]).encode("ascii"))
+            enc_key = hmac.new(master, b"algodesk-enc-v1" + nonce, hashlib.sha256).digest()
+            mac_key = hmac.new(master, b"algodesk-mac-v1" + nonce, hashlib.sha256).digest()
+            expected_tag = hmac.new(mac_key, b"enc_v1" + nonce + ct, hashlib.sha256).digest()
+            if not hmac.compare_digest(tag, expected_tag):
+                raise ValueError("Encrypted credentials vault failed integrity verification (MAC mismatch).")
+            stream = self._ctr_keystream(enc_key, nonce, len(ct))
+            raw_bytes = bytes(a ^ b for a, b in zip(ct, stream))
+            parsed = json.loads(raw_bytes.decode("utf-8"))
+            return {str(k): str(v) for k, v in parsed.items() if v is not None} if isinstance(parsed, dict) else {}
+
+        raise ValueError(f"Unsupported vault cipher '{cipher}'.")
+
+    def _write_local_vault(self, vault: Dict[str, str]) -> None:
+        self.ensure_runtime_dirs()
+        vault_path = self.CREDENTIALS_VAULT_FILE
+        vault_path.parent.mkdir(parents=True, exist_ok=True)
+        envelope = self._encrypt_vault_payload(json.dumps(vault, sort_keys=True))
+        vault_path.write_text(json.dumps(envelope, indent=2), encoding="utf-8")
+        try:
+            os.chmod(vault_path, stat.S_IRUSR | stat.S_IWUSR)
+        except OSError:
+            pass
+
     def _read_local_vault(self) -> Dict[str, str]:
         path = self.CREDENTIALS_VAULT_FILE
         if not path.exists():
@@ -367,10 +487,37 @@ class AppConfig:
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
             if isinstance(raw, dict):
-                return {str(k): str(v) for k, v in raw.items() if v is not None}
-        except (OSError, json.JSONDecodeError):
-            pass
+                if raw.get("format") == "enc_v1":
+                    return self._decrypt_vault_payload(raw)
+                # Legacy plaintext JSON vault: read transparently and upgrade to encrypted at rest
+                legacy = {str(k): str(v) for k, v in raw.items() if v is not None}
+                if legacy:
+                    try:
+                        self._write_local_vault(legacy)
+                    except OSError:
+                        pass
+                return legacy
+        except Exception as exc:
+            logging.getLogger(__name__).warning("Could not read local credentials vault: %s", exc)
         return {}
+
+    def vault_status(self) -> Dict[str, Any]:
+        """Return encryption status of the local credentials vault."""
+        path = self.CREDENTIALS_VAULT_FILE
+        if not path.exists():
+            return {"exists": False, "encrypted": True, "cipher": "enc_v1_ready", "path": str(path)}
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict) and raw.get("format") == "enc_v1":
+                return {
+                    "exists": True,
+                    "encrypted": True,
+                    "cipher": str(raw.get("cipher") or "unknown"),
+                    "path": str(path),
+                }
+            return {"exists": True, "encrypted": False, "cipher": "legacy_plaintext", "path": str(path)}
+        except Exception:
+            return {"exists": True, "encrypted": False, "cipher": "unreadable", "path": str(path)}
 
     def save_local_credential(
         self,
@@ -379,7 +526,7 @@ class AppConfig:
         value: str,
     ) -> None:
         """
-        Persist credential into process env and local 0o600 vault file without
+        Persist credential into process env and encrypted local 0o600 vault file without
         triggering macOS Keychain UI prompts. Optionally mirrors to Keychain only
         when ALGODESK_USE_KEYCHAIN=true.
         """
@@ -389,12 +536,9 @@ class AppConfig:
         os.environ[env_key] = clean
 
         try:
-            self.ensure_runtime_dirs()
-            vault_path = self.CREDENTIALS_VAULT_FILE
             vault = self._read_local_vault()
             vault[vault_account] = clean
-            vault_path.write_text(json.dumps(vault, indent=2), encoding="utf-8")
-            os.chmod(vault_path, stat.S_IRUSR | stat.S_IWUSR)
+            self._write_local_vault(vault)
         except OSError as exc:
             logging.getLogger(__name__).warning("Could not write local credentials vault: %s", exc)
 

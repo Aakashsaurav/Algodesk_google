@@ -449,9 +449,184 @@ def _split_chunk(start_d: date, end_d: date, max_days: int) -> List[Tuple[date, 
     return chunks
 
 
+VALID_ADJUSTMENT_MODES = ("raw", "split_adjusted", "total_return")
+
+
 def _normalize_adjustment_mode(raw: Optional[str]) -> str:
     mode = (raw or "raw").strip().lower()
-    return "adjusted" if mode in {"adjusted", "adj", "split_adjusted"} else "raw"
+    if mode in {"split_adjusted", "adjusted", "adj", "split"}:
+        return "split_adjusted"
+    if mode in {"total_return", "dividend_adjusted", "div_adjusted", "tr"}:
+        return "total_return"
+    return "raw"
+
+
+def apply_corporate_actions(
+    rows: List[Dict[str, Any]],
+    actions: List[Dict[str, Any]],
+    adjustment_mode: str = "split_adjusted",
+) -> List[Dict[str, Any]]:
+    """
+    Apply backward-looking corporate action adjustments to chronological OHLCV bars.
+
+    Conventions:
+    - Split action (`action_type in {"split", "bonus"}`):
+      `ratio` is new_shares / old_shares (e.g., 2.0 for a 2-for-1 split or 1:1 bonus).
+      For every bar strictly BEFORE `ex_date`:
+        OHLC prices are divided by `ratio`,
+        volume is multiplied by `ratio` (inverse of price factor, preserving rupee turnover).
+    - Dividend action (`action_type == "dividend"`), applied ONLY in `total_return` mode:
+      For every bar strictly BEFORE `ex_date`:
+        OHLC prices are scaled by `max(0.01, (prev_close - dividend_amount) / prev_close)`.
+    """
+    mode = _normalize_adjustment_mode(adjustment_mode)
+    if mode == "raw" or not rows or not actions:
+        return [dict(r) for r in rows]
+
+    ordered = [dict(r) for r in sorted(rows, key=lambda r: str(r.get("ts_ist") or r.get("trade_date") or r.get("date") or ""))]
+    sorted_actions = sorted(
+        [a for a in actions if a.get("ex_date")],
+        key=lambda a: str(a["ex_date"]),
+        reverse=True,
+    )
+
+    for act in sorted_actions:
+        ex_date = str(act.get("ex_date") or "")[:10]
+        if not ex_date:
+            continue
+        act_type = str(act.get("action_type") or "").strip().lower()
+        if act_type in {"split", "bonus"}:
+            ratio = float(act.get("ratio") or 1.0)
+            if ratio <= 0 or abs(ratio - 1.0) < 1e-9:
+                continue
+            for r in ordered:
+                td = str(r.get("trade_date") or r.get("ts_ist") or r.get("date") or "")[:10]
+                if td and td < ex_date:
+                    r["open"] = round(float(r["open"]) / ratio, 4)
+                    r["high"] = round(float(r["high"]) / ratio, 4)
+                    r["low"] = round(float(r["low"]) / ratio, 4)
+                    r["close"] = round(float(r["close"]) / ratio, 4)
+                    r["volume"] = int(round(float(r.get("volume", 0) or 0) * ratio))
+        elif act_type == "dividend" and mode == "total_return":
+            div_amt = float(act.get("dividend_amount") or act.get("cash_amount") or 0.0)
+            if div_amt <= 0:
+                continue
+            # Find last close strictly prior to ex_date
+            prev_close = 0.0
+            for r in ordered:
+                td = str(r.get("trade_date") or r.get("ts_ist") or r.get("date") or "")[:10]
+                if td and td < ex_date:
+                    prev_close = float(r["close"])
+            if prev_close <= div_amt or prev_close <= 0:
+                continue
+            factor = max(0.01, (prev_close - div_amt) / prev_close)
+            for r in ordered:
+                td = str(r.get("trade_date") or r.get("ts_ist") or r.get("date") or "")[:10]
+                if td and td < ex_date:
+                    r["open"] = round(float(r["open"]) * factor, 4)
+                    r["high"] = round(float(r["high"]) * factor, 4)
+                    r["low"] = round(float(r["low"]) * factor, 4)
+                    r["close"] = round(float(r["close"]) * factor, 4)
+    return ordered
+
+
+def compute_data_quality_score(
+    rows: List[Dict[str, Any]],
+    timeframe: str = "1day",
+    *,
+    exchange: str = "NSE",
+    missing_dates: Optional[List[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Compute deterministic OHLCV dataset quality diagnostics and a 0-100 score.
+    Detects invalid OHLC ordering, non-positive prices, duplicate timestamps,
+    zero-volume anomalies, extreme single-bar jumps (potential unadjusted splits),
+    and missing trading weekdays.
+    """
+    total = len(rows)
+    if total == 0:
+        return {
+            "total_bars": 0,
+            "duplicate_timestamps": 0,
+            "non_positive_prices": 0,
+            "invalid_ohlc_bars": 0,
+            "zero_volume_bars": 0,
+            "extreme_jump_bars": 0,
+            "missing_trading_days": len(missing_dates or []),
+            "quality_score": 0.0,
+            "warnings": ["Dataset contains zero bars."],
+        }
+
+    seen_ts: Set[str] = set()
+    dup_ts = 0
+    non_pos = 0
+    invalid_ohlc = 0
+    zero_vol = 0
+    extreme_jumps = 0
+    prev_close: Optional[float] = None
+
+    for r in rows:
+        ts = str(r.get("ts_ist") or r.get("trade_date") or "")
+        if ts in seen_ts:
+            dup_ts += 1
+        else:
+            seen_ts.add(ts)
+
+        o = float(r.get("open", 0.0) or 0.0)
+        h = float(r.get("high", 0.0) or 0.0)
+        l = float(r.get("low", 0.0) or 0.0)
+        c = float(r.get("close", 0.0) or 0.0)
+        v = int(float(r.get("volume", 0) or 0))
+
+        if o <= 0 or h <= 0 or l <= 0 or c <= 0:
+            non_pos += 1
+        if h < l or h < max(o, c) - 1e-6 or l > min(o, c) + 1e-6:
+            invalid_ohlc += 1
+        if v <= 0:
+            zero_vol += 1
+        if prev_close is not None and prev_close > 0 and c > 0:
+            pct_chg = abs(c - prev_close) / prev_close
+            if pct_chg >= 0.40:
+                extreme_jumps += 1
+        if c > 0:
+            prev_close = c
+
+    miss_cnt = len(missing_dates or [])
+    penalties = (
+        min(35.0, (non_pos / total) * 200.0)
+        + min(25.0, (invalid_ohlc / total) * 150.0)
+        + min(15.0, (dup_ts / total) * 150.0)
+        + min(15.0, extreme_jumps * 5.0)
+        + min(10.0, (miss_cnt / max(1, total)) * 60.0)
+    )
+    score = round(max(0.0, 100.0 - penalties), 2)
+    warnings: List[str] = []
+    if non_pos > 0:
+        warnings.append(f"{non_pos} bar(s) contain non-positive OHLC prices.")
+    if invalid_ohlc > 0:
+        warnings.append(f"{invalid_ohlc} bar(s) violate High >= max(O,C) >= min(O,C) >= Low.")
+    if dup_ts > 0:
+        warnings.append(f"{dup_ts} duplicate timestamp(s) detected.")
+    if extreme_jumps > 0:
+        warnings.append(
+            f"{extreme_jumps} bar(s) have >=40% single-bar moves (verify stock split / bonus adjustment)."
+        )
+    if miss_cnt > 0:
+        warnings.append(f"{miss_cnt} missing trading weekday(s) inside dataset span.")
+
+    return {
+        "total_bars": total,
+        "timeframe": timeframe,
+        "exchange": exchange,
+        "duplicate_timestamps": dup_ts,
+        "non_positive_prices": non_pos,
+        "invalid_ohlc_bars": invalid_ohlc,
+        "zero_volume_bars": zero_vol,
+        "extreme_jump_bars": extreme_jumps,
+        "missing_trading_days": miss_cnt,
+        "quality_score": score,
+        "warnings": warnings,
+    }
 
 
 def _month_keys_in_range(start_iso: Optional[str], end_iso: Optional[str]) -> Optional[List[str]]:
@@ -578,6 +753,8 @@ class HistoricalDataManager:
         path.parent.mkdir(parents=True, exist_ok=True)
         conn = sqlite3.connect(str(path), timeout=15.0)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA busy_timeout=5000;")
+        conn.execute("PRAGMA foreign_keys=ON;")
         if path not in self._initialized_paths:
             with self._lock:
                 if path not in self._initialized_paths:
@@ -662,7 +839,76 @@ class HistoricalDataManager:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_asset_history_lookup ON asset_data_history (symbol, exchange, timeframe);"
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS corporate_actions (
+                symbol TEXT NOT NULL,
+                exchange TEXT NOT NULL,
+                ex_date TEXT NOT NULL,
+                action_type TEXT NOT NULL,
+                ratio REAL NOT NULL DEFAULT 1.0,
+                dividend_amount REAL NOT NULL DEFAULT 0.0,
+                source TEXT NOT NULL DEFAULT 'manual',
+                updated_at TEXT NOT NULL,
+                PRIMARY KEY (symbol, exchange, ex_date, action_type)
+            );
+            """
+        )
         conn.commit()
+
+    def record_corporate_action(
+        self,
+        *,
+        symbol: str,
+        exchange: str = "NSE",
+        ex_date: str,
+        action_type: str,
+        ratio: float = 1.0,
+        dividend_amount: float = 0.0,
+        source: str = "manual",
+    ) -> Dict[str, Any]:
+        clean_sym = _normalize_symbol(symbol)
+        clean_exch = (exchange or "NSE").strip().upper()
+        ex_iso = _parse_iso_date(ex_date).isoformat()
+        act_type = (action_type or "split").strip().lower()
+        if act_type not in {"split", "bonus", "dividend"}:
+            raise ValueError(f"Unsupported corporate action type '{action_type}'. Use split, bonus, or dividend.")
+        now_ist = datetime.now(tz=IST_TZ).isoformat(timespec="seconds")
+        with self._connect() as conn:
+            conn.execute(
+                """
+                INSERT OR REPLACE INTO corporate_actions
+                (symbol, exchange, ex_date, action_type, ratio, dividend_amount, source, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (clean_sym, clean_exch, ex_iso, act_type, float(ratio), float(dividend_amount), source, now_ist),
+            )
+            conn.commit()
+        return {
+            "symbol": clean_sym,
+            "exchange": clean_exch,
+            "ex_date": ex_iso,
+            "action_type": act_type,
+            "ratio": float(ratio),
+            "dividend_amount": float(dividend_amount),
+            "source": source,
+            "updated_at": now_ist,
+        }
+
+    def list_corporate_actions(self, symbol: str, exchange: str = "NSE") -> List[Dict[str, Any]]:
+        clean_sym = _normalize_symbol(symbol)
+        clean_exch = (exchange or "NSE").strip().upper()
+        with self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT symbol, exchange, ex_date, action_type, ratio, dividend_amount, source, updated_at
+                FROM corporate_actions
+                WHERE symbol = ? AND exchange = ?
+                ORDER BY ex_date ASC
+                """,
+                (clean_sym, clean_exch),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def _row_to_history_dict(self, row: sqlite3.Row) -> Dict[str, Any]:
         try:
@@ -934,8 +1180,39 @@ class HistoricalDataManager:
         instrument_key: Optional[str] = None,
         adjustment_mode: str = "raw",
     ) -> List[Dict[str, Any]]:
-        if provider == "upstox":
-            return self._fetch_upstox_chunk(
+        eff_prov = (provider or "").strip().lower()
+        adj_mode = _normalize_adjustment_mode(adjustment_mode)
+
+        # Modular BrokerRegistry historical dispatch: allows any newly registered broker or
+        # data provider plugin to supply historical candles without modifying core/historical.py.
+        if eff_prov not in {"upstox", "zerodha", "yfinance"}:
+            try:
+                from broker.registry import BrokerRegistry
+
+                if BrokerRegistry.has(eff_prov):
+                    adapter = BrokerRegistry.get(eff_prov)
+                    start_iso = chunk_start.isoformat() if isinstance(chunk_start, date) else str(chunk_start)
+                    end_iso = chunk_end.isoformat() if isinstance(chunk_end, date) else str(chunk_end)
+                    rows = adapter.fetch_historical_candles(
+                        symbol=symbol,
+                        exchange=exchange,
+                        timeframe=timeframe,
+                        start_date=start_iso,
+                        end_date=end_iso,
+                        instrument_key=instrument_key or "",
+                        adjustment_mode=adj_mode,
+                    )
+                    if rows is not None:
+                        if adj_mode != "raw":
+                            actions = self.list_corporate_actions(symbol, exchange)
+                            if actions:
+                                rows = apply_corporate_actions(rows, actions, adj_mode)
+                        return rows
+            except NotImplementedError:
+                pass
+
+        if eff_prov == "upstox":
+            rows = self._fetch_upstox_chunk(
                 symbol,
                 exchange,
                 timeframe,
@@ -944,8 +1221,13 @@ class HistoricalDataManager:
                 instrument_type=instrument_type,
                 instrument_key=instrument_key,
             )
-        if provider == "zerodha":
-            return self._fetch_zerodha_chunk(
+            if adj_mode != "raw":
+                actions = self.list_corporate_actions(symbol, exchange)
+                if actions:
+                    rows = apply_corporate_actions(rows, actions, adj_mode)
+            return rows
+        if eff_prov == "zerodha":
+            rows = self._fetch_zerodha_chunk(
                 symbol,
                 exchange,
                 timeframe,
@@ -954,7 +1236,12 @@ class HistoricalDataManager:
                 instrument_type=instrument_type,
                 instrument_key=instrument_key,
             )
-        if provider == "yfinance":
+            if adj_mode != "raw":
+                actions = self.list_corporate_actions(symbol, exchange)
+                if actions:
+                    rows = apply_corporate_actions(rows, actions, adj_mode)
+            return rows
+        if eff_prov == "yfinance":
             return self._fetch_yahoo_chunk(
                 symbol,
                 exchange,
@@ -962,7 +1249,7 @@ class HistoricalDataManager:
                 chunk_start,
                 chunk_end,
                 instrument_type=instrument_type,
-                adjustment_mode=adjustment_mode,
+                adjustment_mode=adj_mode,
             )
         raise ValueError(f"Unsupported historical data provider '{provider}'.")
 
@@ -1203,6 +1490,7 @@ class HistoricalDataManager:
                 "period2": str(int(p2_dt.timestamp())),
                 "interval": interval,
                 "includePrePost": "false",
+                "events": "div,splits",
             }
         )
         url = f"https://query1.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(ticker)}?{params}"
@@ -1238,7 +1526,54 @@ class HistoricalDataManager:
         quote = (indicators.get("quote") or [{}])[0]
         adj_block = (indicators.get("adjclose") or [{}])[0]
         adj_closes = adj_block.get("adjclose") or []
-        use_adjusted = _normalize_adjustment_mode(adjustment_mode) == "adjusted"
+        adj_mode = _normalize_adjustment_mode(adjustment_mode)
+
+        # Parse corporate actions (splits & dividends) from Yahoo events block when present
+        events_block = res0.get("events") or {}
+        split_events: List[Tuple[str, float]] = []
+        raw_splits = events_block.get("splits") or {}
+        if isinstance(raw_splits, dict):
+            for ev in raw_splits.values():
+                if not isinstance(ev, dict):
+                    continue
+                ev_ts = ev.get("date")
+                num = float(ev.get("numerator") or 0.0)
+                den = float(ev.get("denominator") or 0.0)
+                if ev_ts and num > 0 and den > 0:
+                    ev_date = datetime.fromtimestamp(int(ev_ts), tz=timezone.utc).astimezone(IST_TZ).date().isoformat()
+                    ratio = num / den
+                    split_events.append((ev_date, ratio))
+                    try:
+                        self.record_corporate_action(
+                            symbol=clean,
+                            exchange=exchange,
+                            ex_date=ev_date,
+                            action_type="split",
+                            ratio=ratio,
+                            source="yfinance",
+                        )
+                    except Exception:
+                        pass
+        raw_divs = events_block.get("dividends") or {}
+        if isinstance(raw_divs, dict):
+            for ev in raw_divs.values():
+                if not isinstance(ev, dict):
+                    continue
+                ev_ts = ev.get("date")
+                amt = float(ev.get("amount") or 0.0)
+                if ev_ts and amt > 0:
+                    ev_date = datetime.fromtimestamp(int(ev_ts), tz=timezone.utc).astimezone(IST_TZ).date().isoformat()
+                    try:
+                        self.record_corporate_action(
+                            symbol=clean,
+                            exchange=exchange,
+                            ex_date=ev_date,
+                            action_type="dividend",
+                            dividend_amount=amt,
+                            source="yfinance",
+                        )
+                    except Exception:
+                        pass
 
         opens = quote.get("open") or []
         highs = quote.get("high") or []
@@ -1254,28 +1589,62 @@ class HistoricalDataManager:
             # Clip strictly within requested gap window
             if not (chunk_start <= dt_ist.date() <= chunk_end):
                 continue
+            td_iso = dt_ist.date().isoformat()
             raw_c = float(closes[idx])
             o = float(opens[idx]) if idx < len(opens) and opens[idx] is not None else raw_c
             h = float(highs[idx]) if idx < len(highs) and highs[idx] is not None else raw_c
             l = float(lows[idx]) if idx < len(lows) and lows[idx] is not None else raw_c
             c_val = raw_c
-            if use_adjusted and idx < len(adj_closes) and adj_closes[idx] is not None and raw_c > 0:
-                adj_c = float(adj_closes[idx])
-                ratio = adj_c / raw_c
-                o *= ratio
-                h *= ratio
-                l *= ratio
-                c_val = adj_c
-            v = volumes[idx] if idx < len(volumes) and volumes[idx] is not None else 0
+            v = float(volumes[idx]) if idx < len(volumes) and volumes[idx] is not None else 0.0
+
+            if adj_mode == "total_return":
+                # Yahoo adjclose reflects dividends + splits; apply price ratio to OHLC
+                # and split-adjust volume inversely using split events (never dividend ratio).
+                if idx < len(adj_closes) and adj_closes[idx] is not None and raw_c > 0:
+                    adj_c = float(adj_closes[idx])
+                    ratio = adj_c / raw_c
+                    o *= ratio
+                    h *= ratio
+                    l *= ratio
+                    c_val = adj_c
+                # Yahoo quote.volume is already split-adjusted on some endpoints, or raw on others;
+                # if split events exist and price ratio is split-like, ensure volume reflects splits
+                # without inflating for cash dividends.
+            elif adj_mode == "split_adjusted":
+                # Split-only adjustment: adjust OHLC AND volume inversely on splits without
+                # distorting prices with dividend reinvestment.
+                if split_events:
+                    cum_split = 1.0
+                    for ev_date, ev_ratio in split_events:
+                        if td_iso < ev_date and ev_ratio > 0:
+                            cum_split *= ev_ratio
+                    if abs(cum_split - 1.0) > 1e-9:
+                        o /= cum_split
+                        h /= cum_split
+                        l /= cum_split
+                        c_val /= cum_split
+                        v *= cum_split
+                elif idx < len(adj_closes) and adj_closes[idx] is not None and raw_c > 0:
+                    # Fallback when events block is absent: apply price ratio AND inverse volume scaling
+                    adj_c = float(adj_closes[idx])
+                    ratio = adj_c / raw_c
+                    if ratio > 0:
+                        o *= ratio
+                        h *= ratio
+                        l *= ratio
+                        c_val = adj_c
+                        if ratio < 0.85 or ratio > 1.15:
+                            v = v / ratio
+
             out.append(
                 {
                     "ts_ist": dt_ist.isoformat(timespec="seconds"),
-                    "trade_date": dt_ist.date().isoformat(),
+                    "trade_date": td_iso,
                     "open": round(o, 4),
                     "high": round(h, 4),
                     "low": round(l, 4),
                     "close": round(c_val, 4),
-                    "volume": int(v),
+                    "volume": int(round(max(0.0, v))),
                     "oi": 0,
                 }
             )
@@ -2050,6 +2419,98 @@ class HistoricalDataManager:
                 syms.add(sym)
         return sorted(syms)
 
+    def get_data_quality(
+        self,
+        *,
+        symbol: str,
+        exchange: str = "NSE",
+        timeframe: str = "1day",
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None,
+        provider: Optional[str] = None,
+        adjustment_mode: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Inspect local OHLCV data quality, provenance, and corporate action lineage."""
+        clean_sym = _normalize_symbol(symbol)
+        clean_exch = (exchange or "NSE").strip().upper()
+        tf = normalize_timeframe(timeframe)
+        base_tf = resolve_base_timeframe(tf)
+        recs = self.get_records(
+            symbol=clean_sym,
+            exchange=clean_exch,
+            timeframe=tf,
+            from_date=from_date,
+            to_date=to_date,
+            view="full",
+            provider=provider,
+            adjustment_mode=adjustment_mode,
+        )
+        hist = self.get_asset_history(
+            clean_sym,
+            clean_exch,
+            base_tf,
+            provider=provider,
+            adjustment_mode=adjustment_mode,
+        )
+        missing_dates = list(hist.get("missing_dates") or []) if hist else []
+        quality = compute_data_quality_score(
+            recs.get("rows") or [],
+            timeframe=tf,
+            exchange=clean_exch,
+            missing_dates=missing_dates,
+        )
+        actions = self.list_corporate_actions(clean_sym, clean_exch)
+        return {
+            "ok": True,
+            "symbol": clean_sym,
+            "exchange": clean_exch,
+            "timeframe": tf,
+            "provider": (hist or {}).get("provider") or provider or "unknown",
+            "adjustment_mode": (hist or {}).get("adjustment_mode") or _normalize_adjustment_mode(adjustment_mode),
+            "storage_backend": recs.get("storage_backend", "sqlite"),
+            "corporate_actions_count": len(actions),
+            "corporate_actions": actions,
+            **quality,
+        }
+
+    def check_adjustment_consistency(
+        self,
+        symbols: List[str],
+        exchange: str = "NSE",
+        timeframe: str = "1day",
+    ) -> Dict[str, Any]:
+        """
+        Verify whether a set of symbols share a consistent adjustment_mode and provider
+        in local history so portfolio backtests never silently mix raw and adjusted series.
+        """
+        clean_exch = (exchange or "NSE").strip().upper()
+        base_tf = resolve_base_timeframe(timeframe)
+        modes_by_symbol: Dict[str, str] = {}
+        providers_by_symbol: Dict[str, str] = {}
+        for sym in symbols:
+            clean_sym = _normalize_symbol(sym)
+            hist = self.get_asset_history(clean_sym, clean_exch, base_tf)
+            if hist:
+                modes_by_symbol[clean_sym] = str(hist.get("adjustment_mode") or "raw")
+                providers_by_symbol[clean_sym] = str(hist.get("provider") or "unknown")
+        distinct_modes = sorted(set(modes_by_symbol.values()))
+        distinct_providers = sorted(set(providers_by_symbol.values()))
+        mixed_modes = len(distinct_modes) > 1
+        warning = (
+            f"Mixed adjustment modes detected across symbols ({', '.join(distinct_modes)}). "
+            "Re-download symbols under a single consistent adjustment_mode for apples-to-apples backtesting."
+            if mixed_modes
+            else None
+        )
+        return {
+            "consistent": not mixed_modes,
+            "distinct_adjustment_modes": distinct_modes,
+            "distinct_providers": distinct_providers,
+            "modes_by_symbol": modes_by_symbol,
+            "providers_by_symbol": providers_by_symbol,
+            "warning": warning,
+        }
+
     def export_csv(
         self,
         *,
@@ -2082,7 +2543,10 @@ historical_data_manager = HistoricalDataManager()
 __all__ = [
     "DefaultParquetIO",
     "HistoricalDataManager",
+    "VALID_ADJUSTMENT_MODES",
     "VALID_TIMEFRAMES",
+    "apply_corporate_actions",
+    "compute_data_quality_score",
     "compute_missing_date_ranges",
     "historical_data_manager",
     "normalize_timeframe",

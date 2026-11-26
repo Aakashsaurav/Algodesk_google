@@ -158,9 +158,47 @@ _BANNED_KEYWORD_ARGS: Set[str] = {
 }
 
 PLUGIN_TRUST_NOTICE = (
-    "Admin-Only Trusted Code: Python plugins execute in-process inside the local AlgoDesk server. "
-    "Static AST checks are defense-in-depth only; upload only code you wrote or trust."
+    "Trusted-Operator Code Boundary: Uploaded Python strategies/screeners execute in-process "
+    "inside the local AlgoDesk server. Static AST validation is a safety guardrail for trusted "
+    "operator code ONLY — it is NOT a sandbox for untrusted third-party code."
 )
+
+
+def validate_oauth_redirect_origin(
+    origin: Optional[str],
+    *,
+    allowed_origins: Optional[List[str]] = None,
+) -> str:
+    """
+    Validate and return a strict `postMessage` targetOrigin for broker OAuth popups.
+    Never returns wildcard `'*'`. Defaults to `'http://127.0.0.1:8000'` when empty or
+    when a non-allowed remote origin is supplied.
+    """
+    from urllib.parse import urlparse
+
+    cand = (origin or "").strip()
+    if cand:
+        try:
+            parsed = urlparse(cand)
+            if parsed.scheme in {"http", "https"} and parsed.hostname:
+                norm = f"{parsed.scheme}://{parsed.netloc}"
+                host = parsed.hostname.lower()
+                if allowed_origins:
+                    if norm in set(allowed_origins):
+                        return norm
+                elif host in {"127.0.0.1", "localhost", "::1"}:
+                    return norm
+                else:
+                    env_allowed = [
+                        o.strip()
+                        for o in os.getenv("ALGODESK_ALLOWED_ORIGINS", "").split(",")
+                        if o.strip()
+                    ]
+                    if norm in set(env_allowed):
+                        return norm
+        except Exception:
+            pass
+    return "http://127.0.0.1:8000"
 
 
 def validate_python_plugin_ast(code: str, filename: str = "plugin.py") -> List[str]:
@@ -561,5 +599,6 @@ __all__ = [
     "SecurityManager",
     "is_live_trading_enabled",
     "security_manager",
+    "validate_oauth_redirect_origin",
     "validate_python_plugin_ast",
 ]

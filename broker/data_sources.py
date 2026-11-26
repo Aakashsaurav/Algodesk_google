@@ -15,24 +15,21 @@ import urllib.request
 from typing import Optional, Sequence
 
 from broker.base import (
-    AccountBalance,
-    BrokerBase,
     BrokerCapabilities,
-    BrokerError,
     BrokerHealthSnapshot,
-    BrokerOrder,
-    BrokerPosition,
     ConnectionState,
-    OrderRequest,
+    MarketDataProviderBase,
 )
 
 
-class YFinanceDataAdapter(BrokerBase):
+class YFinanceDataAdapter(MarketDataProviderBase):
     """
     Lightweight market-data-only connection adapter for Yahoo Finance.
 
     Does NOT import heavy pandas/yfinance packages during connectivity checks,
     preserving MacBook Air M2 memory until historical data is actually fetched.
+    Marked `execution_grade_feed=False` so automated live trading cannot use
+    delayed daily Yahoo quotes as an execution feed.
     """
 
     name = "yfinance"
@@ -43,6 +40,10 @@ class YFinanceDataAdapter(BrokerBase):
         supports_market_data=True,
         supports_websocket=False,
         requires_oauth=False,
+        supports_historical=True,
+        supports_instrument_master=False,
+        max_depth_levels=0,
+        execution_grade_feed=False,
     )
 
     _PROBE_URL = "https://query1.finance.yahoo.com/v8/finance/chart/%5ENSEI?range=1d&interval=1d"
@@ -116,20 +117,8 @@ class YFinanceDataAdapter(BrokerBase):
                 auth_mode="public",
             )
 
-    def place_order(self, order: OrderRequest) -> Optional[BrokerOrder]:
-        raise BrokerError("Yahoo Finance is a read-only data provider; trading is not supported.")
-
-    def cancel_order(self, order_id: str) -> bool:
-        return False
-
-    def get_positions(self) -> Sequence[BrokerPosition]:
-        return []
-
-    def get_balance(self) -> AccountBalance:
-        return AccountBalance(cash=0.0)
-
-    def get_orders(self) -> Sequence[BrokerOrder]:
-        return []
+    def is_authenticated(self) -> bool:
+        return True
 
 
 __all__ = ["YFinanceDataAdapter"]
