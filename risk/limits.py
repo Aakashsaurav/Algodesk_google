@@ -751,12 +751,15 @@ class RiskWatchdog:
         try:
             res = cb()
             if isinstance(res, dict):
-                if res.get("error") or res.get("ok") is False:
+                has_granular = any(
+                    k in res for k in ("oms_error", "position_error", "order_recovery_error")
+                )
+                if not has_granular and (res.get("error") or res.get("ok") is False):
                     err = str(res.get("error") or "Reconciliation returned error")
                     self.report_dimension("oms_reconciliation", healthy=False, error=err)
                     self.report_dimension("position_reconciliation", healthy=False, error=err)
                     return res
-                # Inspect granular OMS / position errors if returned
+                # Inspect granular OMS / position / recovery errors if returned
                 oms_err = res.get("oms_error")
                 pos_err = res.get("position_error")
                 if oms_err:

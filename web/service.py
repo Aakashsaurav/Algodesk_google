@@ -1078,39 +1078,44 @@ class BrokerHubService:
         except Exception as exc:
             logger.warning("Bootstrap code initialization note: %s", exc)
 
-        def _periodic_reconcile() -> None:
+        def _periodic_reconcile() -> Dict[str, Any]:
+            oms_error: Optional[str] = None
+            pos_error: Optional[str] = None
+            order_recovery_error: Optional[str] = None
+            oms_checked = 0
             try:
-                oms_res = deployment_manager.reconcile_orders()
-                risk_watchdog.report_dimension(
-                    "oms_reconciliation",
-                    True,
-                    f"OMS orders reconciled ({oms_res.get('checked', 0)} checked)",
-                )
+                oms_res = deployment_manager.reconcile_orders() or {}
+                oms_checked = int(oms_res.get("checked") or 0)
+                if oms_res.get("ok") is False or oms_res.get("error"):
+                    oms_error = str(oms_res.get("error") or "OMS reconciliation failed")
+                manual_req = oms_res.get("manual_intervention_required") or []
+                if manual_req:
+                    order_recovery_error = (
+                        f"{len(manual_req)} ambiguous order(s) require manual operator verification."
+                    )
             except Exception as exc:
                 logger.warning("Periodic OMS order reconciliation note: %s", exc)
-                risk_watchdog.report_dimension("oms_reconciliation", False, f"OMS reconciliation error: {exc}")
+                oms_error = f"OMS reconciliation error: {exc}"
             try:
-                pos_res = deployment_manager.reconcile_positions()
+                pos_res = deployment_manager.reconcile_positions() or {}
                 mismatches = pos_res.get("mismatches") or []
-                if mismatches:
-                    risk_watchdog.report_dimension(
-                        "position_reconciliation",
-                        False,
-                        f"{len(mismatches)} position mismatch(es) detected during periodic reconciliation.",
-                    )
-                else:
-                    risk_watchdog.report_dimension(
-                        "position_reconciliation",
-                        True,
-                        "Positions aligned with broker.",
+                if pos_res.get("ok") is False or pos_res.get("error"):
+                    pos_error = str(pos_res.get("error") or "Position reconciliation failed")
+                elif mismatches:
+                    pos_error = (
+                        f"{len(mismatches)} position mismatch(es) detected during periodic reconciliation."
                     )
             except Exception as exc:
                 logger.warning("Periodic position reconciliation note: %s", exc)
-                risk_watchdog.report_dimension(
-                    "position_reconciliation",
-                    False,
-                    f"Position reconciliation error: {exc}",
-                )
+                pos_error = f"Position reconciliation error: {exc}"
+
+            return {
+                "ok": not (oms_error or pos_error or order_recovery_error),
+                "checked": oms_checked,
+                "oms_error": oms_error,
+                "position_error": pos_error,
+                "order_recovery_error": order_recovery_error,
+            }
 
         try:
             risk_watchdog.set_reconcile_callback(_periodic_reconcile)
