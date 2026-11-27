@@ -123,11 +123,20 @@ function startPythonHub(port = activePythonPort): void {
   console.log(`[python-hub] starting with interpreter: ${pythonBin}`);
   pythonProc = spawn(
     pythonBin,
-    ['-m', 'web.local_server', '--host', '127.0.0.1', '--port', String(activePythonPort), '--no-browser'],
+    [
+      '-m',
+      'web.local_server',
+      '--host',
+      '127.0.0.1',
+      '--port',
+      String(activePythonPort),
+      '--no-browser',
+      '--skip-spa-build',
+    ],
     {
       cwd: __dirname,
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env, PYTHONUNBUFFERED: '1' },
+      env: { ...process.env, PYTHONUNBUFFERED: '1', ALGODESK_SKIP_SPA_BUILD: '1' },
     }
   );
 

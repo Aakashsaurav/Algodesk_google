@@ -16,6 +16,7 @@ import argparse
 import html
 import json
 import logging
+import os
 import queue
 import socket
 import sys
@@ -1277,9 +1278,21 @@ class _AlgoDeskHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
 
-def run_server(host: str = "127.0.0.1", port: int = 8000, open_browser: bool = True) -> None:
+def run_server(
+    host: str = "127.0.0.1",
+    port: int = 8000,
+    open_browser: bool = True,
+    skip_spa_build: bool = False,
+) -> None:
     setup_logging()
-    ensure_spa_bundle(auto_build=True)
+    env_skip = str(os.environ.get("ALGODESK_SKIP_SPA_BUILD", "")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if not skip_spa_build and not env_skip:
+        ensure_spa_bundle(auto_build=True)
     url = f"http://{host}:{port}"
     logger.info("Starting AlgoDesk Broker & Data Hub at %s", url)
 
@@ -1331,8 +1344,18 @@ def main(argv: Optional[list[str]] = None) -> None:
     parser.add_argument("--host", default="127.0.0.1", help="Bind host (default 127.0.0.1)")
     parser.add_argument("--port", type=int, default=8000, help="Listen port (default 8000)")
     parser.add_argument("--no-browser", action="store_true", help="Do not auto-open browser")
+    parser.add_argument(
+        "--skip-spa-build",
+        action="store_true",
+        help="Skip automatic frontend SPA rebuild (used when Node/Vite serves the frontend)",
+    )
     args = parser.parse_args(argv)
-    run_server(host=args.host, port=args.port, open_browser=not args.no_browser)
+    run_server(
+        host=args.host,
+        port=args.port,
+        open_browser=not args.no_browser,
+        skip_spa_build=bool(args.skip_spa_build),
+    )
 
 
 if __name__ == "__main__":
