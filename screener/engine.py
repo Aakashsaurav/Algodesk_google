@@ -9,9 +9,10 @@ across named universes (NIFTY 50, NIFTY F&O, NIFTY 500, etc.) using drop-in
 from __future__ import annotations
 
 import math
+import re
 import threading
 from datetime import date, datetime, timedelta
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from config import IST_TZ, config
 from core.historical import (
@@ -30,6 +31,62 @@ from screener.nse_universe_sync import nse_universe_sync
 from screener.registry import ScreenRegistry, screen_registry
 from screener.sr_engine import filter_complete_weekly_candles, short_tf_label, slice_candles_as_of
 from screener.universes import UniverseResolver, universe_resolver
+
+
+_OPTION_SYMBOL_RE = re.compile(r"(?:\d+(?:\.\d+)?(?:CE|PE)$|\bOPT(?:STK|IDX)?\b)", re.IGNORECASE)
+_FUTURES_SYMBOL_RE = re.compile(r"(?:FUT$|\d{2}[A-Z]{3}FUT$)", re.IGNORECASE)
+
+OPTIONS_EXCLUDED_NOTICE = (
+    "Option-premium contracts (CE/PE/OPT) are excluded from Support & Resistance screening; "
+    "evaluate structural zones on the underlying cash equity or futures contract instead."
+)
+
+
+def is_option_contract(symbol: str, instrument_type: Optional[str] = None) -> bool:
+    """Detect NSE/BSE option contracts (CE/PE/OPT) without misclassifying cash equities."""
+    itype = str(instrument_type or "").strip().upper()
+    if itype in {"CE", "PE", "OPT", "OPTSTK", "OPTIDX"} or itype.startswith("OPT"):
+        return True
+    clean = str(symbol or "").strip().upper()
+    if not clean:
+        return False
+    return bool(_OPTION_SYMBOL_RE.search(clean))
+
+
+def is_futures_contract(symbol: str, instrument_type: Optional[str] = None) -> bool:
+    """Detect NSE/BSE futures contracts (FUT/FUTSTK/FUTIDX)."""
+    itype = str(instrument_type or "").strip().upper()
+    if itype.startswith("FUT"):
+        return True
+    clean = str(symbol or "").strip().upper()
+    return bool(clean and _FUTURES_SYMBOL_RE.search(clean))
+
+
+def normalize_segments(segments: Optional[List[str]]) -> Tuple[List[str], bool]:
+    """
+    Normalize requested market segments into canonical ['EQ'], ['FUT'], or ['EQ', 'FUT'].
+    Returns `(normalized_segments, options_requested)`.
+    """
+    if not segments:
+        return ["EQ"], False
+    out: List[str] = []
+    options_requested = False
+    for raw in segments:
+        tok = str(raw or "").strip().upper()
+        if tok in {"OPT", "OPTIONS", "CE", "PE", "OPTSTK", "OPTIDX"}:
+            options_requested = True
+            continue
+        if tok in {"EQ", "EQUITY", "CASH", "SPOT"}:
+            if "EQ" not in out:
+                out.append("EQ")
+        elif tok in {"FUT", "FUTURES", "FUTSTK", "FUTIDX", "FNO_FUT"}:
+            if "FUT" not in out:
+                out.append("FUT")
+        elif tok in {"EQ+FUT", "EQ_FUT", "ALL"}:
+            for item in ("EQ", "FUT"):
+                if item not in out:
+                    out.append(item)
+    return (out or ["EQ"]), options_requested
 
 
 def compute_auto_lookback_days(required_bars: int, timeframe: str) -> int:
@@ -97,6 +154,142 @@ class ScreenerEngine:
             pass
         return fno_syms
 
+    def _expand_segment_targets(
+        self,
+        *,
+        clean_symbols: List[str],
+        exchanges: List[str],
+        segments: List[str],
+        as_of_date: str,
+    ) -> Tuple[List[Dict[str, Any]], int, List[Dict[str, str]]]:
+        """
+        Expand symbols into segment-tagged scan targets (`EQ` and/or active `FUT` contracts)
+        across requested exchanges (`NSE`, `BSE`), strictly excluding option contracts and
+        never silently stitching across futures expiries.
+        """
+        targets: List[Dict[str, Any]] = []
+        excluded_options = 0
+        missing_contracts: List[Dict[str, str]] = []
+        seen_keys: set[Tuple[str, str, str]] = set()
+
+        include_eq = "EQ" in segments
+        include_fut = "FUT" in segments
+
+        try:
+            from core.instruments import instrument_index
+        except Exception:
+            instrument_index = None  # type: ignore[assignment]
+
+        for raw_sym in clean_symbols:
+            sym_u = str(raw_sym or "").strip().upper()
+            if not sym_u:
+                continue
+            if is_option_contract(sym_u):
+                excluded_options += 1
+                continue
+
+            sym_is_fut = is_futures_contract(sym_u)
+            for exch in exchanges:
+                ex_u = str(exch or "NSE").strip().upper()
+                if sym_is_fut:
+                    if include_fut:
+                        fut_exch = "BFO" if ex_u in {"BSE", "BFO"} else "NFO"
+                        key = (sym_u, fut_exch, "FUT")
+                        if key not in seen_keys:
+                            seen_keys.add(key)
+                            expiry_val = None
+                            if instrument_index is not None:
+                                try:
+                                    c_obj = instrument_index.get_contract(sym_u, exchange=fut_exch)
+                                    if c_obj is not None:
+                                        expiry_val = c_obj.expiry
+                                except Exception:
+                                    pass
+                            targets.append(
+                                {
+                                    "symbol": sym_u,
+                                    "underlying": sym_u,
+                                    "exchange": fut_exch,
+                                    "instrument_category": "FUT",
+                                    "contract_expiry": expiry_val,
+                                }
+                            )
+                    continue
+
+                if include_eq:
+                    eq_exch = "BSE" if ex_u in {"BSE", "BFO"} else "NSE"
+                    key = (sym_u, eq_exch, "EQ")
+                    if key not in seen_keys:
+                        seen_keys.add(key)
+                        targets.append(
+                            {
+                                "symbol": sym_u,
+                                "underlying": sym_u,
+                                "exchange": eq_exch,
+                                "instrument_category": "EQ",
+                                "contract_expiry": None,
+                            }
+                        )
+
+                if include_fut:
+                    fut_exch = "BFO" if ex_u in {"BSE", "BFO"} else "NFO"
+                    found_fut = False
+                    if instrument_index is not None:
+                        try:
+                            fno_out = instrument_index.list_fno_contracts(
+                                underlying=sym_u,
+                                exchange=fut_exch,
+                                contract_type="FUT",
+                                include_expired=False,
+                                limit=6,
+                            )
+                            contracts = [
+                                c for c in (fno_out.get("contracts") or [])
+                                if str(c.get("asset_symbol") or "").strip().upper() == sym_u
+                                and not is_option_contract(
+                                    str(c.get("trading_symbol") or ""),
+                                    str(c.get("instrument_type") or ""),
+                                )
+                            ]
+                            # Sort by nearest expiry first; keep active contracts distinct (no stitching)
+                            contracts.sort(key=lambda c: str(c.get("expiry") or "9999-12-31"))
+                            for c in contracts[:2]:
+                                c_sym = str(c.get("trading_symbol") or "").strip().upper()
+                                if not c_sym:
+                                    continue
+                                key = (c_sym, fut_exch, "FUT")
+                                if key not in seen_keys:
+                                    seen_keys.add(key)
+                                    targets.append(
+                                        {
+                                            "symbol": c_sym,
+                                            "underlying": sym_u,
+                                            "exchange": fut_exch,
+                                            "instrument_category": "FUT",
+                                            "contract_expiry": c.get("expiry"),
+                                            "instrument_key": c.get("instrument_key"),
+                                        }
+                                    )
+                                    found_fut = True
+                        except Exception:
+                            found_fut = False
+
+                    if not found_fut:
+                        missing_contracts.append(
+                            {
+                                "symbol": sym_u,
+                                "exchange": fut_exch,
+                                "timeframe": "ALL",
+                                "canonical_timeframe": "ALL",
+                                "reason": (
+                                    f"No active {fut_exch} futures contract found in local instrument master for {sym_u} "
+                                    f"as of {as_of_date} (sync instrument master to screen FUT contracts)."
+                                ),
+                            }
+                        )
+
+        return targets, excluded_options, missing_contracts
+
     def _load_candles(
         self,
         *,
@@ -145,6 +338,8 @@ class ScreenerEngine:
         fetcher: Optional[Callable[..., List[Dict[str, Any]]]],
         progress_cb: Optional[Callable[[int, int, str], None]],
         cancel_event: Optional[threading.Event],
+        segments: Optional[List[str]] = None,
+        exchanges: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Multi-timeframe orchestration layer reusing canonical base series:
@@ -152,10 +347,26 @@ class ScreenerEngine:
         - Fetches `1day` base data ONCE per symbol for 1d / 1w.
         - Derives all higher timeframes in-memory via `resample_ohlcv_rows`
           and strictly excludes incomplete weekly candles for point-in-time accuracy.
+        - Supports EQ and active NSE/BSE FUT contracts while explicitly excluding
+          option-premium contracts.
         - Reports missing `(symbol, timeframe, reason)` explicitly without
           fabricating candles or silently substituting daily data for intraday.
         """
         to_date = eff_end_d.isoformat()
+        eff_segments, options_requested = normalize_segments(segments)
+        eff_exchanges = [
+            str(e).strip().upper()
+            for e in (exchanges if (exchanges and len(exchanges) > 0) else [eff_exch])
+            if str(e).strip()
+        ] or [eff_exch]
+
+        targets, excluded_options, missing_contracts = self._expand_segment_targets(
+            clean_symbols=clean_symbols,
+            exchanges=eff_exchanges,
+            segments=eff_segments,
+            as_of_date=to_date,
+        )
+
         intraday_tfs = [t for t in target_tfs if resolve_base_timeframe(t) == "1minute"]
         daily_tfs = [t for t in target_tfs if resolve_base_timeframe(t) == "1day"]
 
@@ -186,21 +397,27 @@ class ScreenerEngine:
         declared_cols = screen.get_columns(resolved_params)
 
         all_rows: List[Dict[str, Any]] = []
-        missing_data: List[Dict[str, str]] = []
+        missing_data: List[Dict[str, str]] = list(missing_contracts)
         errors: List[Dict[str, str]] = []
         evaluated_symbols = 0
         total_api_calls = 0
         total_cached_skipped = 0
 
-        total = len(clean_symbols)
-        for idx, sym in enumerate(clean_symbols):
+        total = len(targets)
+        for idx, target in enumerate(targets):
+            sym = target["symbol"]
+            target_exch = target["exchange"]
+            inst_cat = target["instrument_category"]
+            contract_expiry = target.get("contract_expiry")
+            underlying = target.get("underlying") or sym
+
             if cancel_event is not None and cancel_event.is_set():
                 raise JobCancelledError(f"Screener cancelled at {idx}/{total} ({sym}).")
             if progress_cb:
                 progress_cb(
                     idx,
                     total,
-                    f"Scanning {sym} ({idx + 1}/{total}) across {len(target_tfs)} TFs as of {to_date}...",
+                    f"Scanning {sym} [{inst_cat}] ({idx + 1}/{total}) across {len(target_tfs)} TFs as of {to_date}...",
                 )
 
             sym_api_calls = 0
@@ -215,7 +432,7 @@ class ScreenerEngine:
                 try:
                     dl_1m = self._hist.download(
                         symbol=sym,
-                        exchange=eff_exch,
+                        exchange=target_exch,
                         timeframe="1minute",
                         from_date=intra_from_date,
                         to_date=to_date,
@@ -242,7 +459,7 @@ class ScreenerEngine:
 
                 if raw_1m:
                     for itf in intraday_tfs:
-                        resampled = raw_1m if itf == "1minute" else resample_ohlcv_rows(raw_1m, itf, exchange=eff_exch)
+                        resampled = raw_1m if itf == "1minute" else resample_ohlcv_rows(raw_1m, itf, exchange=target_exch)
                         candles_by_tf[itf] = resampled
                 else:
                     reason = intra_err or f"No 1minute intraday data available from {eff_provider.upper()} up to {to_date}"
@@ -250,7 +467,7 @@ class ScreenerEngine:
                         sym_missing.append(
                             {
                                 "symbol": sym_norm,
-                                "exchange": eff_exch,
+                                "exchange": target_exch,
                                 "timeframe": short_tf_label(itf),
                                 "canonical_timeframe": itf,
                                 "reason": reason,
@@ -264,7 +481,7 @@ class ScreenerEngine:
                 try:
                     dl_1d = self._hist.download(
                         symbol=sym,
-                        exchange=eff_exch,
+                        exchange=target_exch,
                         timeframe="1day",
                         from_date=daily_from_date,
                         to_date=to_date,
@@ -294,16 +511,16 @@ class ScreenerEngine:
                         if dtf == "1day":
                             candles_by_tf[dtf] = raw_1d
                         elif dtf == "1week":
-                            candles_by_tf[dtf] = filter_complete_weekly_candles(raw_1d, as_of_date=to_date, exchange=eff_exch)
+                            candles_by_tf[dtf] = filter_complete_weekly_candles(raw_1d, as_of_date=to_date, exchange=target_exch)
                         else:
-                            candles_by_tf[dtf] = resample_ohlcv_rows(raw_1d, dtf, exchange=eff_exch)
+                            candles_by_tf[dtf] = resample_ohlcv_rows(raw_1d, dtf, exchange=target_exch)
                 else:
                     reason = daily_err or f"No 1day data available from {eff_provider.upper()} up to {to_date}"
                     for dtf in daily_tfs:
                         sym_missing.append(
                             {
                                 "symbol": sym_norm,
-                                "exchange": eff_exch,
+                                "exchange": target_exch,
                                 "timeframe": short_tf_label(dtf),
                                 "canonical_timeframe": dtf,
                                 "reason": reason,
@@ -322,15 +539,20 @@ class ScreenerEngine:
                 continue
 
             try:
-                eval_out = screen.evaluate_multi_timeframe(
-                    symbol=sym_norm,
-                    exchange=eff_exch,
-                    candles_by_tf=candles_by_tf,
-                    params=resolved_params,
-                    as_of_date=to_date,
-                    fno_eligible=(sym_norm in fno_set),
-                    api_calls=sym_api_calls,
-                )
+                eval_kwargs: Dict[str, Any] = {
+                    "symbol": sym_norm,
+                    "exchange": target_exch,
+                    "candles_by_tf": candles_by_tf,
+                    "params": resolved_params,
+                    "as_of_date": to_date,
+                    "fno_eligible": (underlying in fno_set or inst_cat == "FUT"),
+                    "api_calls": sym_api_calls,
+                    "instrument_category": inst_cat,
+                    "contract_expiry": contract_expiry,
+                    "data_source": eff_provider,
+                    "adjustment_basis": "split_adjusted_ohlcv",
+                }
+                eval_out = screen.evaluate_multi_timeframe(**eval_kwargs)
                 if eval_out.get("evaluated_timeframes"):
                     evaluated_symbols += 1
                 if eval_out.get("missing_data"):
@@ -346,12 +568,14 @@ class ScreenerEngine:
             progress_cb(
                 total,
                 total,
-                f"Multi-TF scan completed ({evaluated_symbols}/{total} symbols, {len(all_rows)} S&R events).",
+                f"Multi-TF scan completed ({evaluated_symbols}/{total} instruments, {len(all_rows)} S&R events).",
             )
 
+        # Priority Ranking: Tier 1 (Major Breakout/Breakdown) -> Tier 2 (Major Retest) ->
+        # Tier 3 (Major Bounce/Rejection) -> Tier 4 (Near Major) -> Tier 5 (Minor Events) -> Tier 6 (Other)
         all_rows.sort(
             key=lambda r: (
-                1 if r.get("classification") == "Major" else 0,
+                -int(r.get("rank_tier", 6)),
                 float(r.get("strength", 0.0)),
                 -abs(float(r.get("distance_pct", 0.0))),
             ),
@@ -380,6 +604,12 @@ class ScreenerEngine:
             "is_historical_as_of": eff_end_d < today_ist,
             "provider": eff_provider,
             "exchange": eff_exch,
+            "exchanges": eff_exchanges,
+            "segments": eff_segments,
+            "options_excluded_count": excluded_options,
+            "options_excluded_notice": (
+                OPTIONS_EXCLUDED_NOTICE if (excluded_options > 0 or options_requested or "FUT" in eff_segments) else None
+            ),
             "timeframe": ",".join(short_tfs),
             "timeframes": short_tfs,
             "canonical_timeframes": target_tfs,
@@ -390,7 +620,7 @@ class ScreenerEngine:
             "lookback_mode": "manual_min_auto" if lookback_days else "auto",
             "storage_backend": storage_meta["active_mode"],
             "ta_backends": available_backends(),
-            "scanned_count": len(clean_symbols),
+            "scanned_count": len(targets),
             "evaluated_count": evaluated_symbols,
             "matched_count": len(all_rows),
             "events_found": len(all_rows),
@@ -416,6 +646,8 @@ class ScreenerEngine:
         symbols: Optional[List[str]] = None,
         universe: str = "CUSTOM",
         exchange: str = "NSE",
+        exchanges: Optional[List[str]] = None,
+        segments: Optional[List[str]] = None,
         timeframe: str = "1day",
         timeframes: Optional[List[str]] = None,
         lookback_days: Optional[int] = None,
@@ -488,6 +720,8 @@ class ScreenerEngine:
                 fetcher=fetcher,
                 progress_cb=progress_cb,
                 cancel_event=cancel_event,
+                segments=segments,
+                exchanges=exchanges,
             )
 
         # Standard Single-Timeframe path (100% preserved for all existing screens)

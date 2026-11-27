@@ -349,6 +349,7 @@ class BacktestEngine:
         tk = IndicatorToolkit(rows, backend=backend)
         strat_inst.prepare(rows, resolved_params, tk)
         indicator_series = collect_strategy_indicators(strat_inst, tk, len(rows)) if collect_export else {}
+        sr_zone_spans = tk.get_sr_zone_spans() if hasattr(tk, "get_sr_zone_spans") else []
 
         if progress_cb:
             progress_cb(70, 100, f"Simulating {strat_inst.name} (next-bar open fills)...")
@@ -749,6 +750,7 @@ class BacktestEngine:
                 "symbol": dl_meta["symbol"],
                 "indicator_columns": ind_names,
                 "rows": export_rows,
+                "sr_zones": sr_zone_spans,
             }
 
         out: Dict[str, Any] = {
@@ -823,6 +825,7 @@ class BacktestEngine:
                 "segment": segment,
                 "charges_overrides": charges_overrides or {},
             },
+            "sr_zones_count": len(sr_zone_spans),
             "generated_at_ist": datetime.now(tz=IST_TZ).isoformat(timespec="seconds"),
         }
         if export_payload is not None:

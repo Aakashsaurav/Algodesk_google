@@ -62,6 +62,28 @@ SUPPORTED_OPERANDS: List[Dict[str, Any]] = [
     {"id": "rolling_high", "label": "Rolling High", "kind": "indicator", "default_period": 20},
     {"id": "rolling_low", "label": "Rolling Low", "kind": "indicator", "default_period": 20},
     {"id": "vol_sma", "label": "Volume SMA", "kind": "volume", "default_period": 20},
+    # Causal Support & Resistance (zero-lookahead) indicator operands
+    {"id": "sr_nearest_support", "label": "S&R Nearest Support", "kind": "sr", "default_period": 5},
+    {"id": "sr_nearest_resistance", "label": "S&R Nearest Resistance", "kind": "sr", "default_period": 5},
+    {"id": "sr_support_low", "label": "S&R Support Zone Low", "kind": "sr", "default_period": 5},
+    {"id": "sr_support_high", "label": "S&R Support Zone High", "kind": "sr", "default_period": 5},
+    {"id": "sr_resistance_low", "label": "S&R Resistance Zone Low", "kind": "sr", "default_period": 5},
+    {"id": "sr_resistance_high", "label": "S&R Resistance Zone High", "kind": "sr", "default_period": 5},
+    {"id": "sr_support_strength", "label": "S&R Support Strength (0-100)", "kind": "sr", "default_period": 5},
+    {"id": "sr_resistance_strength", "label": "S&R Resistance Strength (0-100)", "kind": "sr", "default_period": 5},
+    {"id": "sr_dist_support_pct", "label": "S&R Distance to Support (%)", "kind": "sr", "default_period": 5},
+    {"id": "sr_dist_resistance_pct", "label": "S&R Distance to Resistance (%)", "kind": "sr", "default_period": 5},
+    {"id": "sr_confluence_count", "label": "S&R HTF Confluence Count", "kind": "sr", "default_period": 5},
+    {"id": "sr_event_code", "label": "S&R Active Event Code (0-9)", "kind": "sr", "default_period": 5},
+    {"id": "sr_near_support", "label": "S&R Event: Near Support (0/1)", "kind": "sr", "default_period": 5},
+    {"id": "sr_near_resistance", "label": "S&R Event: Near Resistance (0/1)", "kind": "sr", "default_period": 5},
+    {"id": "sr_support_bounce", "label": "S&R Event: Support Bounce (0/1)", "kind": "sr", "default_period": 5},
+    {"id": "sr_resistance_rejection", "label": "S&R Event: Resistance Rejection (0/1)", "kind": "sr", "default_period": 5},
+    {"id": "sr_resistance_breakout", "label": "S&R Event: Resistance Breakout (0/1)", "kind": "sr", "default_period": 5},
+    {"id": "sr_support_breakdown", "label": "S&R Event: Support Breakdown (0/1)", "kind": "sr", "default_period": 5},
+    {"id": "sr_breakout_retest", "label": "S&R Event: Breakout Retest (0/1)", "kind": "sr", "default_period": 5},
+    {"id": "sr_breakdown_retest", "label": "S&R Event: Breakdown Retest (0/1)", "kind": "sr", "default_period": 5},
+    {"id": "sr_false_breakout", "label": "S&R Event: False Breakout (0/1)", "kind": "sr", "default_period": 5},
     {"id": "formula", "label": "Formula (Math Expr)", "kind": "formula", "default_period": None},
 ]
 
@@ -257,6 +279,44 @@ def _compute_operand_series(
 
         vols = [float(c.get("volume") or 0.0) for c in candles]
         series = compute_sma_series(vols, max(1, period))
+    elif op_type.startswith("sr_"):
+        lb = max(2, int(spec.get("left_bars") or spec.get("period") or 5))
+        rb = max(2, int(spec.get("right_bars") or spec.get("period") or 5))
+        atr_p = max(5, int(spec.get("atr_period") or 14))
+        cluster_mult = float(
+            spec.get("cluster_atr_multiplier")
+            if spec.get("cluster_atr_multiplier") is not None
+            else (param2 if param2 > 0 else 0.50)
+        )
+        min_str = float(spec.get("min_strength") if spec.get("min_strength") is not None else 40.0)
+        htf_conf = bool(spec.get("htf_confluence", False))
+        extra_sr: Dict[str, Any] = {}
+        for k in (
+            "breakout_buffer_atr",
+            "reversal_distance_atr",
+            "near_distance_atr",
+            "retest_tolerance_atr",
+            "weight_touches",
+            "weight_reactions",
+            "weight_volume",
+            "weight_recency",
+            "weight_age",
+            "weight_confluence",
+            "weight_reversal",
+        ):
+            if spec.get(k) is not None:
+                extra_sr[k] = spec[k]
+        sr_bundle = tk.support_resistance(
+            left_bars=lb,
+            right_bars=rb,
+            atr_period=atr_p,
+            cluster_atr_multiplier=cluster_mult,
+            min_strength=min_str,
+            htf_confluence=htf_conf,
+            extra_params=extra_sr or None,
+            record_overlays=True,
+        )
+        series = list(sr_bundle.get(op_type) or ([None] * n))
     else:
         series = [float(c["close"]) for c in candles]
 
@@ -284,7 +344,13 @@ def _operand_label(spec: Dict[str, Any]) -> str:
     period = spec.get("period")
     mult = float(spec.get("multiplier") or 1.0)
     off = int(spec.get("offset") or 0)
-    base = f"{op.upper()}({int(period)})" if period and op not in {"close", "open", "high", "low", "volume"} else op.upper()
+    if op.startswith("sr_"):
+        lb = int(spec.get("left_bars") or period or 5)
+        rb = int(spec.get("right_bars") or period or 5)
+        htf_tag = ",HTF" if spec.get("htf_confluence") else ""
+        base = f"{op.upper()}({lb},{rb}{htf_tag})"
+    else:
+        base = f"{op.upper()}({int(period)})" if period and op not in {"close", "open", "high", "low", "volume"} else op.upper()
     if mult != 1.0:
         base = f"{mult:g}*{base}"
     if off != 0:
@@ -322,7 +388,11 @@ def _estimate_required_bars_for_group(group: Optional[Dict[str, Any]]) -> int:
                 continue
             per = int(side.get("period") or 0)
             off = abs(int(side.get("offset") or 0))
-            if op in {"ema", "rsi", "rsi_ma", "adx", "atr", "macd", "macd_signal", "macd_hist"}:
+            if op.startswith("sr_"):
+                lb = int(side.get("left_bars") or per or 5)
+                rb = int(side.get("right_bars") or per or 5)
+                req = max(req, 80 + (lb + rb) * 6 + off)
+            elif op in {"ema", "rsi", "rsi_ma", "adx", "atr", "macd", "macd_signal", "macd_hist"}:
                 req = max(req, per * 3 + off + 15)
             elif per > 0:
                 req = max(req, per + off + 15)
@@ -1055,6 +1125,103 @@ _SEED_VISUAL_RULES: List[Dict[str, Any]] = [
                 {"left": {"type": "close"}, "operator": ">", "right": {"type": "ema", "period": 20}, "enabled": True},
                 {"left": {"type": "rsi", "period": 14}, "operator": ">", "right": {"type": "number", "value": 60}, "enabled": True},
                 {"left": {"type": "volume"}, "operator": ">", "right": {"type": "vol_sma", "period": 20, "multiplier": 1.5}, "enabled": True},
+            ],
+        },
+    },
+    {
+        "id": "vis_sr_breakout_strategy",
+        "kind": "strategy",
+        "mode": "visual",
+        "builder_mode": "advance",
+        "category": "Equity Swing",
+        "name": "S&R Resistance Breakout (Causal)",
+        "description": "Enters when a completed candle confirms a Resistance Breakout off a strong ATR-clustered zone with optional HTF confluence; exits on Support Breakdown.",
+        "timeframe": "1day",
+        "chart_type": "candlestick",
+        "segment": "equity_delivery",
+        "universe": "NIFTY_50",
+        "default_symbols": ["RELIANCE", "INFY", "TCS", "HDFCBANK", "ICICIBANK", "SBIN"],
+        "stop_loss_pct": 4.0,
+        "take_profit_pct": 10.0,
+        "trailing_sl_pct": 2.0,
+        "entry": {
+            "logic": "AND",
+            "conditions": [
+                {
+                    "left": {
+                        "type": "sr_resistance_breakout",
+                        "left_bars": 5,
+                        "right_bars": 5,
+                        "cluster_atr_multiplier": 0.5,
+                        "min_strength": 55,
+                        "htf_confluence": True,
+                        "offset": 0,
+                    },
+                    "operator": "==",
+                    "right": {"type": "number", "value": 1},
+                    "enabled": True,
+                },
+            ],
+        },
+        "exit": {
+            "logic": "OR",
+            "conditions": [
+                {
+                    "left": {
+                        "type": "sr_support_breakdown",
+                        "left_bars": 5,
+                        "right_bars": 5,
+                        "cluster_atr_multiplier": 0.5,
+                        "min_strength": 45,
+                        "htf_confluence": True,
+                        "offset": 0,
+                    },
+                    "operator": "==",
+                    "right": {"type": "number", "value": 1},
+                    "enabled": True,
+                },
+            ],
+        },
+    },
+    {
+        "id": "vis_scan_sr_major_setup",
+        "kind": "screen",
+        "mode": "visual",
+        "builder_mode": "basic",
+        "name": "S&R Near Strong Support",
+        "description": "Visual scanner finding stocks near a strong causal Support zone (strength >= 60) with positive trend alignment.",
+        "universe": "NIFTY_50",
+        "timeframe": "1day",
+        "chart_type": "candlestick",
+        "entry": {
+            "logic": "AND",
+            "conditions": [
+                {
+                    "left": {
+                        "type": "sr_support_strength",
+                        "left_bars": 5,
+                        "right_bars": 5,
+                        "cluster_atr_multiplier": 0.5,
+                        "min_strength": 40,
+                        "htf_confluence": True,
+                    },
+                    "operator": ">=",
+                    "right": {"type": "number", "value": 60},
+                    "enabled": True,
+                },
+                {
+                    "left": {
+                        "type": "sr_dist_support_pct",
+                        "left_bars": 5,
+                        "right_bars": 5,
+                        "cluster_atr_multiplier": 0.5,
+                        "min_strength": 40,
+                        "htf_confluence": True,
+                    },
+                    "operator": "<=",
+                    "right": {"type": "number", "value": 2.0},
+                    "enabled": True,
+                },
             ],
         },
     },

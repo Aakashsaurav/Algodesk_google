@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { apiFetch, createAuthenticatedWebSocket } from '../../utils/authClient';
 import {
+  BarChart3,
   Bell,
   Calendar,
   Compass,
@@ -15,6 +16,7 @@ import {
 } from 'lucide-react';
 import type { QuickOrderTarget } from './QuickOrderModal';
 import { ScannerResultsTable } from './ScannerResultsTable';
+import { SRValidationLab } from './SRValidationLab';
 import { StreakConditionBuilder, type BuilderEngineMode } from './StreakConditionBuilder';
 import type {
   ScannerColumnSpec,
@@ -86,6 +88,10 @@ export function CreateScannerView({
   const [selectedPythonId, setSelectedPythonId] = useState(meta.screens?.[0]?.id || 'support_resistance');
   const [pythonParams, setPythonParams] = useState<Record<string, unknown>>({});
   const [mtfTimeframes, setMtfTimeframes] = useState<string[]>(['5m', '15m', '1h', '1d', '1w']);
+  const [segmentMode, setSegmentMode] = useState<'EQ' | 'FUT' | 'EQ+FUT'>('EQ');
+  const [scanExchanges, setScanExchanges] = useState<string[]>(['NSE']);
+  const [optionsNotice, setOptionsNotice] = useState('');
+  const [showSrValidationLab, setShowSrValidationLab] = useState(false);
 
   // Results & Execution
   const [rows, setRows] = useState<ScannerResultRow[]>([]);
@@ -222,7 +228,9 @@ export function CreateScannerView({
         universe: target.universe,
         basket_id: target.basket_id,
         symbols: target.symbols,
-        exchange: 'NSE',
+        exchange: scanExchanges[0] || 'NSE',
+        exchanges: scanExchanges,
+        segments: segmentMode === 'EQ+FUT' ? ['EQ', 'FUT'] : [segmentMode],
         timeframe,
         backend: indicatorBackend,
         as_of_date: scanDateMode === 'as_of' ? asOfDate : undefined,
@@ -252,6 +260,7 @@ export function CreateScannerView({
       setColumns(Array.isArray(body.columns) ? body.columns : []);
       setScannedAt(body.generated_at_ist || body.as_of_date || new Date().toISOString());
       setTotalScanned(body.total_scanned ?? body.symbols_scanned ?? body.scanned_count);
+      setOptionsNotice(typeof body.options_excluded_notice === 'string' ? body.options_excluded_notice : '');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Scan failed.');
       setRows([]);
@@ -458,6 +467,18 @@ export function CreateScannerView({
         <div className="flex flex-wrap items-center gap-2">
           <button
             type="button"
+            onClick={() => setShowSrValidationLab((v) => !v)}
+            className={`inline-flex min-h-[36px] items-center gap-1.5 rounded-lg border px-3.5 text-xs font-semibold transition-colors ${
+              showSrValidationLab
+                ? 'border-emerald-600/80 bg-emerald-950/40 text-emerald-300'
+                : 'border-slate-700 bg-[#111827] text-slate-200 hover:border-sky-400'
+            }`}
+          >
+            <BarChart3 className="h-3.5 w-3.5 text-emerald-400" />
+            <span>{showSrValidationLab ? 'Hide S&R Validation' : 'S&R Validation Lab'}</span>
+          </button>
+          <button
+            type="button"
             onClick={onNavigateDiscover}
             className="inline-flex min-h-[36px] items-center gap-1.5 rounded-lg border border-slate-700 bg-[#111827] px-3.5 text-xs font-semibold text-slate-200 hover:border-sky-400"
           >
@@ -621,6 +642,62 @@ export function CreateScannerView({
               </div>
             </div>
 
+            {/* Row 2b: Market Segment (EQ / FUT / EQ+FUT) & Exchange Selector for S&R Multi-TF Screening */}
+            {mode === 'python' && selectedPythonId === 'support_resistance' && (
+              <div className="space-y-2 rounded-lg border border-slate-800 bg-[#0b1120]/70 p-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div>
+                    <div className="text-[11px] font-semibold text-slate-300">Market Segment &amp; Exchanges</div>
+                    <div className="text-[10px] text-slate-500">
+                      Option premiums (CE/PE/OPT) are excluded; screen spot equities or active NSE/BSE futures contracts.
+                    </div>
+                  </div>
+                  <div className="flex flex-wrap items-center gap-2">
+                    <div className="inline-flex rounded-md border border-slate-800 bg-[#111827] p-0.5">
+                      {(['EQ', 'FUT', 'EQ+FUT'] as const).map((seg) => (
+                        <button
+                          key={seg}
+                          type="button"
+                          onClick={() => setSegmentMode(seg)}
+                          className={`min-h-[26px] rounded px-2.5 font-mono text-[11px] font-semibold ${
+                            segmentMode === seg
+                              ? 'bg-sky-500 text-slate-950'
+                              : 'text-slate-400 hover:text-slate-100'
+                          }`}
+                        >
+                          {seg}
+                        </button>
+                      ))}
+                    </div>
+                    <div className="flex items-center gap-1">
+                      {(['NSE', 'BSE'] as const).map((ex) => {
+                        const active = scanExchanges.includes(ex);
+                        return (
+                          <button
+                            key={ex}
+                            type="button"
+                            onClick={() => {
+                              const next = active
+                                ? scanExchanges.filter((x) => x !== ex)
+                                : [...scanExchanges, ex];
+                              setScanExchanges(next.length > 0 ? next : ['NSE']);
+                            }}
+                            className={`min-h-[26px] rounded border px-2 font-mono text-[11px] font-semibold ${
+                              active
+                                ? 'border-sky-500/70 bg-sky-500/15 text-sky-300'
+                                : 'border-slate-700 bg-[#111827] text-slate-400 hover:text-slate-200'
+                            }`}
+                          >
+                            {ex}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
+
             {/* Row 3: Addition #1 — Basic / Advance / Python (.py) Condition Builder */}
             <div className="border-t border-slate-800 pt-4">
               <StreakConditionBuilder
@@ -711,7 +788,12 @@ export function CreateScannerView({
         </div>
 
         {/* Right Results Table Card */}
-        <div className="xl:col-span-7">
+        <div className="space-y-3 xl:col-span-7">
+          {optionsNotice && (
+            <div className="rounded-lg border border-slate-800 bg-[#0b1120] px-3.5 py-2 text-xs text-slate-300">
+              {optionsNotice}
+            </div>
+          )}
           <ScannerResultsTable
             rows={rows}
             columns={columns}
@@ -728,6 +810,24 @@ export function CreateScannerView({
           />
         </div>
       </div>
+
+      {/* Statistical S&R Event Validation Lab (accessible directly from Scanner workspace) */}
+      {showSrValidationLab && (
+        <SRValidationLab
+          defaultSymbols={
+            scanOnKey === 'custom'
+              ? customSymbolsText
+                  .split(/[\s,]+/)
+                  .map((s) => s.trim().toUpperCase())
+                  .filter(Boolean)
+              : undefined
+          }
+          defaultUniverse={scanOnKey.startsWith('universe:') ? scanOnKey.slice(9) : 'CUSTOM'}
+          defaultExchange={scanExchanges[0] || 'NSE'}
+          defaultTimeframe={timeframe}
+          defaultParams={mode === 'python' ? pythonParams : undefined}
+        />
+      )}
 
       {/* My Scanners Modal */}
       {myScannersOpen && (

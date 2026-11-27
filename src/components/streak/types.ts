@@ -37,6 +37,11 @@ export interface VisualOperandSpec {
   offset?: number;
   value?: number;
   expr?: string;
+  left_bars?: number;
+  right_bars?: number;
+  cluster_atr_multiplier?: number;
+  min_strength?: number;
+  htf_confluence?: boolean;
 }
 
 export interface VisualCondition {
@@ -502,6 +507,109 @@ export interface DeploymentsPayload {
   pending_alerts: ActionableAlert[];
   kill_switch: { engaged: boolean; reason?: string };
   generated_at_ist: string;
+}
+
+export interface SRZoneSpan {
+  zone_id: string;
+  level_type: 'Support' | 'Resistance' | 'support' | 'resistance';
+  zone_low: number;
+  zone_high: number;
+  representative_price: number;
+  start_bar_index: number;
+  start_ts: string;
+  end_bar_index: number;
+  end_ts: string;
+  peak_strength: number;
+  final_strength: number;
+  classification: 'Major' | 'Minor' | 'Weak';
+  touches: number;
+  reactions: number;
+  confluence_count: number;
+  confluence_timeframes: string[];
+  status: string;
+  timeframe: string;
+}
+
+export interface SRValidationBucket {
+  count: number;
+  success_rate_pct: number;
+  avg_mfe_atr: number;
+  avg_mae_atr: number;
+  avg_mfe_pct: number;
+  avg_mae_pct: number;
+  avg_return_pct: number;
+  edge_ratio: number;
+  avg_reaction_bars: number | null;
+}
+
+export interface SRValidationEventRow extends SRValidationBucket {
+  event: string;
+}
+
+export interface SRValidationTierRow extends SRValidationBucket {
+  tier: string;
+}
+
+export interface SRValidationRegimeRow extends SRValidationBucket {
+  regime: string;
+}
+
+export interface SRValidationHorizonRow extends SRValidationBucket {
+  horizon_bars: number;
+}
+
+export interface SRValidationSummary {
+  total_events: number;
+  overall_success_rate_pct: number;
+  bounce_success_rate_pct: number;
+  bounce_count: number;
+  rejection_success_rate_pct: number;
+  rejection_count: number;
+  breakout_success_rate_pct: number;
+  breakout_count: number;
+  retest_success_rate_pct: number;
+  retest_count: number;
+  false_breakout_rate_pct: number;
+  avg_mfe_atr: number;
+  avg_mae_atr: number;
+  avg_mfe_pct: number;
+  avg_mae_pct: number;
+  edge_ratio: number;
+  avg_reaction_bars: number | null;
+}
+
+export interface SRValidationBaselineRow extends SRValidationBucket {
+  id: string;
+  label: string;
+  lift_vs_baseline_pp: number;
+  edge_ratio_lift: number;
+}
+
+export interface SRValidationReport {
+  ok: boolean;
+  timeframe: string;
+  canonical_timeframe?: string;
+  exchange?: string;
+  universe?: string;
+  universe_label?: string;
+  from_date?: string;
+  to_date?: string;
+  provider?: string;
+  symbols_evaluated: string[];
+  symbol_count: number;
+  total_bars_analyzed: number;
+  horizons: number[];
+  primary_horizon_bars: number;
+  htf_confluence: boolean;
+  weights: Record<string, number>;
+  summary: SRValidationSummary;
+  by_event: SRValidationEventRow[];
+  by_strength_tier: SRValidationTierRow[];
+  by_regime: SRValidationRegimeRow[];
+  by_horizon: SRValidationHorizonRow[];
+  baselines: SRValidationBaselineRow[];
+  missing_symbols?: Array<{ symbol: string; reason: string }>;
+  generated_at_ist?: string;
 }
 
 export type PlatformNavId =

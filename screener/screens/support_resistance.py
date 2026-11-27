@@ -176,10 +176,19 @@ class SupportResistanceScreen(BaseScreen):
             step=0.10,
             description="Relative volume threshold vs time-of-day / rolling baseline for confirmation.",
         ),
+        ParamSpec("weight_touches", "Weight: Touches", "float", 20.0, min_val=0.0, max_val=100.0, step=1.0, description="Scoring weight for independent touches (normalized to sum 100)."),
+        ParamSpec("weight_reactions", "Weight: Reactions", "float", 20.0, min_val=0.0, max_val=100.0, step=1.0, description="Scoring weight for successful bounces/rejections."),
+        ParamSpec("weight_volume", "Weight: Volume", "float", 15.0, min_val=0.0, max_val=100.0, step=1.0, description="Scoring weight for historical relative volume around zone."),
+        ParamSpec("weight_recency", "Weight: Recency", "float", 10.0, min_val=0.0, max_val=100.0, step=1.0, description="Scoring weight for recency of last zone interaction."),
+        ParamSpec("weight_age", "Weight: Age / Span", "float", 10.0, min_val=0.0, max_val=100.0, step=1.0, description="Scoring weight for zone durability / time since formation."),
+        ParamSpec("weight_confluence", "Weight: HTF Confluence", "float", 15.0, min_val=0.0, max_val=100.0, step=1.0, description="Scoring weight for higher-timeframe overlapping confluence."),
+        ParamSpec("weight_reversal", "Weight: Reversal Quality", "float", 10.0, min_val=0.0, max_val=100.0, step=1.0, description="Scoring weight for average post-touch reversal magnitude (MFE/ATR)."),
     ]
 
     columns = [
+        ColumnSpec("rank_tier", "Priority Tier", "number", 0, "right"),
         ColumnSpec("exchange", "Exchange", "text", 0, "left"),
+        ColumnSpec("instrument_category", "Segment", "text", 0, "left"),
         ColumnSpec("fno_eligible", "F&O Eligible", "badge", 0, "left"),
         ColumnSpec("timeframe", "Timeframe", "text", 0, "left"),
         ColumnSpec("event", "Event", "badge", 0, "left"),
@@ -226,6 +235,10 @@ class SupportResistanceScreen(BaseScreen):
         as_of_date: Optional[str] = None,
         fno_eligible: bool = False,
         api_calls: int = 0,
+        instrument_category: str = "EQ",
+        contract_expiry: str = "",
+        data_source: str = "",
+        adjustment_basis: str = "split_adjusted",
     ) -> Dict[str, Any]:
         return evaluate_symbol_mtf(
             symbol=symbol,
@@ -236,6 +249,10 @@ class SupportResistanceScreen(BaseScreen):
             fno_eligible=fno_eligible,
             api_calls=api_calls,
             include_weak=False,
+            instrument_category=instrument_category,
+            contract_expiry=contract_expiry,
+            data_source=data_source,
+            adjustment_basis=adjustment_basis,
         )
 
     def evaluate(

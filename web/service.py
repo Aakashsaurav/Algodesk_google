@@ -878,6 +878,8 @@ class BrokerHubService:
         basket_id: Optional[str] = None,
         universe: str = "CUSTOM",
         exchange: str = "NSE",
+        exchanges: Optional[List[str]] = None,
+        segments: Optional[List[str]] = None,
         timeframe: str = "1day",
         timeframes: Optional[List[str]] = None,
         lookback_days: Optional[int] = None,
@@ -907,6 +909,8 @@ class BrokerHubService:
             "as_of_date": as_of_date or "LATEST",
             "provider": eff_provider,
             "exchange": exchange,
+            "exchanges": exchanges,
+            "segments": segments,
             "timeframe": ",".join(timeframes) if timeframes else timeframe,
         }
 
@@ -915,6 +919,8 @@ class BrokerHubService:
                 symbols=eff_symbols,
                 universe=eff_universe,
                 exchange=exchange,
+                exchanges=exchanges,
+                segments=segments,
                 timeframe=timeframe,
                 timeframes=timeframes,
                 lookback_days=lookback_days,
@@ -934,6 +940,132 @@ class BrokerHubService:
 
         job = analytics_job_runner.run_sync("screener", meta, _task)
         return {"ok": True, "async": False, "job": job, **(job["result"] or {})}
+
+    def run_sr_validation(
+        self,
+        *,
+        symbols: Optional[List[str]] = None,
+        basket_id: Optional[str] = None,
+        universe: str = "CUSTOM",
+        exchange: str = "NSE",
+        timeframe: str = "1day",
+        from_date: Optional[str] = None,
+        to_date: Optional[str] = None,
+        horizons: Optional[List[int]] = None,
+        primary_horizon: int = 10,
+        htf_confluence: bool = False,
+        params: Optional[Dict[str, Any]] = None,
+        provider: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Run statistical S&R event validation (bounce, rejection, breakout, retest, MFE/MAE & 4 baselines)."""
+        from datetime import timedelta
+
+        from core.historical import normalize_timeframe
+        from screener.sr_engine import slice_candles_as_of
+        from screener.sr_validation import evaluate_sr_validation
+        from screener.universes import universe_resolver
+
+        sel = self._store.load()
+        eff_provider = (provider or sel.get("data_connection") or "yfinance").strip().lower()
+        eff_exch = (exchange or "NSE").strip().upper()
+        tf = normalize_timeframe(timeframe or "1day")
+
+        today_ist = datetime.now(tz=IST_TZ).date()
+        end_str = (to_date or "").strip() or today_ist.isoformat()
+        start_str = (from_date or "").strip() or (today_ist - timedelta(days=540)).isoformat()
+
+        eff_symbols = symbols
+        eff_universe = (universe or "CUSTOM").strip().upper()
+        if basket_id:
+            b = basket_store.get(basket_id)
+            if b and b.get("symbols"):
+                eff_symbols = list(b["symbols"])
+                eff_universe = "CUSTOM"
+
+        if eff_symbols and len(eff_symbols) > 0:
+            clean_syms = [str(s).strip().upper() for s in eff_symbols if str(s or "").strip()]
+            uni_label = "Custom Symbols"
+        elif eff_universe and eff_universe != "CUSTOM":
+            bundle = universe_resolver.resolve(
+                universe=eff_universe,
+                custom_symbols=None,
+                exchange=eff_exch,
+                timeframe=tf,
+            )
+            clean_syms = list(bundle.get("symbols") or [])
+            uni_label = str(bundle.get("label") or eff_universe)
+        else:
+            clean_syms = ["RELIANCE", "TCS", "INFY", "HDFCBANK", "ICICIBANK"]
+            uni_label = "Default Watchlist"
+
+        # Cap to keep statistical validation responsive
+        clean_syms = clean_syms[:25]
+        if not clean_syms:
+            raise ValueError("At least one symbol is required for S&R statistical validation.")
+
+        candles_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
+        missing_symbols: List[Dict[str, str]] = []
+        total_api_calls = 0
+
+        for sym in clean_syms:
+            try:
+                dl_meta = historical_data_manager.download(
+                    symbol=sym,
+                    exchange=eff_exch,
+                    timeframe=tf,
+                    from_date=start_str,
+                    to_date=end_str,
+                    provider=eff_provider,
+                )
+                total_api_calls += int(dl_meta.get("api_calls_made", 0))
+                rec = historical_data_manager.get_records(
+                    symbol=dl_meta["symbol"],
+                    exchange=dl_meta["exchange"],
+                    timeframe=dl_meta["timeframe"],
+                    from_date=start_str,
+                    to_date=end_str,
+                    view="full",
+                )
+                rows = slice_candles_as_of(rec.get("rows", []), end_str)
+                if len(rows) < 40:
+                    missing_symbols.append(
+                        {
+                            "symbol": dl_meta["symbol"],
+                            "reason": f"Insufficient bars ({len(rows)} < 40) between {start_str} and {end_str}.",
+                        }
+                    )
+                    continue
+                candles_by_symbol[dl_meta["symbol"]] = rows
+            except Exception as exc:
+                missing_symbols.append({"symbol": sym, "reason": str(exc)})
+
+        if not candles_by_symbol:
+            detail = missing_symbols[0]["reason"] if missing_symbols else "No historical OHLCV bars available."
+            raise ValueError(f"S&R validation could not load candles: {detail}")
+
+        eff_horizons = [int(h) for h in (horizons or [5, 10, 20]) if int(h) >= 1][:5]
+        if not eff_horizons:
+            eff_horizons = [5, 10, 20]
+
+        report = evaluate_sr_validation(
+            candles_by_symbol=candles_by_symbol,
+            timeframe=tf,
+            exchange=eff_exch,
+            params=params or {},
+            horizons=eff_horizons,
+            primary_horizon=int(primary_horizon or eff_horizons[len(eff_horizons) // 2]),
+            htf_confluence=bool(htf_confluence),
+        )
+        report["universe"] = eff_universe
+        report["universe_label"] = uni_label
+        report["exchange"] = eff_exch
+        report["from_date"] = start_str
+        report["to_date"] = end_str
+        report["provider"] = eff_provider
+        report["api_calls_made"] = total_api_calls
+        report["missing_symbols"] = missing_symbols
+        report["generated_at_ist"] = datetime.now(tz=IST_TZ).isoformat(timespec="seconds")
+        return report
 
     def run_backtest(
         self,

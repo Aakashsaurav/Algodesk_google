@@ -852,6 +852,79 @@ class IndicatorToolkit:
             self._cache["vcp"] = compute_vcp_metrics(self.candles)
         return self._cache["vcp"]
 
+    def support_resistance(
+        self,
+        *,
+        left_bars: int = 5,
+        right_bars: int = 5,
+        atr_period: int = 14,
+        cluster_atr_multiplier: float = 0.50,
+        cluster_min_pct: float = 0.25,
+        min_strength: float = 40.0,
+        major_strength: float = 70.0,
+        htf_confluence: bool = False,
+        timeframe: Optional[str] = None,
+        extra_params: Optional[Dict[str, Any]] = None,
+        record_overlays: bool = True,
+    ) -> Dict[str, Any]:
+        """
+        Compute & cache strictly-causal bar-by-bar Support & Resistance series
+        plus active zone spans for chart overlays.
+        """
+        from screener.sr_engine import compute_causal_sr_series
+
+        extra_key = tuple(sorted((extra_params or {}).items()))
+        key = (
+            "support_resistance",
+            int(left_bars),
+            int(right_bars),
+            int(atr_period),
+            round(float(cluster_atr_multiplier), 4),
+            round(float(cluster_min_pct), 4),
+            round(float(min_strength), 2),
+            round(float(major_strength), 2),
+            bool(htf_confluence),
+            str(timeframe or ""),
+            extra_key,
+        )
+        if key not in self._cache:
+            merged_params: Dict[str, Any] = {
+                "left_bars": int(left_bars),
+                "right_bars": int(right_bars),
+                "atr_period": int(atr_period),
+                "cluster_atr_multiplier": float(cluster_atr_multiplier),
+                "cluster_min_pct": float(cluster_min_pct),
+                "minor_strength": float(min_strength),
+                "major_strength": float(major_strength),
+                "htf_confluence": bool(htf_confluence),
+                **(extra_params or {}),
+            }
+            res = compute_causal_sr_series(
+                self.candles,
+                timeframe=timeframe,
+                params=merged_params,
+                htf_confluence=bool(htf_confluence),
+                min_strength=float(min_strength),
+                collect_events=True,
+                collect_spans=True,
+            )
+            self._cache[key] = res
+            spans = res.get("zone_spans") or []
+            if spans:
+                self._cache["_last_sr_zone_spans"] = spans
+            if record_overlays:
+                suffix = f"({left_bars},{right_bars})"
+                self._record_series(f"SR_Support{suffix}", res["sr_nearest_support"])
+                self._record_series(f"SR_Resistance{suffix}", res["sr_nearest_resistance"])
+                self._record_series(f"SR_Support_Strength{suffix}", res["sr_support_strength"])
+                self._record_series(f"SR_Resistance_Strength{suffix}", res["sr_resistance_strength"])
+        return self._cache[key]
+
+    def get_sr_zone_spans(self) -> List[Dict[str, Any]]:
+        """Return active S&R horizontal zone spans collected during indicator evaluation."""
+        spans = self._cache.get("_last_sr_zone_spans")
+        return list(spans) if isinstance(spans, list) else []
+
 
 __all__ = [
     "IndicatorToolkit",

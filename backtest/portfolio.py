@@ -252,12 +252,14 @@ class PortfolioBacktestEngine:
                             writer.writerow([r.get("symbol", "") if h == "trading_symbol" else r.get(h, "") for h in headers])
                     symbol_files[sym_k.upper()] = csv_path.name
 
+                sr_zones_by_sym = bundle.get("sr_zones_by_symbol") or {}
                 meta = {
                     "run_id": safe_id,
                     "strategy": strategy_name,
                     "indicator_columns": ind_cols,
                     "headers": headers,
                     "symbol_files": symbol_files,
+                    "sr_zones_by_symbol": sr_zones_by_sym,
                 }
                 (run_dir / "meta.json").write_text(json.dumps(meta), encoding="utf-8")
                 self._export_cache[safe_id] = meta
@@ -424,6 +426,22 @@ class PortfolioBacktestEngine:
         if "macd_hist" in base_norm or base_norm.startswith("macdhist"):
             return {"pane": "oscillator", "kind": "histogram", "levels": [0.0]}
 
+        # Support & Resistance causal indicator series classification
+        sr_overlay_prefixes = (
+            "sr_support(", "sr_resistance(", "sr_sup(", "sr_res(",
+            "sr_nearest_support", "sr_nearest_resistance",
+            "sr_support_low", "sr_support_high",
+            "sr_resistance_low", "sr_resistance_high",
+        )
+        if any(base_norm.startswith(p) for p in sr_overlay_prefixes):
+            return {"pane": "overlay", "kind": "line", "levels": []}
+
+        if base_norm.startswith(("sr_support_strength", "sr_resistance_strength", "sr_sup_str", "sr_res_str")):
+            return {"pane": "oscillator", "kind": "line", "levels": [40.0, 70.0]}
+
+        if base_norm.startswith("sr_"):
+            return {"pane": "oscillator", "kind": "line", "levels": [0.0]}
+
         osc_prefixes = (
             "rsi", "macd", "adx", "plus_di", "minus_di", "stoch", "atr",
             "roc", "cci", "mfi", "williams", "willr", "obv", "cmf", "aroon",
@@ -571,6 +589,9 @@ class PortfolioBacktestEngine:
                 }
             )
 
+        sr_zones_map = meta.get("sr_zones_by_symbol") or {}
+        sr_zones = list(sr_zones_map.get(clean_sym) or [])
+
         return {
             "ok": True,
             "run_id": safe_id,
@@ -579,6 +600,7 @@ class PortfolioBacktestEngine:
             "bars": bars,
             "indicators": indicators,
             "indicator_columns": [ind["id"] for ind in indicators],
+            "sr_zones": sr_zones,
         }
 
     def _save_run_snapshot(self, result: Dict[str, Any]) -> None:
@@ -870,6 +892,7 @@ class PortfolioBacktestEngine:
 
         curve_by_date: Dict[str, List[float]] = {}
         export_by_symbol: Dict[str, List[Dict[str, Any]]] = {}
+        export_sr_zones: Dict[str, List[Dict[str, Any]]] = {}
         export_ind_cols: List[str] = []
 
         for idx, sym in enumerate(symbols):
@@ -909,6 +932,8 @@ class PortfolioBacktestEngine:
                 exp = res.pop("_export", None)
                 if exp:
                     export_by_symbol[res["symbol"]] = exp.get("rows") or []
+                    if exp.get("sr_zones"):
+                        export_sr_zones[res["symbol"]] = list(exp.get("sr_zones") or [])
                     for col_name in exp.get("indicator_columns") or []:
                         if col_name not in export_ind_cols:
                             export_ind_cols.append(col_name)
@@ -966,6 +991,7 @@ class PortfolioBacktestEngine:
                 "strategy": strategy_id,
                 "indicator_columns": export_ind_cols,
                 "by_symbol": export_by_symbol,
+                "sr_zones_by_symbol": export_sr_zones,
             },
         )
 
@@ -1178,6 +1204,7 @@ class PortfolioBacktestEngine:
                 tk = IndicatorToolkit(rows, backend=backend)
                 strat_inst.prepare(rows, params, tk)
                 ind_map = collect_strategy_indicators(strat_inst, tk, len(rows))
+                sr_zones_for_sym = tk.get_sr_zone_spans() if hasattr(tk, "get_sr_zone_spans") else []
                 for col_name in ind_map.keys():
                     if col_name not in export_ind_cols:
                         export_ind_cols.append(col_name)
@@ -1219,6 +1246,7 @@ class PortfolioBacktestEngine:
                     "bar_by_ts": bar_by_ts,
                     "export_rows": export_rows,
                     "last_close": float(rows[0]["close"]),
+                    "sr_zones": sr_zones_for_sym,
                 }
             except JobCancelledError:
                 raise
@@ -1543,6 +1571,11 @@ class PortfolioBacktestEngine:
                 "strategy": strategy_id,
                 "indicator_columns": export_ind_cols,
                 "by_symbol": {s: sym_series[s]["export_rows"] for s in active_syms},
+                "sr_zones_by_symbol": {
+                    s: sym_series[s].get("sr_zones") or []
+                    for s in active_syms
+                    if sym_series[s].get("sr_zones")
+                },
             },
         )
 

@@ -13,8 +13,10 @@ import {
   Rocket,
   X,
 } from 'lucide-react';
+import { BarChart3 } from 'lucide-react';
 import { CandlestickChartPanel } from './CandlestickChartPanel';
 import { PortfolioPnlChart } from './PortfolioPnlChart';
+import { SRValidationLab } from './SRValidationLab';
 import type { QuickOrderTarget } from './QuickOrderModal';
 import type { BacktestFullResult, BacktestTradeRow } from './types';
 import { fetchSecurityStatus, type SecurityStatus } from '../../utils/authClient';
@@ -176,6 +178,13 @@ export function BacktestResultsView({
   const [showChargesBreakdown, setShowChargesBreakdown] = useState<boolean>(false);
   const [showAllTrades, setShowAllTrades] = useState<boolean>(false);
   const [selectedYear, setSelectedYear] = useState<string>('ALL');
+  const isSrStrategy = useMemo(
+    () =>
+      (result.strategy || '').includes('support_resistance') ||
+      (result.indicator_columns || []).some((c) => c.toUpperCase().startsWith('SR_')),
+    [result.strategy, result.indicator_columns]
+  );
+  const [showSrValidation, setShowSrValidation] = useState<boolean>(false);
 
   // Deploy modal state
   const [deployOpen, setDeployOpen] = useState(false);
@@ -396,6 +405,18 @@ export function BacktestResultsView({
               <span>Copy Strategy</span>
             </button>
           )}
+          <button
+            type="button"
+            onClick={() => setShowSrValidation((v) => !v)}
+            className={`inline-flex min-h-[36px] items-center gap-1.5 rounded-lg border px-3.5 text-xs font-semibold transition-colors ${
+              showSrValidation || isSrStrategy
+                ? 'border-emerald-700/70 bg-emerald-950/30 text-emerald-300 hover:border-emerald-400'
+                : 'border-slate-700 bg-[#111827] text-slate-300 hover:border-sky-400 hover:text-sky-300'
+            }`}
+          >
+            <BarChart3 className="h-3.5 w-3.5" />
+            <span>{showSrValidation ? 'Hide S&R Validation' : 'S&R Validation Lab'}</span>
+          </button>
           <button
             type="button"
             onClick={() => setDeployOpen(true)}
@@ -915,6 +936,19 @@ export function BacktestResultsView({
             tradeSeries={activeStats.cumSeries}
             totalPnl={activeStats.totalPnl}
           />
+
+          {/* Statistical Support & Resistance Event Validation Report */}
+          {(showSrValidation || isSrStrategy) && (
+            <SRValidationLab
+              defaultSymbols={result.symbols}
+              defaultExchange={result.deploy_spec?.exchange || 'NSE'}
+              defaultTimeframe={result.timeframe || '1day'}
+              defaultFromDate={result.from_date}
+              defaultToDate={result.to_date}
+              defaultParams={result.deploy_spec?.params}
+              compact
+            />
+          )}
         </div>
       </div>
 

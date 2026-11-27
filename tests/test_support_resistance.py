@@ -462,7 +462,7 @@ class TestSupportResistanceScanner(unittest.TestCase):
         self.assertTrue(meta["supports_multi_timeframe"])
         self.assertEqual(meta["default_timeframes"], ["5minute", "15minute", "60minute", "1day", "1week"])
         param_names = [p["name"] for p in meta["params"]]
-        expected_14 = [
+        expected_21 = [
             "left_bars",
             "right_bars",
             "min_pivot_separation",
@@ -477,8 +477,15 @@ class TestSupportResistanceScanner(unittest.TestCase):
             "reversal_distance_atr",
             "retest_tolerance_atr",
             "relative_volume_threshold",
+            "weight_touches",
+            "weight_reactions",
+            "weight_volume",
+            "weight_recency",
+            "weight_age",
+            "weight_confluence",
+            "weight_reversal",
         ]
-        self.assertEqual(param_names, expected_14)
+        self.assertEqual(param_names, expected_21)
 
         with tempfile.TemporaryDirectory() as tmp:
             hm = HistoricalDataManager(

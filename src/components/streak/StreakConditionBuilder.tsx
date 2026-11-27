@@ -106,7 +106,61 @@ const PREBUILT_SETUPS: PrebuiltSetup[] = [
     glyph: 'vol',
     condition: { left: { type: 'volume', offset: 0 }, operator: '>', right: { type: 'vol_sma', period: 20, multiplier: 1.5, offset: 0 }, enabled: true },
   },
+  {
+    id: 'sr_breakout',
+    label: 'S&R Breakout',
+    glyph: 'band',
+    condition: {
+      left: { type: 'sr_resistance_breakout', left_bars: 5, right_bars: 5, cluster_atr_multiplier: 0.75, min_strength: 40, offset: 0 },
+      operator: '==',
+      right: { type: 'number', value: 1 },
+      enabled: true,
+    },
+  },
+  {
+    id: 'sr_bounce',
+    label: 'S&R Bounce',
+    glyph: 'band',
+    condition: {
+      left: { type: 'sr_support_bounce', left_bars: 5, right_bars: 5, cluster_atr_multiplier: 0.75, min_strength: 40, offset: 0 },
+      operator: '==',
+      right: { type: 'number', value: 1 },
+      enabled: true,
+    },
+  },
 ];
+
+const SR_EVENT_FLAG_IDS = new Set([
+  'sr_near_support',
+  'sr_near_resistance',
+  'sr_support_bounce',
+  'sr_resistance_rejection',
+  'sr_resistance_breakout',
+  'sr_support_breakdown',
+  'sr_breakout_retest',
+  'sr_breakdown_retest',
+  'sr_false_breakout',
+]);
+
+const SR_WEIGHT_KEYS = [
+  'weight_touches',
+  'weight_reactions',
+  'weight_volume',
+  'weight_recency',
+  'weight_age',
+  'weight_confluence',
+  'weight_reversal',
+] as const;
+
+const SR_DEFAULT_WEIGHTS: Record<string, number> = {
+  weight_touches: 20,
+  weight_reactions: 20,
+  weight_volume: 15,
+  weight_recency: 10,
+  weight_age: 10,
+  weight_confluence: 15,
+  weight_reversal: 10,
+};
 
 const DEFAULT_OPERANDS: OperandOption[] = [
   { id: 'close', label: 'Close', kind: 'price', default_period: null },
@@ -422,6 +476,7 @@ export function StreakConditionBuilder({
     if (!cur || isConditionGroup(cur)) return;
     const prevSide = cur[side] || { type: 'close' };
     let nextSide: VisualOperandSpec = { ...prevSide, ...patch };
+    let extraCondPatch: Partial<VisualCondition> = {};
     if (patch.type && patch.type !== prevSide.type) {
       const meta = opList.find((o) => o.id === patch.type);
       if (patch.type === 'formula') {
@@ -433,13 +488,26 @@ export function StreakConditionBuilder({
         };
       } else if (patch.type === 'number') {
         nextSide = { type: 'number', value: prevSide.value ?? 50 };
+      } else if (patch.type.startsWith('sr_')) {
+        nextSide = {
+          type: patch.type,
+          left_bars: prevSide.left_bars ?? 5,
+          right_bars: prevSide.right_bars ?? 5,
+          cluster_atr_multiplier: prevSide.cluster_atr_multiplier ?? 0.75,
+          min_strength: prevSide.min_strength ?? 40,
+          htf_confluence: prevSide.htf_confluence ?? false,
+          offset: prevSide.offset ?? 0,
+        };
+        if (side === 'left' && SR_EVENT_FLAG_IDS.has(patch.type)) {
+          extraCondPatch = { operator: '==', right: { type: 'number', value: 1 } };
+        }
       } else if (meta?.default_period) {
         nextSide = { type: patch.type, period: meta.default_period, offset: prevSide.offset ?? 0 };
       } else {
         nextSide = { type: patch.type, offset: prevSide.offset ?? 0 };
       }
     }
-    updateConditionAt(idx, { [side]: nextSide });
+    updateConditionAt(idx, { [side]: nextSide, ...extraCondPatch });
   };
 
   const removeNodeAt = (idx: number) => {
@@ -598,18 +666,43 @@ export function StreakConditionBuilder({
       );
     }
 
+    const isSr = safeSpec.type.startsWith('sr_') || meta?.kind === 'sr';
+    const priceOps = opList.filter((o) => o.kind === 'price' || o.kind === 'volume' || o.kind === 'constant');
+    const srOps = opList.filter((o) => o.kind === 'sr' || o.id.startsWith('sr_'));
+    const indOps = opList.filter(
+      (o) => !priceOps.includes(o) && !srOps.includes(o)
+    );
+
     return (
       <div className={`flex flex-wrap items-center gap-1.5 ${compact ? '' : 'flex-1'}`}>
         <select
           value={safeSpec.type}
           onChange={(e) => onChange({ type: e.target.value })}
-          className="min-h-[34px] min-w-[112px] flex-1 rounded-md border border-slate-700 bg-[#0b1120] px-2 text-xs font-medium text-slate-100 focus:border-sky-400 focus:outline-none"
+          className="min-h-[34px] min-w-[128px] flex-1 rounded-md border border-slate-700 bg-[#0b1120] px-2 text-xs font-medium text-slate-100 focus:border-sky-400 focus:outline-none"
         >
-          {opList.map((op) => (
-            <option key={op.id} value={op.id}>
-              {op.label}
-            </option>
-          ))}
+          <optgroup label="Price, Volume & Constants">
+            {priceOps.map((op) => (
+              <option key={op.id} value={op.id}>
+                {op.label}
+              </option>
+            ))}
+          </optgroup>
+          {srOps.length > 0 && (
+            <optgroup label="Support & Resistance (Causal)">
+              {srOps.map((op) => (
+                <option key={op.id} value={op.id}>
+                  {op.label}
+                </option>
+              ))}
+            </optgroup>
+          )}
+          <optgroup label="Technical Indicators">
+            {indOps.map((op) => (
+              <option key={op.id} value={op.id}>
+                {op.label}
+              </option>
+            ))}
+          </optgroup>
           {allowFormula && <option value="formula">Formula (Math Expr)</option>}
         </select>
         {isNum ? (
@@ -621,6 +714,74 @@ export function StreakConditionBuilder({
             aria-label="Constant value"
             className="min-h-[34px] w-20 rounded-md border border-slate-700 bg-[#0b1120] px-2 font-mono text-xs text-slate-100 tabular-nums focus:border-sky-400 focus:outline-none"
           />
+        ) : isSr ? (
+          <div className="flex flex-wrap items-center gap-1">
+            <label className="inline-flex items-center gap-1 rounded border border-slate-800 bg-[#0b1120] px-1.5 py-0.5 text-[10px] text-slate-400" title="Pivot Left/Right Bars">
+              <span>L/R</span>
+              <input
+                type="number"
+                min={2}
+                max={20}
+                value={safeSpec.left_bars ?? 5}
+                onChange={(e) => {
+                  const v = Math.max(2, Math.min(20, Number(e.target.value) || 5));
+                  onChange({ left_bars: v, right_bars: v });
+                }}
+                aria-label="S&R pivot window"
+                className="w-9 bg-transparent font-mono text-[11px] text-slate-100 tabular-nums focus:outline-none"
+              />
+            </label>
+            <label className="inline-flex items-center gap-1 rounded border border-slate-800 bg-[#0b1120] px-1.5 py-0.5 text-[10px] text-slate-400" title="Cluster ATR Multiplier">
+              <span>ATR×</span>
+              <input
+                type="number"
+                min={0.2}
+                max={2.5}
+                step={0.05}
+                value={safeSpec.cluster_atr_multiplier ?? 0.75}
+                onChange={(e) =>
+                  onChange({ cluster_atr_multiplier: Math.max(0.2, Number(e.target.value) || 0.75) })
+                }
+                aria-label="S&R cluster ATR multiplier"
+                className="w-11 bg-transparent font-mono text-[11px] text-slate-100 tabular-nums focus:outline-none"
+              />
+            </label>
+            <label className="inline-flex items-center gap-1 rounded border border-slate-800 bg-[#0b1120] px-1.5 py-0.5 text-[10px] text-slate-400" title="Minimum Zone Strength (0-100)">
+              <span>Str≥</span>
+              <input
+                type="number"
+                min={0}
+                max={95}
+                step={5}
+                value={safeSpec.min_strength ?? 40}
+                onChange={(e) =>
+                  onChange({ min_strength: Math.max(0, Math.min(95, Number(e.target.value) || 0)) })
+                }
+                aria-label="S&R minimum zone strength"
+                className="w-10 bg-transparent font-mono text-[11px] text-slate-100 tabular-nums focus:outline-none"
+              />
+            </label>
+            <label className="inline-flex cursor-pointer items-center gap-1 rounded border border-slate-800 bg-[#0b1120] px-1.5 py-1 text-[10px] text-sky-300" title="Enable completed-bar Higher-Timeframe confluence">
+              <input
+                type="checkbox"
+                checked={Boolean(safeSpec.htf_confluence)}
+                onChange={(e) => onChange({ htf_confluence: e.target.checked })}
+                className="h-3 w-3 accent-sky-400"
+              />
+              <span>HTF</span>
+            </label>
+            <select
+              value={String(safeSpec.offset ?? 0)}
+              onChange={(e) => onChange({ offset: Number(e.target.value) })}
+              title="Candle offset (0 = current, -1 = previous)"
+              aria-label="Candle offset"
+              className="min-h-[30px] w-13 rounded-md border border-slate-700 bg-[#0b1120] px-1 font-mono text-[11px] text-slate-300 focus:border-sky-400 focus:outline-none"
+            >
+              <option value="0">(0)</option>
+              <option value="-1">(-1)</option>
+              <option value="-2">(-2)</option>
+            </select>
+          </div>
         ) : (
           <>
             {needsPeriod && (
@@ -1368,65 +1529,161 @@ export function StreakConditionBuilder({
             </div>
           )}
 
-          {/* Dynamic ParamSpec controls */}
-          {selectedPlugin && Array.isArray(selectedPlugin.params) && selectedPlugin.params.length > 0 && (
-            <div className="grid grid-cols-1 gap-3 border-t border-slate-800 pt-3 sm:grid-cols-2">
-              {(selectedPlugin.params as ParamSpecMeta[]).map((ps) => {
-                const rawVal = pythonParams[ps.name] ?? ps.default;
-                if (ps.kind === 'bool') {
-                  return (
-                    <label
-                      key={ps.name}
-                      className="flex cursor-pointer items-center gap-2 rounded-lg border border-slate-800 bg-[#111827] px-3 py-2 text-xs text-slate-200"
-                    >
-                      <input
-                        type="checkbox"
-                        checked={Boolean(rawVal)}
-                        onChange={(e) => onPythonParamsChange({ ...pythonParams, [ps.name]: e.target.checked })}
-                        className="h-4 w-4 accent-sky-400"
-                      />
-                      <span>{ps.label}</span>
-                    </label>
-                  );
+          {/* Dynamic ParamSpec controls (with dedicated 7-Component S&R Strength Weights editor when present) */}
+          {selectedPlugin && Array.isArray(selectedPlugin.params) && selectedPlugin.params.length > 0 && (() => {
+            const allParams = selectedPlugin.params as ParamSpecMeta[];
+            const weightParams = allParams.filter((p) =>
+              (SR_WEIGHT_KEYS as readonly string[]).includes(p.name)
+            );
+            const coreParams = allParams.filter(
+              (p) => !(SR_WEIGHT_KEYS as readonly string[]).includes(p.name)
+            );
+            const weightSum = weightParams.reduce(
+              (acc, p) => acc + (Number(pythonParams[p.name] ?? p.default) || 0),
+              0
+            );
+            const handleNormalizeWeights = () => {
+              const total = weightSum > 0 ? weightSum : 100;
+              const patch: Record<string, unknown> = { ...pythonParams };
+              let running = 0;
+              weightParams.forEach((p, i) => {
+                const cur = Number(pythonParams[p.name] ?? p.default) || 0;
+                if (i === weightParams.length - 1) {
+                  patch[p.name] = Math.max(0, Math.round((100 - running) * 10) / 10);
+                } else {
+                  const val = Math.round(((cur / total) * 100) * 10) / 10;
+                  patch[p.name] = val;
+                  running += val;
                 }
-                if (ps.kind === 'choice' && ps.options) {
-                  return (
-                    <div key={ps.name}>
-                      <label className="mb-1 block text-[11px] font-medium text-slate-400">{ps.label}</label>
-                      <select
-                        value={String(rawVal ?? '')}
-                        onChange={(e) => onPythonParamsChange({ ...pythonParams, [ps.name]: e.target.value })}
-                        className="min-h-[36px] w-full rounded-lg border border-slate-700 bg-[#111827] px-2.5 text-xs text-slate-100"
-                      >
-                        {ps.options.map((opt) => (
-                          <option key={opt} value={opt}>{opt}</option>
-                        ))}
-                      </select>
+              });
+              onPythonParamsChange(patch);
+            };
+            const handleResetWeights = () => {
+              onPythonParamsChange({ ...pythonParams, ...SR_DEFAULT_WEIGHTS });
+            };
+
+            return (
+              <div className="space-y-4 border-t border-slate-800 pt-3">
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  {coreParams.map((ps) => {
+                    const rawVal = pythonParams[ps.name] ?? ps.default;
+                    if (ps.kind === 'bool') {
+                      return (
+                        <label
+                          key={ps.name}
+                          className="flex cursor-pointer items-center gap-2 rounded-lg border border-slate-800 bg-[#111827] px-3 py-2 text-xs text-slate-200"
+                        >
+                          <input
+                            type="checkbox"
+                            checked={Boolean(rawVal)}
+                            onChange={(e) => onPythonParamsChange({ ...pythonParams, [ps.name]: e.target.checked })}
+                            className="h-4 w-4 accent-sky-400"
+                          />
+                          <span>{ps.label}</span>
+                        </label>
+                      );
+                    }
+                    if (ps.kind === 'choice' && ps.options) {
+                      return (
+                        <div key={ps.name}>
+                          <label className="mb-1 block text-[11px] font-medium text-slate-400">{ps.label}</label>
+                          <select
+                            value={String(rawVal ?? '')}
+                            onChange={(e) => onPythonParamsChange({ ...pythonParams, [ps.name]: e.target.value })}
+                            className="min-h-[36px] w-full rounded-lg border border-slate-700 bg-[#111827] px-2.5 text-xs text-slate-100"
+                          >
+                            {ps.options.map((opt) => (
+                              <option key={opt} value={opt}>{opt}</option>
+                            ))}
+                          </select>
+                        </div>
+                      );
+                    }
+                    return (
+                      <div key={ps.name}>
+                        <label className="mb-1 block text-[11px] font-medium text-slate-400">{ps.label}</label>
+                        <input
+                          type="number"
+                          min={ps.min}
+                          max={ps.max}
+                          step={ps.step ?? (ps.kind === 'float' ? 0.1 : 1)}
+                          value={String(rawVal ?? '')}
+                          onChange={(e) =>
+                            onPythonParamsChange({
+                              ...pythonParams,
+                              [ps.name]: ps.kind === 'int' ? Number.parseInt(e.target.value, 10) || 0 : Number(e.target.value) || 0,
+                            })
+                          }
+                          className="min-h-[36px] w-full rounded-lg border border-slate-700 bg-[#111827] px-2.5 font-mono text-xs text-slate-100 tabular-nums focus:border-sky-400 focus:outline-none"
+                        />
+                      </div>
+                    );
+                  })}
+                </div>
+
+                {weightParams.length > 0 && (
+                  <div className="space-y-3 rounded-lg border border-slate-800 bg-[#111827] p-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div>
+                        <div className="text-xs font-semibold text-slate-200">
+                          7-Component Zone Strength Weights &amp; Priority Ranking
+                        </div>
+                        <div className="mt-0.5 font-mono text-[10px] text-slate-400">
+                          Total:{' '}
+                          <strong className={Math.abs(weightSum - 100) < 0.2 ? 'text-emerald-400' : 'text-amber-300'}>
+                            {weightSum.toFixed(1)} / 100
+                          </strong>
+                          {' · '}Auto-normalized to 100 at scan time · Ranked Tier 1 (Major BO) → Tier 6
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          type="button"
+                          onClick={handleNormalizeWeights}
+                          className="rounded border border-sky-700/70 bg-sky-950/30 px-2 py-1 text-[11px] font-semibold text-sky-300 hover:border-sky-400"
+                        >
+                          Normalize to 100
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleResetWeights}
+                          className="rounded border border-slate-700 bg-[#0b1120] px-2 py-1 text-[11px] text-slate-300 hover:border-slate-500"
+                        >
+                          Reset Defaults
+                        </button>
+                      </div>
                     </div>
-                  );
-                }
-                return (
-                  <div key={ps.name}>
-                    <label className="mb-1 block text-[11px] font-medium text-slate-400">{ps.label}</label>
-                    <input
-                      type="number"
-                      min={ps.min}
-                      max={ps.max}
-                      step={ps.step ?? (ps.kind === 'float' ? 0.1 : 1)}
-                      value={String(rawVal ?? '')}
-                      onChange={(e) =>
-                        onPythonParamsChange({
-                          ...pythonParams,
-                          [ps.name]: ps.kind === 'int' ? Number.parseInt(e.target.value, 10) || 0 : Number(e.target.value) || 0,
-                        })
-                      }
-                      className="min-h-[36px] w-full rounded-lg border border-slate-700 bg-[#111827] px-2.5 font-mono text-xs text-slate-100 tabular-nums focus:border-sky-400 focus:outline-none"
-                    />
+                    <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-4">
+                      {weightParams.map((ps) => {
+                        const rawVal = pythonParams[ps.name] ?? ps.default;
+                        return (
+                          <div key={ps.name}>
+                            <label className="mb-1 block truncate text-[10px] font-medium text-slate-400" title={ps.help || ps.label}>
+                              {ps.label}
+                            </label>
+                            <input
+                              type="number"
+                              min={0}
+                              max={100}
+                              step={1}
+                              value={String(rawVal ?? '')}
+                              onChange={(e) =>
+                                onPythonParamsChange({
+                                  ...pythonParams,
+                                  [ps.name]: Math.max(0, Number(e.target.value) || 0),
+                                })
+                              }
+                              className="min-h-[32px] w-full rounded-md border border-slate-700 bg-[#0b1120] px-2 font-mono text-xs text-slate-100 tabular-nums focus:border-sky-400 focus:outline-none"
+                            />
+                          </div>
+                        );
+                      })}
+                    </div>
                   </div>
-                );
-              })}
-            </div>
-          )}
+                )}
+              </div>
+            );
+          })()}
 
           {/* Embedded Python File Editor */}
           {pyEditorOpen && (

@@ -931,6 +931,8 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
                         basket_id=body.get("basket_id"),
                         universe=str(body.get("universe", "CUSTOM")),
                         exchange=str(body.get("exchange", "NSE")),
+                        exchanges=body.get("exchanges") if isinstance(body.get("exchanges"), list) else None,
+                        segments=body.get("segments") if isinstance(body.get("segments"), list) else None,
                         timeframe=str(body.get("timeframe", "1day")),
                         timeframes=body.get("timeframes") if isinstance(body.get("timeframes"), list) else None,
                         lookback_days=(
@@ -946,6 +948,32 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
                         provider=body.get("provider"),
                         backend=str(body.get("backend", "auto")),
                         async_job=is_async,
+                    ),
+                )
+                return
+
+            if path == "/api/analytics/sr/validate":
+                raw_horizons = body.get("horizons")
+                eff_horizons = (
+                    [int(h) for h in raw_horizons if str(h).strip().isdigit()]
+                    if isinstance(raw_horizons, list)
+                    else None
+                )
+                self._send_json(
+                    200,
+                    hub_service.run_sr_validation(
+                        symbols=body.get("symbols") if isinstance(body.get("symbols"), list) else None,
+                        basket_id=body.get("basket_id"),
+                        universe=str(body.get("universe", "CUSTOM")),
+                        exchange=str(body.get("exchange", "NSE")),
+                        timeframe=str(body.get("timeframe", "1day")),
+                        from_date=body.get("from_date"),
+                        to_date=body.get("to_date"),
+                        horizons=eff_horizons,
+                        primary_horizon=int(body.get("primary_horizon", 10) or 10),
+                        htf_confluence=bool(body.get("htf_confluence", False)),
+                        params=body.get("params") if isinstance(body.get("params"), dict) else None,
+                        provider=body.get("provider"),
                     ),
                 )
                 return

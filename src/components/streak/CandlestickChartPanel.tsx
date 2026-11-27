@@ -10,7 +10,7 @@ import {
   ZoomIn,
   ZoomOut,
 } from 'lucide-react';
-import type { BacktestTradeRow } from './types';
+import type { BacktestTradeRow, SRZoneSpan } from './types';
 import type { QuickOrderTarget } from './QuickOrderModal';
 
 interface OhlcvBar {
@@ -130,6 +130,10 @@ export function CandlestickChartPanel({
 }: CandlestickChartPanelProps) {
   const [bars, setBars] = useState<OhlcvBar[]>([]);
   const [strategyIndicators, setStrategyIndicators] = useState<StrategyIndicatorSeries[]>([]);
+  const [srZones, setSrZones] = useState<SRZoneSpan[]>([]);
+  const [showSupportZones, setShowSupportZones] = useState(true);
+  const [showResistanceZones, setShowResistanceZones] = useState(true);
+  const [showMinorZones, setShowMinorZones] = useState(true);
   const [usingStrategyIndicators, setUsingStrategyIndicators] = useState(false);
   const [enabledIndicators, setEnabledIndicators] = useState<Record<string, boolean>>({});
   const [loading, setLoading] = useState(false);
@@ -191,8 +195,12 @@ export function CandlestickChartPanel({
               const loadedInds: StrategyIndicatorSeries[] = Array.isArray(chartBody.indicators)
                 ? chartBody.indicators
                 : [];
+              const loadedZones: SRZoneSpan[] = Array.isArray(chartBody.sr_zones)
+                ? chartBody.sr_zones
+                : [];
               setBars(loadedBars);
               setStrategyIndicators(loadedInds);
+              setSrZones(loadedZones);
               setUsingStrategyIndicators(true);
               setEnabledIndicators((prev) => {
                 const isNewRun = lastRunIdRef.current !== backtestRunId;
@@ -213,6 +221,7 @@ export function CandlestickChartPanel({
 
         // Standalone chart (Create Strategy preview or pruned historical run fallback)
         setStrategyIndicators([]);
+        setSrZones([]);
         setUsingStrategyIndicators(false);
 
         let paddedFrom = fromDate;
@@ -668,6 +677,48 @@ export function CandlestickChartPanel({
     return spansMultiYear ? d.slice(2) : d.slice(5);
   };
 
+  // Visible S&R zone spans filtered by toggle buttons and current viewport
+  const visibleSrZones = useMemo(() => {
+    if (!srZones.length || !visibleBars.length) return [];
+    const totalBars = bars.length;
+    return srZones
+      .filter((z) => {
+        const lt = String(z.level_type || '').toLowerCase();
+        if (lt === 'support' && !showSupportZones) return false;
+        if (lt === 'resistance' && !showResistanceZones) return false;
+        if (z.classification !== 'Major' && !showMinorZones) return false;
+        const zStart = Math.max(0, Math.min(totalBars - 1, Number(z.start_bar_index ?? 0)));
+        const zEnd = Math.max(zStart, Math.min(totalBars - 1, Number(z.end_bar_index ?? totalBars - 1)));
+        return zEnd >= clampedStart && zStart < clampedEnd;
+      })
+      .map((z) => {
+        const zStart = Math.max(clampedStart, Number(z.start_bar_index ?? 0));
+        const zEnd = Math.min(clampedEnd - 1, Number(z.end_bar_index ?? bars.length - 1));
+        const localStart = zStart - clampedStart;
+        const localEnd = Math.max(localStart, zEnd - clampedStart);
+        return {
+          ...z,
+          localStart,
+          localEnd,
+        };
+      });
+  }, [srZones, visibleBars.length, bars.length, showSupportZones, showResistanceZones, showMinorZones, clampedStart, clampedEnd]);
+
+  // Active S&R zones spanning the hovered / latest bar (for crosshair readout)
+  const activeBarZones = useMemo(() => {
+    if (activeFullIdx < 0 || !srZones.length) return [];
+    return srZones
+      .filter((z) => {
+        const lt = String(z.level_type || '').toLowerCase();
+        if (lt === 'support' && !showSupportZones) return false;
+        if (lt === 'resistance' && !showResistanceZones) return false;
+        if (z.classification !== 'Major' && !showMinorZones) return false;
+        return activeFullIdx >= Number(z.start_bar_index ?? 0) && activeFullIdx <= Number(z.end_bar_index ?? bars.length - 1);
+      })
+      .sort((a, b) => (b.final_strength || 0) - (a.final_strength || 0))
+      .slice(0, 3);
+  }, [activeFullIdx, srZones, showSupportZones, showResistanceZones, showMinorZones, bars.length]);
+
   // Live indicator readout values at hovered / latest bar
   const indicatorReadouts = useMemo(() => {
     if (activeFullIdx < 0) return [];
@@ -898,6 +949,45 @@ export function CandlestickChartPanel({
             </>
           )}
 
+          {/* S&R Zone Band Overlay Toggles (when strategy computes causal S&R zones) */}
+          {srZones.length > 0 && (
+            <div className="flex items-center gap-1 border-l border-slate-800 pl-1.5">
+              <button
+                type="button"
+                onClick={() => setShowSupportZones((v) => !v)}
+                className={`min-h-[28px] rounded-md border px-2 font-mono text-[11px] font-semibold transition-colors ${
+                  showSupportZones
+                    ? 'border-emerald-600/70 bg-emerald-950/40 text-emerald-300'
+                    : 'border-slate-800 bg-[#0b1120] text-slate-500 hover:text-slate-300'
+                }`}
+              >
+                Support Zones
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowResistanceZones((v) => !v)}
+                className={`min-h-[28px] rounded-md border px-2 font-mono text-[11px] font-semibold transition-colors ${
+                  showResistanceZones
+                    ? 'border-red-600/70 bg-red-950/40 text-red-300'
+                    : 'border-slate-800 bg-[#0b1120] text-slate-500 hover:text-slate-300'
+                }`}
+              >
+                Resistance Zones
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowMinorZones((v) => !v)}
+                className={`min-h-[28px] rounded-md border px-2 font-mono text-[11px] font-semibold transition-colors ${
+                  showMinorZones
+                    ? 'border-slate-600 bg-slate-800/80 text-slate-200'
+                    : 'border-slate-800 bg-[#0b1120] text-slate-500 hover:text-slate-300'
+                }`}
+              >
+                Minor
+              </button>
+            </div>
+          )}
+
           <button
             type="button"
             onClick={() => void fetchBars(activeSymbol, timeframe, !backtestRunId)}
@@ -910,8 +1000,8 @@ export function CandlestickChartPanel({
         </div>
       </div>
 
-      {/* Live indicator readout bar for hovered / active candle */}
-      {bars.length > 0 && indicatorReadouts.length > 0 && (
+      {/* Live indicator & S&R zone readout bar for hovered / active candle */}
+      {bars.length > 0 && (indicatorReadouts.length > 0 || activeBarZones.length > 0) && (
         <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-b border-slate-800/70 bg-[#0d1424] px-4 py-1.5 font-mono text-[11px] tabular-nums">
           {indicatorReadouts.map((item) => (
             <span key={item.id} className="inline-flex items-center gap-1.5 text-slate-300">
@@ -922,6 +1012,27 @@ export function CandlestickChartPanel({
               </strong>
             </span>
           ))}
+          {activeBarZones.map((z) => {
+            const isSup = String(z.level_type || '').toLowerCase() === 'support';
+            return (
+              <span
+                key={z.zone_id}
+                className={`inline-flex items-center gap-1.5 ${isSup ? 'text-emerald-300' : 'text-red-300'}`}
+              >
+                <span className="text-slate-500">·</span>
+                <span className="font-semibold">
+                  {z.classification} {isSup ? 'SUP' : 'RES'}
+                </span>
+                <span>
+                  {z.zone_low.toFixed(1)}–{z.zone_high.toFixed(1)}
+                </span>
+                <span className="text-slate-400">
+                  (Str {z.final_strength.toFixed(0)} · {z.touches}t
+                  {z.confluence_count > 1 ? ` · ${z.confluence_timeframes.join('+')}` : ''})
+                </span>
+              </span>
+            );
+          })}
         </div>
       )}
 
@@ -1082,8 +1193,61 @@ export function CandlestickChartPanel({
                 );
               })}
 
-              {/* Candlesticks, Trade Markers & Price Overlays */}
+              {/* Candlesticks, Causal S&R Zone Bands, Trade Markers & Price Overlays */}
               <g clipPath={`url(#${clipPathId})`}>
+                {/* Horizontal Support & Resistance Zone Bands (rendered behind candlesticks) */}
+                {visibleSrZones.map((z) => {
+                  const isSup = String(z.level_type || '').toLowerCase() === 'support';
+                  const isMajor = z.classification === 'Major';
+                  const x1 = padL + z.localStart * stepX;
+                  const x2 = padL + (z.localEnd + 1) * stepX;
+                  const yTop = yForPrice(z.zone_high);
+                  const yBot = yForPrice(z.zone_low);
+                  const rectY = Math.min(yTop, yBot);
+                  const rectH = Math.max(3, Math.abs(yBot - yTop));
+                  const fill = isSup
+                    ? isMajor
+                      ? 'rgba(16, 185, 129, 0.17)'
+                      : 'rgba(16, 185, 129, 0.08)'
+                    : isMajor
+                      ? 'rgba(239, 68, 68, 0.17)'
+                      : 'rgba(239, 68, 68, 0.08)';
+                  const stroke = isSup
+                    ? isMajor
+                      ? 'rgba(16, 185, 129, 0.65)'
+                      : 'rgba(16, 185, 129, 0.35)'
+                    : isMajor
+                      ? 'rgba(239, 68, 68, 0.65)'
+                      : 'rgba(239, 68, 68, 0.35)';
+                  return (
+                    <g key={`srz-${z.zone_id}`}>
+                      <rect
+                        x={x1}
+                        y={rectY}
+                        width={Math.max(4, x2 - x1)}
+                        height={rectH}
+                        fill={fill}
+                        stroke={stroke}
+                        strokeWidth={isMajor ? 1.1 : 0.7}
+                        strokeDasharray={isMajor ? undefined : '3 2'}
+                      />
+                      {isMajor && (x2 - x1) > 42 && (
+                        <text
+                          x={Math.min(svgW - padR - 4, x2 - 4)}
+                          y={rectY + 9}
+                          textAnchor="end"
+                          fill={isSup ? '#34d399' : '#f87171'}
+                          fontSize="8.5"
+                          fontWeight="600"
+                          fontFamily="IBM Plex Mono, monospace"
+                        >
+                          {isSup ? 'SUP' : 'RES'} {z.representative_price.toFixed(1)} · S{z.final_strength.toFixed(0)}
+                        </text>
+                      )}
+                    </g>
+                  );
+                })}
+
                 {visibleBars.map((b, i) => {
                   const fullIdx = clampedStart + i;
                   const cx = padL + i * stepX + stepX / 2;

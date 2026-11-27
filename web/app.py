@@ -111,6 +111,8 @@ class ScreenerRequest(BaseModel):
     universe: str = "CUSTOM"
     basket_id: Optional[str] = None
     exchange: str = "NSE"
+    exchanges: Optional[List[str]] = None
+    segments: Optional[List[str]] = None
     timeframe: str = "1day"
     timeframes: Optional[List[str]] = None
     lookback_days: Optional[int] = None
@@ -122,6 +124,21 @@ class ScreenerRequest(BaseModel):
     provider: Optional[str] = None
     backend: str = "auto"
     async_job: bool = False
+
+
+class SRValidationRequest(BaseModel):
+    symbols: Optional[List[str]] = None
+    basket_id: Optional[str] = None
+    universe: str = "CUSTOM"
+    exchange: str = "NSE"
+    timeframe: str = "1day"
+    from_date: Optional[str] = None
+    to_date: Optional[str] = None
+    horizons: Optional[List[int]] = None
+    primary_horizon: int = 10
+    htf_confluence: bool = False
+    params: Optional[Dict[str, Any]] = None
+    provider: Optional[str] = None
 
 
 class UniverseSyncRequest(BaseModel):
@@ -844,6 +861,8 @@ def create_app() -> FastAPI:
                 basket_id=req.basket_id,
                 universe=req.universe,
                 exchange=req.exchange,
+                exchanges=req.exchanges,
+                segments=req.segments,
                 timeframe=req.timeframe,
                 timeframes=req.timeframes,
                 lookback_days=req.lookback_days,
@@ -855,6 +874,27 @@ def create_app() -> FastAPI:
                 provider=req.provider,
                 backend=req.backend,
                 async_job=is_async,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/analytics/sr/validate")
+    def api_analytics_sr_validate(payload: Optional[SRValidationRequest] = None) -> dict:
+        req = payload or SRValidationRequest()
+        try:
+            return hub_service.run_sr_validation(
+                symbols=req.symbols,
+                basket_id=req.basket_id,
+                universe=req.universe,
+                exchange=req.exchange,
+                timeframe=req.timeframe,
+                from_date=req.from_date,
+                to_date=req.to_date,
+                horizons=req.horizons,
+                primary_horizon=req.primary_horizon,
+                htf_confluence=req.htf_confluence,
+                params=req.params,
+                provider=req.provider,
             )
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
