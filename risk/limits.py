@@ -605,6 +605,7 @@ class RiskWatchdog:
         reconcile_callback: Optional[Callable[[], Any]] = None,
         reconcile_every_n: int = 4,
         degraded_threshold: int = 3,
+        is_active_callback: Optional[Callable[[], bool]] = None,
     ) -> None:
         self._risk = risk_mgr or risk_limit_manager
         self._interval = max(1.0, float(interval_sec))
@@ -614,6 +615,8 @@ class RiskWatchdog:
         self._reconcile_callback = reconcile_callback
         self._reconcile_every_n = max(1, int(reconcile_every_n))
         self._degraded_threshold = max(1, int(degraded_threshold))
+        self._is_active_callback = is_active_callback
+        self._idle_standby: bool = False
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._last_eval: Optional[Dict[str, Any]] = None
@@ -705,6 +708,14 @@ class RiskWatchdog:
     def set_reconcile_callback(self, cb: Optional[Callable[[], Any]]) -> None:
         with self._lock:
             self._reconcile_callback = cb
+
+    def set_active_callback(self, cb: Optional[Callable[[], bool]]) -> None:
+        with self._lock:
+            self._is_active_callback = cb
+
+    def set_broker_provider(self, provider: Optional[Callable[[], Any]]) -> None:
+        with self._lock:
+            self._broker_provider = provider
 
     def _record_failure(self, exc: Exception, *, dimension: str = "risk_calculations") -> None:
         with self._lock:
@@ -834,6 +845,23 @@ class RiskWatchdog:
 
     def _loop(self) -> None:
         while not self._stop.is_set():
+            is_active = True
+            active_cb = self._is_active_callback
+            if active_cb is not None:
+                try:
+                    is_active = bool(active_cb())
+                except Exception:
+                    is_active = True
+
+            if not is_active:
+                with self._lock:
+                    self._idle_standby = True
+                self._stop.wait(self._interval)
+                continue
+
+            with self._lock:
+                self._idle_standby = False
+
             try:
                 self.run_once()
             except Exception:
@@ -850,6 +878,7 @@ class RiskWatchdog:
         with self._lock:
             return {
                 "running": bool(self._thread is not None and self._thread.is_alive()),
+                "idle_standby": self._idle_standby,
                 "interval_sec": self._interval,
                 "degraded": self._degraded,
                 "blocks_live_entries": self._degraded,

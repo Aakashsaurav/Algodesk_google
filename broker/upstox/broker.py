@@ -159,12 +159,100 @@ class UpstoxBroker(BrokerBase):
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             return False, 0, {}, f"Network error: {exc.__class__.__name__}"
 
+    def _probe_analytics_token(self, token: str, timeout: float = 3.5) -> tuple[bool, int, str]:
+        """Verify 1-year read-only Analytics Token against Upstox V3 LTP endpoint (no static IP required)."""
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+            "User-Agent": "AlgoDesk/5.0",
+        }
+        url = f"{config.UPSTOX_BASE_URL}/v3/market-quote/ltp?instrument_key=NSE_INDEX%7CNifty%2050"
+        urlopen_mocked = getattr(urllib.request.urlopen, "__module__", "") != "urllib.request"
+        if requests is not None and not urlopen_mocked:
+            try:
+                resp = requests.get(url, headers=headers, timeout=timeout)
+                if resp.status_code == 200:
+                    return True, 200, ""
+                return False, resp.status_code, f"HTTP {resp.status_code}"
+            except requests.exceptions.Timeout:
+                return False, 0, "Analytics token probe timed out"
+            except Exception as exc:
+                return False, 0, f"Network error: {exc.__class__.__name__}"
+
+        req = urllib.request.Request(url, headers=headers, method="GET")
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return True, resp.status, ""
+        except urllib.error.HTTPError as exc:
+            return False, exc.code, f"HTTP {exc.code}"
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            return False, 0, f"Network error: {exc.__class__.__name__}"
+
+    def _analytics_token_snapshot(
+        self,
+        *,
+        has_creds: bool,
+        expiry_iso: str,
+        timeout: float,
+    ) -> BrokerHealthSnapshot:
+        """Build health snapshot when only the 1-year read-only Analytics Token is active."""
+        started = time.perf_counter()
+        ok, status_code, err_msg = self._probe_analytics_token(auth_manager.analytics_token, timeout=timeout)
+        latency_ms = (time.perf_counter() - started) * 1000.0
+        self._connected = False  # Daily OAuth trading session is NOT active
+        if ok:
+            return BrokerHealthSnapshot(
+                broker_id=self.name,
+                display_name=self.display_name,
+                stage=self.stage,
+                state=ConnectionState.CONNECTED,
+                capabilities=self.capabilities,
+                latency_ms=latency_ms,
+                account_name="Analytics Token (Data Only)",
+                client_id="1-Year Read-Only",
+                token_expires_at_ist="1-Year Token (No Daily Reset)",
+                message="1-Year Analytics Token verified for Historical Data, Market Quotes & WebSocket. Daily OAuth login is required only for live order execution.",
+                can_reconnect=True,
+                has_credentials=has_creds or True,
+                auth_mode="analytics_token",
+            )
+        if status_code in (401, 403):
+            return BrokerHealthSnapshot(
+                broker_id=self.name,
+                display_name=self.display_name,
+                stage=self.stage,
+                state=ConnectionState.EXPIRED,
+                capabilities=self.capabilities,
+                latency_ms=latency_ms,
+                token_expires_at_ist=expiry_iso,
+                message=f"Upstox Analytics Token was rejected (HTTP {status_code}). Update or clear it in Configure.",
+                can_reconnect=True,
+                has_credentials=has_creds,
+                auth_mode="analytics_token",
+            )
+        return BrokerHealthSnapshot(
+            broker_id=self.name,
+            display_name=self.display_name,
+            stage=self.stage,
+            state=ConnectionState.DISCONNECTED,
+            capabilities=self.capabilities,
+            latency_ms=latency_ms,
+            token_expires_at_ist=expiry_iso,
+            message=f"Unable to verify Upstox Analytics Token ({err_msg}).",
+            can_reconnect=True,
+            has_credentials=has_creds,
+            auth_mode="analytics_token",
+        )
+
     def health_check(self, timeout: float = 3.5) -> BrokerHealthSnapshot:
         """
         Perform real live reachability & token validity verification.
         Never touches the 100k-instrument list, keeping memory footprint minimal.
+        Supports both daily OAuth2 sessions (trading + data) and Upstox's 1-year
+        read-only Analytics Token (Historical Data, Market Quotes & WebSocket).
         """
         has_creds = auth_manager.has_credentials()
+        has_analytics = auth_manager.has_analytics_token()
         _, next_expiry = current_upstox_session_bounds()
         expiry_iso = next_expiry.isoformat(timespec="seconds")
 
@@ -176,6 +264,12 @@ class UpstoxBroker(BrokerBase):
                 token = None
 
         if not token:
+            if has_analytics:
+                return self._analytics_token_snapshot(
+                    has_creds=has_creds,
+                    expiry_iso=expiry_iso,
+                    timeout=timeout,
+                )
             self._connected = False
             if not has_creds:
                 return BrokerHealthSnapshot(
@@ -185,7 +279,7 @@ class UpstoxBroker(BrokerBase):
                     state=ConnectionState.UNCONFIGURED,
                     capabilities=self.capabilities,
                     token_expires_at_ist=expiry_iso,
-                    message="API key & secret required before Upstox OAuth login.",
+                    message="Configure API key/secret for daily OAuth trading or add a 1-Year Analytics Token for data.",
                     can_reconnect=True,
                     has_credentials=False,
                     auth_mode="oauth2",
@@ -197,7 +291,7 @@ class UpstoxBroker(BrokerBase):
                 state=ConnectionState.DISCONNECTED,
                 capabilities=self.capabilities,
                 token_expires_at_ist=expiry_iso,
-                message="No active Upstox token for current trading session. Reconnect required.",
+                message="No active Upstox token for current trading session. Reconnect required (or add a 1-Year Analytics Token for data).",
                 can_reconnect=True,
                 has_credentials=True,
                 auth_mode="oauth2",
@@ -223,15 +317,25 @@ class UpstoxBroker(BrokerBase):
                 account_name=user_name,
                 client_id=_mask_client_id(user_id) if user_id else "Verified",
                 token_expires_at_ist=token_info.get("expires_at_ist") or expiry_iso,
-                message="Live session verified against Upstox profile API.",
+                message=(
+                    "Live OAuth session verified. 1-Year Analytics Token active for Historical Data & WebSocket."
+                    if has_analytics
+                    else "Live session verified against Upstox profile API."
+                ),
                 can_reconnect=False,
                 has_credentials=has_creds or True,
-                auth_mode="oauth2",
+                auth_mode="oauth2+analytics" if has_analytics else "oauth2",
             )
 
         self._connected = False
         if status_code in (401, 403):
             auth_manager.invalidate_local()
+            if has_analytics:
+                return self._analytics_token_snapshot(
+                    has_creds=has_creds,
+                    expiry_iso=expiry_iso,
+                    timeout=timeout,
+                )
             return BrokerHealthSnapshot(
                 broker_id=self.name,
                 display_name=self.display_name,
@@ -331,8 +435,13 @@ class UpstoxBroker(BrokerBase):
             logger.warning("%s: %s", message, exc)
 
     def authorize_ws_feed(self, timeout: float = 5.0) -> str:
-        """Obtain single-use authorized WSS URL from Upstox Market Data Feed V3."""
-        token = self.access_token or auth_manager.get_valid_token()
+        """Obtain single-use authorized WSS URL from Upstox Market Data Feed V3 (prefers 1-Year Analytics Token)."""
+        try:
+            token = auth_manager.get_data_token()
+        except RuntimeError:
+            token = self.access_token
+        if not token:
+            raise BrokerError("No Upstox Analytics Token or active OAuth session token available for WebSocket feed.")
         headers = {
             "Authorization": f"Bearer {token}",
             "Accept": "application/json",
@@ -379,8 +488,17 @@ class UpstoxBroker(BrokerBase):
         method: str = "GET",
         payload: Optional[Dict[str, Any]] = None,
         timeout: float = 6.0,
+        use_data_token: bool = False,
     ) -> Dict[str, Any]:
-        token = self.access_token or auth_manager.get_valid_token()
+        if use_data_token:
+            try:
+                token = auth_manager.get_data_token()
+            except RuntimeError:
+                token = self.access_token
+            if not token:
+                raise RuntimeError("No Upstox Analytics Token or active OAuth session token available.")
+        else:
+            token = self.access_token or auth_manager.get_valid_token()
         method_u = method.upper()
         headers = {
             "Authorization": f"Bearer {token}",
@@ -816,7 +934,7 @@ class UpstoxBroker(BrokerBase):
             seg_prefix = "NSE_FO" if exch == "NFO" else ("BSE_FO" if exch == "BFO" else ("MCX_FO" if exch == "MCX" else f"{exch}_EQ"))
             ikey = f"{seg_prefix}|{sym}"
         req_levels = 30 if int(levels or 5) > 5 else 5
-        if not self.is_authenticated():
+        if not (self.is_authenticated() or auth_manager.has_data_token()):
             return None
 
         endpoints = []
@@ -826,7 +944,7 @@ class UpstoxBroker(BrokerBase):
 
         for url in endpoints:
             try:
-                raw = self._rest_request_json(url, method="GET", timeout=5.0)
+                raw = self._rest_request_json(url, method="GET", timeout=5.0, use_data_token=True)
                 data_map = raw.get("data") or {}
                 if not isinstance(data_map, dict) or not data_map:
                     continue

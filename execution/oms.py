@@ -1234,6 +1234,22 @@ class OrderManagementSystem:
         """
         with self._lock:
             active_orders = self.list_orders(deployment_id=deployment_id, active_only=True, limit=250)
+            matching_active = [
+                rec
+                for rec in active_orders
+                if rec["broker_id"] == broker.name or broker.name == "paper"
+            ]
+            if not matching_active:
+                return {
+                    "ok": True,
+                    "checked": 0,
+                    "reconciled": 0,
+                    "recovered": 0,
+                    "fills_applied": [],
+                    "stale_unmatched": [],
+                    "manual_intervention_required": [],
+                    "skipped_idle": True,
+                }
             broker_orders = list(broker.get_orders() or [])
             try:
                 broker_trades = list(broker.get_trades() or [])

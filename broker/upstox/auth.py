@@ -90,8 +90,33 @@ class AuthManager:
     def token_file(self) -> Path:
         return config.UPSTOX_TOKEN_FILE_PATH
 
+    @property
+    def analytics_token(self) -> str:
+        return config.UPSTOX_ANALYTICS_TOKEN
+
     def has_credentials(self) -> bool:
         return bool(self.api_key and self.api_secret)
+
+    def has_analytics_token(self) -> bool:
+        return bool(self.analytics_token)
+
+    def save_analytics_token(self, token: str) -> None:
+        """
+        Persist Upstox 1-year read-only Analytics Token (used for Historical Data,
+        Market Quotes, and WebSocket Feed) into env + encrypted 0o600 local vault.
+        """
+        clean = (token or "").strip()
+        if clean.lower().startswith("bearer "):
+            clean = clean[7:].strip()
+        if not clean:
+            raise ValueError("Upstox Analytics Token cannot be empty.")
+        if len(clean) < 16:
+            raise ValueError("Upstox Analytics Token looks too short. Paste the full token from Upstox Developer Apps -> Analytics tab.")
+        config.save_local_credential("UPSTOX_ANALYTICS_TOKEN", "upstox_analytics_token", clean)
+
+    def clear_analytics_token(self) -> None:
+        """Remove stored Upstox Analytics Token from env, local vault, and optional Keychain."""
+        config.delete_local_credential("UPSTOX_ANALYTICS_TOKEN", "upstox_analytics_token")
 
     def save_credentials(
         self,
@@ -342,6 +367,34 @@ class AuthManager:
             return True
         except RuntimeError:
             return False
+
+    def get_data_token(self) -> str:
+        """
+        Return the bearer token to use for Upstox read-only market data connections
+        (Historical Candles, Intraday Candles, Market Quotes, Option Chain, and
+        WebSocket Market Data Feed authorize).
+
+        Priority:
+          1. 1-year read-only Analytics Token (`UPSTOX_ANALYTICS_TOKEN`) if configured
+             (no daily 03:30 AM IST OAuth re-login required).
+          2. Active daily OAuth2 trading access token (`get_valid_token()`).
+        """
+        analytics = self.analytics_token
+        if analytics:
+            return analytics
+        return self.get_valid_token()
+
+    def has_data_token(self) -> bool:
+        """Return True if either a 1-year Analytics Token or daily OAuth token is available."""
+        return self.has_analytics_token() or self.is_authenticated()
+
+    def get_data_token_mode(self) -> str:
+        """Return active token source for Upstox data connections: 'analytics_token', 'oauth2', or 'none'."""
+        if self.has_analytics_token():
+            return "analytics_token"
+        if self.is_authenticated():
+            return "oauth2"
+        return "none"
 
     def get_token_info(self) -> dict:
         with self._lock:

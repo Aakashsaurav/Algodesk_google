@@ -55,6 +55,11 @@ class CredentialsRequest(BaseModel):
     api_key: str
     api_secret: str
     redirect_uri: Optional[str] = None
+    analytics_token: Optional[str] = None
+
+
+class AnalyticsTokenRequest(BaseModel):
+    analytics_token: str
 
 
 class ReconnectStartRequest(BaseModel):
@@ -342,7 +347,25 @@ def create_app() -> FastAPI:
                 api_key=payload.api_key,
                 api_secret=payload.api_secret,
                 redirect_uri=payload.redirect_uri,
+                analytics_token=payload.analytics_token,
             )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.post("/api/brokers/{broker_id}/analytics-token")
+    def api_save_analytics_token(broker_id: str, payload: AnalyticsTokenRequest) -> dict:
+        try:
+            return hub_service.save_analytics_token(
+                broker_id=broker_id,
+                analytics_token=payload.analytics_token,
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    @app.delete("/api/brokers/{broker_id}/analytics-token")
+    def api_clear_analytics_token(broker_id: str) -> dict:
+        try:
+            return hub_service.clear_analytics_token(broker_id=broker_id)
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 

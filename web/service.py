@@ -131,7 +131,7 @@ class BrokerHubService:
         key = auth.api_key
         secret = auth.api_secret
         redirect = auth.redirect_uri
-        return {
+        entry: Dict[str, Any] = {
             "has_api_key": bool(key),
             "has_api_secret": bool(secret),
             "api_key_preview": _mask_key(key),
@@ -140,6 +140,16 @@ class BrokerHubService:
             "secret_source": config.credential_source(f"{prefix}_API_SECRET", f"{acct_prefix}_api_secret"),
             "redirect_source": config.credential_source(f"{prefix}_REDIRECT_URI", f"{acct_prefix}_redirect_uri"),
         }
+        if acct_prefix == "upstox":
+            analytics_tok = auth.analytics_token
+            entry["has_analytics_token"] = bool(analytics_tok)
+            entry["analytics_token_preview"] = _mask_key(analytics_tok)
+            entry["analytics_token_source"] = config.credential_source(
+                "UPSTOX_ANALYTICS_TOKEN",
+                "upstox_analytics_token",
+            )
+            entry["data_token_mode"] = auth.get_data_token_mode()
+        return entry
 
     def _credential_summary(self) -> Dict[str, Any]:
         config.reload_if_changed()
@@ -243,11 +253,38 @@ class BrokerHubService:
         api_key: str,
         api_secret: str,
         redirect_uri: Optional[str] = None,
+        analytics_token: Optional[str] = None,
     ) -> Dict[str, Any]:
         bid = broker_id.strip().lower()
         auth = self._auth_for(bid)
         auth.save_credentials(api_key=api_key, api_secret=api_secret, redirect_uri=redirect_uri)
+        if bid == "upstox" and analytics_token is not None and analytics_token.strip():
+            auth.save_analytics_token(analytics_token)
         snap = self.probe_one(bid)
+        return {
+            "ok": True,
+            "broker": snap,
+            "credentials": self._credential_summary(),
+        }
+
+    def save_analytics_token(self, broker_id: str, analytics_token: str) -> Dict[str, Any]:
+        bid = broker_id.strip().lower()
+        if bid != "upstox":
+            raise ValueError(f"1-Year Analytics Token is only supported for Upstox (got '{broker_id}').")
+        upstox_auth_manager.save_analytics_token(analytics_token)
+        snap = self.probe_one("upstox")
+        return {
+            "ok": True,
+            "broker": snap,
+            "credentials": self._credential_summary(),
+        }
+
+    def clear_analytics_token(self, broker_id: str) -> Dict[str, Any]:
+        bid = broker_id.strip().lower()
+        if bid != "upstox":
+            raise ValueError(f"1-Year Analytics Token is only supported for Upstox (got '{broker_id}').")
+        upstox_auth_manager.clear_analytics_token()
+        snap = self.probe_one("upstox")
         return {
             "ok": True,
             "broker": snap,
@@ -1256,7 +1293,18 @@ class BrokerHubService:
                 "order_recovery_error": order_recovery_error,
             }
 
+        def _resolve_trading_broker() -> tuple[str, Any]:
+            bid = str(self._store.load().get("trading_broker") or "upstox").strip().lower()
+            return bid, BrokerRegistry.get(bid)
+
+        def _is_watchdog_active() -> bool:
+            # Stay in zero-API idle standby unless live trading is explicitly enabled
+            # AND there is at least one active live deployment, open live position, or live OMS order.
+            return bool(is_live_trading_enabled() and deployment_manager.has_live_trading_activity())
+
         try:
+            risk_watchdog.set_broker_provider(_resolve_trading_broker)
+            risk_watchdog.set_active_callback(_is_watchdog_active)
             risk_watchdog.set_reconcile_callback(_periodic_reconcile)
             risk_watchdog.start()
         except Exception as exc:

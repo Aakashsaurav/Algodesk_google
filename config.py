@@ -553,6 +553,19 @@ class AppConfig:
         if self.USE_KEYCHAIN:
             keychain_set(self.KEYRING_SERVICE, vault_account, clean)
 
+    def delete_local_credential(self, env_key: str, vault_account: str) -> None:
+        """Remove a credential from process env, local encrypted 0o600 vault, and optional Keychain."""
+        os.environ.pop(env_key, None)
+        try:
+            vault = self._read_local_vault()
+            if vault_account in vault:
+                vault.pop(vault_account, None)
+                self._write_local_vault(vault)
+        except OSError as exc:
+            logging.getLogger(__name__).warning("Could not update local credentials vault: %s", exc)
+        if self.USE_KEYCHAIN:
+            keychain_delete(self.KEYRING_SERVICE, vault_account)
+
     def _resolve_credential(self, env_key: str, account_key: str, default: str = "") -> str:
         self.reload_if_changed()
         env_val = os.getenv(env_key, "").strip()
@@ -617,6 +630,10 @@ class AppConfig:
             "upstox_redirect_uri",
             default="http://127.0.0.1:8000/auth/upstox/callback",
         )
+
+    @property
+    def UPSTOX_ANALYTICS_TOKEN(self) -> str:
+        return self._resolve_credential("UPSTOX_ANALYTICS_TOKEN", "upstox_analytics_token")
 
     @property
     def ZERODHA_API_KEY(self) -> str:
@@ -693,7 +710,10 @@ class AppConfig:
                 pass
 
 
-_TOKEN_QUERY_RE = re.compile(r"([?&](?:token|access_token|api_key|api_secret)=)[^&\s\"']+", re.IGNORECASE)
+_TOKEN_QUERY_RE = re.compile(
+    r"([?&](?:token|access_token|analytics_token|api_key|api_secret)=)[^&\s\"']+",
+    re.IGNORECASE,
+)
 _ADK_TOKEN_RE = re.compile(r"\badk_[A-Za-z0-9_-]{8,}\b")
 _BEARER_TOKEN_RE = re.compile(r"(Bearer\s+)[A-Za-z0-9._~+/=-]{8,}", re.IGNORECASE)
 

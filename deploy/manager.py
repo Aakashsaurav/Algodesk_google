@@ -1869,6 +1869,24 @@ class DeploymentManager:
             "order": order_rec,
         }
 
+    def has_live_trading_activity(self) -> bool:
+        """
+        Return True only when at least one non-paper (live) deployment is RUNNING,
+        holds an open live position, or has an active non-terminal live OMS order.
+        Used by RiskWatchdog to stay in zero-API idle standby when no live trading is active.
+        """
+        with self._lock:
+            for rt in self._runtime.values():
+                if rt.get("exec_mode") != "paper" and (rt.get("status") == "RUNNING" or bool(rt.get("positions"))):
+                    return True
+        try:
+            active_orders = self._oms.list_orders(active_only=True, limit=25)
+            if any(str(o.get("exec_mode") or "").lower() != "paper" for o in active_orders):
+                return True
+        except Exception:
+            pass
+        return False
+
     def reconcile_orders(
         self,
         *,

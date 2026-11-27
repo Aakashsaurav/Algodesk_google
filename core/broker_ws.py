@@ -1145,7 +1145,7 @@ class UpstoxWSFeedClient(_BaseBrokerWSClient):
         return st
 
     def _build_connection_params(self) -> Tuple[str, Dict[str, str]]:
-        token = upstox_auth.get_valid_token()
+        token = upstox_auth.get_data_token()
         auth_url = f"{config.UPSTOX_BASE_URL}/v3/feed/market-data-feed/authorize"
         req = urllib.request.Request(
             auth_url,

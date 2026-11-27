@@ -130,6 +130,10 @@ interface BrokerCredSummary {
   key_source?: 'env' | 'local_vault' | 'keychain' | 'none';
   secret_source?: 'env' | 'local_vault' | 'keychain' | 'none';
   redirect_source?: 'env' | 'local_vault' | 'keychain' | 'none';
+  has_analytics_token?: boolean;
+  analytics_token_preview?: string;
+  analytics_token_source?: 'env' | 'local_vault' | 'keychain' | 'none';
+  data_token_mode?: 'analytics_token' | 'oauth2' | 'none';
 }
 
 interface OverviewPayload {
@@ -566,6 +570,8 @@ export default function App() {
   const [apiKey, setApiKey] = useState('');
   const [apiSecret, setApiSecret] = useState('');
   const [redirectUri, setRedirectUri] = useState('');
+  const [analyticsTokenInput, setAnalyticsTokenInput] = useState('');
+  const [savingAnalyticsToken, setSavingAnalyticsToken] = useState(false);
   const [credsExpanded, setCredsExpanded] = useState(false);
   const [oauthUrl, setOauthUrl] = useState('');
   const [captureActive, setCaptureActive] = useState(false);
@@ -1356,6 +1362,7 @@ export default function App() {
     setModalBrokerId(brokerId);
     setApiKey('');
     setApiSecret('');
+    setAnalyticsTokenInput('');
     setOauthUrl('');
     setCallbackInput('');
     setModalFeedback(null);
@@ -1366,6 +1373,70 @@ export default function App() {
     setCredsExpanded(!hasAll);
     setManualOpen(false);
     setRedirectUri(creds?.redirect_uri || `${window.location.origin}/auth/${brokerId}/callback`);
+  };
+
+  const handleSaveAnalyticsToken = async () => {
+    if (!modalBrokerId || modalBrokerId !== 'upstox') return;
+    if (!analyticsTokenInput.trim()) {
+      setModalFeedback({ type: 'err', text: 'Paste your Upstox 1-Year Analytics Token first.' });
+      return;
+    }
+    setSavingAnalyticsToken(true);
+    setModalFeedback(null);
+    try {
+      const res = await apiFetch('/api/brokers/upstox/analytics-token', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ analytics_token: analyticsTokenInput.trim() }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Could not save Analytics Token.');
+      setAnalyticsTokenInput('');
+      await fetchOverview(false);
+      const brokerState = data.broker?.state;
+      const isOk = brokerState === 'CONNECTED';
+      setModalFeedback({
+        type: isOk ? 'ok' : 'err',
+        text:
+          data.broker?.message ||
+          (isOk
+            ? '1-Year Analytics Token saved and verified for Upstox Historical Data & WebSocket.'
+            : 'Token saved, but Upstox verification did not pass.'),
+      });
+    } catch (err) {
+      setModalFeedback({
+        type: 'err',
+        text: err instanceof Error ? err.message : 'Failed to save Analytics Token.',
+      });
+    } finally {
+      setSavingAnalyticsToken(false);
+    }
+  };
+
+  const handleClearAnalyticsToken = async () => {
+    if (!modalBrokerId || modalBrokerId !== 'upstox') return;
+    setSavingAnalyticsToken(true);
+    setModalFeedback(null);
+    try {
+      const res = await apiFetch('/api/brokers/upstox/analytics-token', {
+        method: 'DELETE',
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.detail || 'Could not clear Analytics Token.');
+      setAnalyticsTokenInput('');
+      await fetchOverview(false);
+      setModalFeedback({
+        type: 'ok',
+        text: 'Upstox Analytics Token removed. Data connection will fall back to daily OAuth when connected.',
+      });
+    } catch (err) {
+      setModalFeedback({
+        type: 'err',
+        text: err instanceof Error ? err.message : 'Failed to clear Analytics Token.',
+      });
+    } finally {
+      setSavingAnalyticsToken(false);
+    }
   };
 
   const handleSaveCredentials = async () => {
@@ -2108,6 +2179,22 @@ export default function App() {
                       <div className="space-y-0.5 font-mono text-xs text-slate-400">
                         <div>Probe: {b.latency_ms !== null ? `${b.latency_ms} ms` : '—'}</div>
                         <div>Reset: {b.token_expires_at_ist || 'N/A'}</div>
+                        {b.broker_id === 'upstox' && (
+                          <div
+                            className={
+                              overview?.credentials?.upstox?.has_analytics_token
+                                ? 'text-emerald-400'
+                                : 'text-slate-400'
+                            }
+                          >
+                            Data Auth:{' '}
+                            {overview?.credentials?.upstox?.has_analytics_token
+                              ? '1-Yr Analytics Token'
+                              : b.is_connected
+                                ? 'Daily OAuth'
+                                : 'None'}
+                          </div>
+                        )}
                         <div>
                           Checked: {b.last_checked_at ? b.last_checked_at.slice(11, 19) : '—'} IST
                         </div>
@@ -2133,6 +2220,18 @@ export default function App() {
                               {isProbing ? 'Checking...' : 'Test'}
                             </button>
 
+                            {b.capabilities.requires_oauth && (b.is_connected || !b.can_reconnect) && (
+                              <button
+                                type="button"
+                                onClick={() => openReconnectModal(b.broker_id)}
+                                className="min-h-[40px] shrink-0 whitespace-nowrap rounded-lg border border-slate-700 bg-[#0b1120] px-4 py-2 text-[13px] font-semibold text-slate-200 transition-colors hover:border-slate-500 hover:bg-slate-800"
+                              >
+                                {b.broker_id === 'upstox' && b.auth_mode === 'analytics_token'
+                                  ? 'OAuth / Token'
+                                  : 'Configure'}
+                              </button>
+                            )}
+
                             {!b.is_connected && b.can_reconnect && (
                               <button
                                 type="button"
@@ -2143,16 +2242,18 @@ export default function App() {
                               </button>
                             )}
 
-                            {b.is_connected && b.capabilities.requires_oauth && (
-                              <button
-                                type="button"
-                                onClick={() => void handleDisconnectBroker(b.broker_id)}
-                                disabled={isProbing}
-                                className="min-h-[40px] shrink-0 whitespace-nowrap rounded-lg border border-red-800/70 bg-transparent px-4 py-2 text-[13px] font-semibold text-red-300 transition-colors hover:bg-red-950/50 disabled:opacity-50"
-                              >
-                                Disconnect
-                              </button>
-                            )}
+                            {b.is_connected &&
+                              b.capabilities.requires_oauth &&
+                              b.auth_mode !== 'analytics_token' && (
+                                <button
+                                  type="button"
+                                  onClick={() => void handleDisconnectBroker(b.broker_id)}
+                                  disabled={isProbing}
+                                  className="min-h-[40px] shrink-0 whitespace-nowrap rounded-lg border border-red-800/70 bg-transparent px-4 py-2 text-[13px] font-semibold text-red-300 transition-colors hover:bg-red-950/50 disabled:opacity-50"
+                                >
+                                  Disconnect
+                                </button>
+                              )}
                           </>
                         )}
                       </div>
@@ -3269,7 +3370,9 @@ export default function App() {
           <div className="max-h-[92vh] w-full max-w-[560px] overflow-y-auto rounded-xl border border-slate-700 bg-[#111827] p-6">
             <div className="mb-5 flex items-center justify-between gap-4">
               <h3 id="reconnect-modal-title" className="text-lg font-semibold text-slate-100">
-                Reconnect {modalBrokerLabel} Session
+                {modalBrokerId === 'upstox'
+                  ? 'Configure & Reconnect Upstox'
+                  : `Reconnect ${modalBrokerLabel} Session`}
               </h3>
               <button
                 type="button"
@@ -3282,10 +3385,108 @@ export default function App() {
             </div>
 
             <div className="space-y-4">
+              {/* Upstox 1-Year Read-Only Analytics Token (Historical Data, Quotes & WebSocket) */}
+              {modalBrokerId === 'upstox' && (
+                <div className="space-y-3 rounded-lg border border-slate-700/80 bg-[#0b1120] p-4">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <div className="text-[13px] font-semibold text-slate-100">
+                        Analytics Token (1-Year Read-Only Data Connection)
+                      </div>
+                      <p className="mt-0.5 text-xs text-slate-400">
+                        Powers Historical Candles, Market Quotes &amp; WebSocket streaming for 1 year without daily OAuth login. Live orders still use daily OAuth below.
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="flex items-baseline justify-between gap-3 border-t border-slate-800 pt-2.5 text-xs">
+                    <span className="font-semibold text-slate-400">Stored Token</span>
+                    <span
+                      className={`font-mono ${
+                        activeCreds?.has_analytics_token ? 'text-emerald-400' : 'text-slate-400'
+                      }`}
+                    >
+                      {activeCreds?.has_analytics_token
+                        ? `${activeCreds.analytics_token_preview} (${formatCredentialSource(activeCreds.analytics_token_source)})`
+                        : 'Not configured'}
+                    </span>
+                  </div>
+
+                  <div className="flex items-baseline justify-between gap-3 text-xs">
+                    <span className="font-semibold text-slate-400">Active Data Auth Mode</span>
+                    <span className="font-mono text-slate-200">
+                      {activeCreds?.data_token_mode === 'analytics_token'
+                        ? '1-Year Analytics Token'
+                        : activeCreds?.data_token_mode === 'oauth2'
+                          ? 'Daily OAuth Fallback'
+                          : 'None'}
+                    </span>
+                  </div>
+
+                  <div>
+                    <label
+                      htmlFor="modal-upstox-analytics-token"
+                      className="mb-1.5 block text-xs font-semibold text-slate-300"
+                    >
+                      {activeCreds?.has_analytics_token
+                        ? 'Replace Analytics Token'
+                        : 'Paste Upstox Analytics Token'}
+                    </label>
+                    <input
+                      id="modal-upstox-analytics-token"
+                      type="password"
+                      value={analyticsTokenInput}
+                      onChange={(e) => setAnalyticsTokenInput(e.target.value)}
+                      placeholder="Generated in Upstox Developer Apps -> Analytics tab"
+                      autoComplete="off"
+                      className="min-h-[40px] w-full rounded-lg border border-slate-700 bg-[#111827] px-3 py-2 font-mono text-xs text-slate-100 focus:border-sky-400 focus:outline-none"
+                    />
+                  </div>
+
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <button
+                        type="button"
+                        onClick={() => void handleSaveAnalyticsToken()}
+                        disabled={savingAnalyticsToken}
+                        className="min-h-[36px] shrink-0 whitespace-nowrap rounded-lg bg-emerald-500 px-3.5 py-1.5 text-xs font-semibold text-slate-950 transition-colors hover:bg-emerald-400 disabled:opacity-50"
+                      >
+                        {savingAnalyticsToken ? 'Verifying...' : 'Save & Verify Token'}
+                      </button>
+
+                      {activeCreds?.has_analytics_token && (
+                        <button
+                          type="button"
+                          onClick={() => void handleClearAnalyticsToken()}
+                          disabled={savingAnalyticsToken}
+                          className="min-h-[36px] shrink-0 whitespace-nowrap rounded-lg border border-red-800/70 px-3 py-1.5 text-xs font-semibold text-red-300 transition-colors hover:bg-red-950/50 disabled:opacity-50"
+                        >
+                          Remove Token
+                        </button>
+                      )}
+                    </div>
+
+                    <a
+                      href="https://upstox.com/developer/api-documentation/analytics-token"
+                      target="_blank"
+                      rel="noreferrer"
+                      className="inline-flex items-center gap-1 font-mono text-[11px] text-sky-400 hover:text-sky-300"
+                    >
+                      <span>Upstox Docs</span>
+                      <ExternalLink className="h-3 w-3" />
+                    </a>
+                  </div>
+                </div>
+              )}
+
               {/* Auto-detected .env / Keychain Configuration */}
               <div className="space-y-2 rounded-lg border border-slate-800 bg-[#0b1120] p-3.5">
                 <div className="flex items-center justify-between gap-3">
-                  <span className="text-[13px] font-semibold text-slate-200">Detected Local Configuration</span>
+                  <span className="text-[13px] font-semibold text-slate-200">
+                    {modalBrokerId === 'upstox'
+                      ? 'Trading OAuth2 Configuration (Daily Session)'
+                      : 'Detected Local Configuration'}
+                  </span>
                   <button
                     type="button"
                     onClick={() => setCredsExpanded((prev) => !prev)}

@@ -1306,7 +1306,7 @@ class HistoricalDataManager:
             "User-Agent": "AlgoDesk/5.0",
         }
         try:
-            headers["Authorization"] = f"Bearer {upstox_auth.get_valid_token()}"
+            headers["Authorization"] = f"Bearer {upstox_auth.get_data_token()}"
         except RuntimeError:
             pass
 

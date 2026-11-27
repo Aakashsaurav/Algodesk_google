@@ -382,7 +382,7 @@ def _fetch_live_quotes_upstox(symbols: List[Any], timeout: float = 4.5) -> Dict[
     is_mocked = urllib.request.urlopen is not _ORIG_URLOPEN
     today_ist_str = datetime.now(tz=IST_TZ).date().isoformat()
 
-    token = upstox_auth.get_valid_token()
+    token = upstox_auth.get_data_token()
     key_map: Dict[str, Dict[str, str]] = {}
     missing_indices: List[Any] = []
     for raw_item in symbols[:40]:

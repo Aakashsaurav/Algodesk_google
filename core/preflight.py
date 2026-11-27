@@ -345,18 +345,25 @@ class PreflightChecker:
         # 2. Trading Broker Live Auth Check (+ proactive token expiry monitoring)
         t_adapter = BrokerRegistry.get(trading_broker)
         t_snap = t_adapter.health_check(timeout=3.0) if probe_brokers else None
-        t_ok = bool(t_snap and t_snap.is_connected)
+        t_is_readonly_analytics = bool(t_snap and str(getattr(t_snap, "auth_mode", "") or "") == "analytics_token")
+        t_ok = bool(t_snap and t_snap.is_connected and not t_is_readonly_analytics)
         expiry_detail: Optional[Dict[str, Any]] = None
         if trading_broker.strip().lower() == "upstox":
             expiry_detail = upstox_auth.get_token_expiry_status(now=ref_dt)
         elif trading_broker.strip().lower() == "zerodha":
             expiry_detail = zerodha_auth.get_token_expiry_status(now=ref_dt)
 
-        t_msg = (
-            f"Verified session for {t_snap.account_name} ({t_snap.client_id})."
-            if t_snap and t_ok
-            else (t_snap.message if t_snap else "Trading session not verified.")
-        )
+        if t_is_readonly_analytics:
+            t_msg = (
+                "Upstox is currently using a read-only 1-Year Analytics Token (Data & WebSocket only). "
+                "Complete daily OAuth login before dispatching live orders."
+            )
+        else:
+            t_msg = (
+                f"Verified session for {t_snap.account_name} ({t_snap.client_id})."
+                if t_snap and t_ok
+                else (t_snap.message if t_snap else "Trading session not verified.")
+            )
         t_status = "PASS" if t_ok else "FAIL"
         if t_ok and expiry_detail and expiry_detail.get("expiring_soon"):
             t_status = "WARN"

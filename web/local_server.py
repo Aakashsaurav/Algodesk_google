@@ -787,6 +787,16 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
                             api_key=str(body.get("api_key", "")),
                             api_secret=str(body.get("api_secret", "")),
                             redirect_uri=body.get("redirect_uri"),
+                            analytics_token=body.get("analytics_token"),
+                        ),
+                    )
+                    return
+                if action == "analytics-token":
+                    self._send_json(
+                        200,
+                        hub_service.save_analytics_token(
+                            broker_id=broker_id,
+                            analytics_token=str(body.get("analytics_token", "")),
                         ),
                     )
                     return
@@ -1294,6 +1304,9 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
                 return
             if len(parts) == 4 and parts[0] == "api" and parts[1] == "streak" and parts[2] == "deployments":
                 self._send_json(200, hub_service.control_deployment(parts[3], "delete"))
+                return
+            if len(parts) == 4 and parts[0] == "api" and parts[1] == "brokers" and parts[3] == "analytics-token":
+                self._send_json(200, hub_service.clear_analytics_token(parts[2]))
                 return
             if len(parts) == 5 and parts[0] == "api" and parts[1] == "streak" and parts[2] == "scanners" and parts[3] == "alerts":
                 self._send_json(200, hub_service.delete_scanner_alert(parts[4]))
