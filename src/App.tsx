@@ -31,6 +31,11 @@ import {
 import { PlatformDashboard } from './components/streak/PlatformDashboard';
 import { QuickOrderModal, type QuickOrderTarget } from './components/streak/QuickOrderModal';
 import { AdminAuthModal } from './components/streak/AdminAuthModal';
+import {
+  ApiUsageHeaderPopover,
+  ApiUsageSection,
+  useOutboundApiUsage,
+} from './components/streak/ApiUsageCounter';
 
 const LiveTerminal = lazy(() =>
   import('./components/LiveTerminal').then((m) => ({ default: m.LiveTerminal }))
@@ -654,6 +659,11 @@ export default function App() {
   const [authModalOpen, setAuthModalOpen] = useState(false);
   const [authPromptReason, setAuthPromptReason] = useState('');
   const [hasAuthSession, setHasAuthSession] = useState(() => hasSessionToken());
+
+  const apiUsage = useOutboundApiUsage(
+    Boolean(authReady && (!securityStatus?.auth_enforced || hasAuthSession)),
+    5000
+  );
 
   const refreshSecurityStatus = useCallback(async (): Promise<SecurityStatus | null> => {
     const st = await fetchSecurityStatus();
@@ -1671,6 +1681,19 @@ export default function App() {
           </div>
 
           <div className="flex shrink-0 items-center gap-2.5">
+            <ApiUsageHeaderPopover
+              data={apiUsage.data}
+              loading={apiUsage.loading}
+              error={apiUsage.error}
+              dayResetRemaining={apiUsage.dayResetRemaining}
+              onRefresh={() => void apiUsage.refresh(true)}
+              onOpenFullView={() => {
+                setActiveNav('connections');
+                window.setTimeout(() => {
+                  document.getElementById('outbound-api-usage')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                }, 80);
+              }}
+            />
             {securityStatus && !securityStatus.live_trading_enabled && (
               <button
                 type="button"
@@ -1729,6 +1752,7 @@ export default function App() {
                 void fetchOverview(true);
                 void fetchStreakMeta();
                 void refreshSecurityStatus();
+                void apiUsage.refresh(true);
               }}
               disabled={refreshing}
               className="inline-flex h-9 shrink-0 items-center gap-2 whitespace-nowrap rounded-lg bg-sky-400 px-3.5 text-xs font-semibold text-sky-950 transition-colors hover:bg-sky-300 disabled:opacity-50"
@@ -2009,6 +2033,15 @@ export default function App() {
             )}
           </div>
         </section>
+
+        {/* Outbound Third-Party API Call Counter */}
+        <ApiUsageSection
+          data={apiUsage.data}
+          loading={apiUsage.loading}
+          error={apiUsage.error}
+          dayResetRemaining={apiUsage.dayResetRemaining}
+          onRefresh={() => void apiUsage.refresh(true)}
+        />
 
         {/* Section 2: Broker & Provider Directory */}
         <section id="connections" className="space-y-4">

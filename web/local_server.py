@@ -664,6 +664,10 @@ class _StdlibBrokerHandler(BaseHTTPRequestHandler):
             self._send_json(200, hub_service.get_telegram_settings())
             return
 
+        if path == "/api/telemetry/api-usage":
+            self._send_json(200, hub_service.get_outbound_api_usage())
+            return
+
         if len(parts) == 4 and parts[0] == "api" and parts[1] == "brokers" and parts[3] == "reconnect-status":
             self._send_json(200, hub_service.get_reconnect_status(parts[2]))
             return

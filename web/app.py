@@ -1403,6 +1403,10 @@ def create_app() -> FastAPI:
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
+    @app.get("/api/telemetry/api-usage")
+    def api_outbound_usage() -> dict:
+        return hub_service.get_outbound_api_usage()
+
     @app.websocket("/ws/deployments")
     async def ws_deployments(websocket: WebSocket) -> None:
         if not _ws_authorized(websocket):

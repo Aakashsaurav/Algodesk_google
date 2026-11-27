@@ -294,6 +294,14 @@ class AppConfig:
         return self.SQLITE_DIR / "audit_chain.db"
 
     @property
+    def API_USAGE_DB_PATH(self) -> Path:
+        rel = os.getenv("ALGODESK_API_USAGE_DB", "").strip()
+        if rel:
+            p = Path(rel)
+            return p if p.is_absolute() else (self.BASE_DIR / p)
+        return self.SQLITE_DIR / "api_usage.db"
+
+    @property
     def ZERODHA_INSTRUMENT_URL(self) -> str:
         return "https://api.kite.trade/instruments"
 

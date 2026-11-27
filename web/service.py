@@ -37,6 +37,7 @@ from broker.upstox.auth import auth_manager as upstox_auth_manager
 from broker.zerodha.auth import zerodha_auth_manager
 from charges.calculator import charges_engine, list_charge_presets
 from config import IST_TZ, config
+from core.api_usage import api_usage_tracker, install_outbound_api_hooks
 from core.audit import audit_trail
 from core.feed_manager import feed_manager
 from core.historical import historical_data_manager
@@ -76,6 +77,9 @@ from web.security import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Activate automatic outbound third-party API call counter globally
+install_outbound_api_hooks()
 
 _AUTH_MANAGERS = {
     "upstox": upstox_auth_manager,
@@ -1184,6 +1188,9 @@ class BrokerHubService:
 
     def send_telegram_test(self) -> Dict[str, Any]:
         return telegram_notifier.send_test()
+
+    def get_outbound_api_usage(self) -> Dict[str, Any]:
+        return api_usage_tracker.get_snapshot()
 
     def get_asset_data_history(
         self,
