@@ -394,6 +394,7 @@ def evaluate_sr_validation(
     candles_by_symbol: Dict[str, Sequence[Dict[str, Any]]],
     *,
     timeframe: str = "1day",
+    exchange: str = "NSE",
     params: Optional[Dict[str, Any]] = None,
     horizons: Sequence[int] = (5, 10, 20),
     primary_horizon: int = 10,
@@ -546,6 +547,7 @@ def evaluate_sr_validation(
 
     return {
         "ok": True,
+        "exchange": str(exchange or "NSE").strip().upper(),
         "timeframe": tf_short,
         "canonical_timeframe": timeframe,
         "primary_horizon_bars": prim_h,

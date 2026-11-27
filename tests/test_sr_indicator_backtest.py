@@ -372,12 +372,14 @@ class TestSupportResistanceIndicatorBacktest(unittest.TestCase):
         report = evaluate_sr_validation(
             candles_by_symbol={"RELIANCE": c1, "TCS": c2},
             timeframe="1day",
+            exchange="NSE",
             params={"left_bars": 4, "right_bars": 4, "min_strength": 25},
             horizons=[5, 10, 20],
             primary_horizon=10,
             htf_confluence=True,
         )
         self.assertTrue(report["ok"])
+        self.assertEqual(report["exchange"], "NSE")
         self.assertEqual(report["symbol_count"], 2)
         self.assertGreater(report["summary"]["total_events"], 0)
         for key in (
